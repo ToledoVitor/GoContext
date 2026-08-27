@@ -47,7 +47,9 @@ Nenhum índice externo é necessário. Reindexação completa de repositórios p
 
 ## Parsing e chunking
 
-Python e TypeScript exigem parser estrutural. Tree-sitter é a direção preferida; binding Go e impacto de CGO precisam ser validados no marco de ingestão. Até essa validação, nenhum parser é fixado como dependência.
+Python e TypeScript exigem parser estrutural. Tree-sitter é a direção preferida; binding Go e impacto de CGO precisam ser validados no marco de ingestão.
+
+`internal/ingest/lineparser` oferece descoberta preliminar enquanto esse spike não ocorre. Reconhece declarações top-level comuns de Python (`def`, `async def`, `class`) e TypeScript (`function`, `class`, `interface`, `type`, `enum`) e registra linha declaratória. Não interpreta AST, bodies, métodos, símbolos aninhados, arrow functions ou declarações multilinha. Essas limitações impedem uso do parser atual para chunking final.
 
 Política inicial de chunking:
 
