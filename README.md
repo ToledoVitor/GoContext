@@ -2,7 +2,7 @@
 
 GoContext é um copiloto local de inteligência para repositórios. A proposta é transformar código-fonte em contexto pesquisável, responder perguntas com evidências verificáveis e expor esse contexto por uma interface MCP somente leitura.
 
-Este repositório está no marco **M1: ingestão observável**, em andamento. Fundação, scanner local e descoberta inicial de declarações estão implementados. Parsing estrutural, chunking, índices, embeddings, LLM, MCP e frontend ainda não estão implementados.
+Este repositório está no marco **M1: ingestão observável**, em andamento. Fundação, scanner local, descoberta inicial de declarações e chunking por símbolo estão implementados. Parsing estrutural, índices de busca, embeddings, LLM, MCP e frontend ainda não estão implementados.
 
 ## Objetivo do MVP
 
@@ -35,6 +35,7 @@ internal/source        tipos centrais: arquivo, símbolo, chunk e citação
 internal/ingest        contratos para scanner, parser, chunker e armazenamento
   └─ filesystem        scanner local seguro para Python e TypeScript
   └─ lineparser        descoberta top-level preliminar, sem AST
+  └─ symbolchunker     chunks por limites de declarações top-level
 internal/search        contratos para busca e resultados ranqueados
 internal/answer        contratos para geração fundamentada e guardrails
 docs/architecture.md   arquitetura, fluxo de dados e limites de segurança

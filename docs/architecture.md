@@ -59,6 +59,8 @@ Política inicial de chunking:
 - chunk registra linguagem, símbolo, caminho e linhas;
 - tamanho máximo será medido em tokens do modelo de embedding escolhido.
 
+`internal/ingest/symbolchunker` implementa recorte inicial dessa política. Cada símbolo começa na linha declaratória e termina antes da próxima declaração top-level; linhas vazias finais são removidas. Arquivo não vazio sem símbolos gera um chunk de arquivo. IDs usam SHA-256 sobre versão, origem, linguagem, símbolo e texto, mantendo reindexações determinísticas. Divisão de símbolos grandes por orçamento de tokens permanece pendente.
+
 ## Scanner filesystem atual
 
 `internal/ingest/filesystem` implementa `ingest.Scanner` usando `os.Root`, disponível no Go 1.24, para manter leituras confinadas à raiz autorizada. Scanner:
