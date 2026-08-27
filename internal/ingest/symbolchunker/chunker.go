@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -29,39 +30,40 @@ func (c *Chunker) Chunk(ctx context.Context, file source.File, symbols []source.
 		return nil, err
 	}
 	if !file.Reference.Valid() {
-		return nil, ErrInvalidInput
+		return nil, invalidInputError(file.Reference, "invalid file reference")
 	}
 
 	lines := contentLines(file.Content)
 	contentEndLine := file.Reference.StartLine + len(lines) - 1
 	if contentEndLine != file.Reference.EndLine {
-		return nil, ErrInvalidInput
+		return nil, invalidInputError(file.Reference, "content line count does not match reference")
 	}
 
 	if len(symbols) == 0 {
 		return fallbackChunk(file, lines), nil
 	}
 	if !validSymbols(file.Reference, contentEndLine, symbols) {
-		return nil, ErrInvalidInput
+		return nil, invalidInputError(file.Reference, "invalid or unordered symbols")
 	}
 
+	startLines := symbolStartLines(file.Reference.StartLine, lines, symbols)
 	chunks := make([]source.Chunk, 0, len(symbols))
 	for index, symbol := range symbols {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		startLine := symbol.Reference.StartLine
+		startLine := startLines[index]
 		endLine := contentEndLine
 		if index+1 < len(symbols) {
-			endLine = symbols[index+1].Reference.StartLine - 1
+			endLine = startLines[index+1] - 1
 		}
 
 		startIndex := startLine - file.Reference.StartLine
 		endIndex := endLine - file.Reference.StartLine
 		endIndex = trimTrailingBlankLines(lines, startIndex, endIndex)
 		if endIndex < startIndex || strings.TrimSpace(lines[startIndex]) == "" {
-			return nil, ErrInvalidInput
+			return nil, invalidInputError(file.Reference, "symbol starts outside non-empty content")
 		}
 
 		endLine = file.Reference.StartLine + endIndex
@@ -70,6 +72,81 @@ func (c *Chunker) Chunk(ctx context.Context, file source.File, symbols []source.
 	}
 
 	return chunks, nil
+}
+
+func invalidInputError(reference source.Reference, reason string) error {
+	if reference.Valid() {
+		return fmt.Errorf("chunk %q: %w: %s", reference.Path, ErrInvalidInput, reason)
+	}
+	return fmt.Errorf("chunk source: %w: %s", ErrInvalidInput, reason)
+}
+
+func symbolStartLines(fileStartLine int, lines []string, symbols []source.Symbol) []int {
+	startLines := make([]int, len(symbols))
+	for index, symbol := range symbols {
+		minimumLine := fileStartLine
+		if index > 0 {
+			minimumLine = symbols[index-1].Reference.StartLine + 1
+		}
+		startLines[index] = associatedDocumentationStart(
+			lines,
+			fileStartLine,
+			symbol.Reference.StartLine,
+			minimumLine,
+		)
+	}
+	return startLines
+}
+
+func associatedDocumentationStart(lines []string, fileStartLine, declarationLine, minimumLine int) int {
+	startIndex := declarationLine - fileStartLine
+	minimumIndex := minimumLine - fileStartLine
+	for index := startIndex - 1; index >= minimumIndex; {
+		line := lines[index]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break
+		}
+
+		if isTopLevelLineDocumentation(line) || isTopLevelDecorator(line) {
+			startIndex = index
+			index--
+			continue
+		}
+
+		if strings.HasSuffix(trimmed, "*/") {
+			blockStart, found := topLevelBlockCommentStart(lines, index, minimumIndex)
+			if !found {
+				break
+			}
+			startIndex = blockStart
+			index = blockStart - 1
+			continue
+		}
+		break
+	}
+	return fileStartLine + startIndex
+}
+
+func isTopLevelLineDocumentation(line string) bool {
+	if line != strings.TrimLeft(line, " \t") {
+		return false
+	}
+	return strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//")
+}
+
+func isTopLevelDecorator(line string) bool {
+	return line == strings.TrimLeft(line, " \t") && strings.HasPrefix(line, "@")
+}
+
+func topLevelBlockCommentStart(lines []string, endIndex, minimumIndex int) (int, bool) {
+	for index := endIndex; index >= minimumIndex; index-- {
+		trimmed := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(trimmed, "/*") {
+			return index, lines[index] == strings.TrimLeft(lines[index], " \t")
+		}
+	}
+	return 0, false
 }
 
 func fallbackChunk(file source.File, lines []string) []source.Chunk {

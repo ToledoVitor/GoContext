@@ -57,7 +57,7 @@ Política inicial de chunking:
 
 - função, método, classe ou declaração exportada forma unidade natural;
 - assinatura e comentários de documentação acompanham corpo;
-- arquivo sem símbolos usa blocos delimitados por linhas;
+- arquivo sem símbolos usa um chunk de arquivo no recorte inicial; divisão por linhas entra junto do orçamento de tokens;
 - chunk registra linguagem, símbolo, caminho e linhas;
 - tamanho máximo será medido em tokens do modelo de embedding escolhido.
 

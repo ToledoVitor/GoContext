@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
@@ -79,12 +80,16 @@ func TestStoreReportsMissingAndRejectsInvalidInput(t *testing.T) {
 
 	if _, err := store.Load(context.Background(), "missing"); !errors.Is(err, localstore.ErrNotFound) {
 		t.Fatalf("Load(missing) error = %v, want ErrNotFound", err)
+	} else if !strings.Contains(err.Error(), "load repository snapshot") {
+		t.Errorf("Load(missing) error = %q, want operation context", err)
 	}
 	if err := store.Replace(context.Background(), "", nil); !errors.Is(err, localstore.ErrInvalidRepositoryID) {
 		t.Fatalf("Replace(empty ID) error = %v, want ErrInvalidRepositoryID", err)
 	}
 	if err := store.Replace(context.Background(), "repo", []source.Chunk{{ID: "invalid"}}); !errors.Is(err, localstore.ErrInvalidChunk) {
 		t.Fatalf("Replace(invalid chunk) error = %v, want ErrInvalidChunk", err)
+	} else if !strings.Contains(err.Error(), "replace repository snapshot") {
+		t.Errorf("Replace(invalid chunk) error = %q, want operation context", err)
 	}
 	duplicate := sampleChunk("same", "app.py", "A = 1")
 	if err := store.Replace(context.Background(), "repo", []source.Chunk{duplicate, duplicate}); !errors.Is(err, localstore.ErrInvalidChunk) {

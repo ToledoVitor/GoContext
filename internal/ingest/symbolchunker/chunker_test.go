@@ -3,6 +3,7 @@ package symbolchunker_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest/symbolchunker"
@@ -67,6 +68,39 @@ func TestChunkerFallsBackToWholeNonEmptyFile(t *testing.T) {
 		Text:      "export const answer = 42",
 		Language:  source.LanguageTypeScript,
 		Reference: source.Reference{Path: "src/constants.ts", StartLine: 1, EndLine: 1},
+	}}
+	assertChunks(t, chunks, want)
+}
+
+func TestChunkerIncludesAdjacentDocumentationAndDecorators(t *testing.T) {
+	file := source.File{
+		Reference: source.Reference{Path: "src/load.ts", StartLine: 1, EndLine: 6},
+		Language:  source.LanguageTypeScript,
+		Content: []byte("" +
+			"/**\n" +
+			" * Loads repository data.\n" +
+			" */\n" +
+			"@trace\n" +
+			"export function loadData() {\n" +
+			"}\n"),
+	}
+	symbols := []source.Symbol{{
+		Name:      "loadData",
+		Kind:      "function",
+		Signature: "export function loadData() {",
+		Reference: source.Reference{Path: "src/load.ts", StartLine: 5, EndLine: 5},
+	}}
+
+	chunks, err := symbolchunker.NewChunker().Chunk(context.Background(), file, symbols)
+	if err != nil {
+		t.Fatalf("Chunk() error = %v", err)
+	}
+
+	want := []source.Chunk{{
+		Text:       "/**\n * Loads repository data.\n */\n@trace\nexport function loadData() {\n}",
+		Language:   source.LanguageTypeScript,
+		SymbolName: "loadData",
+		Reference:  source.Reference{Path: "src/load.ts", StartLine: 1, EndLine: 6},
 	}}
 	assertChunks(t, chunks, want)
 }
@@ -141,6 +175,9 @@ func TestChunkerRejectsUnsafeOrUnorderedSymbols(t *testing.T) {
 			_, err := symbolchunker.NewChunker().Chunk(context.Background(), tt.file, tt.symbols)
 			if !errors.Is(err, symbolchunker.ErrInvalidInput) {
 				t.Fatalf("Chunk() error = %v, want ErrInvalidInput", err)
+			}
+			if tt.file.Reference.Valid() && !strings.Contains(err.Error(), tt.file.Reference.Path) {
+				t.Errorf("Chunk() error = %q, want safe path %q", err, tt.file.Reference.Path)
 			}
 		})
 	}

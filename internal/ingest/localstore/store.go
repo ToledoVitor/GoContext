@@ -74,13 +74,14 @@ func NewStore(directory string) (*Store, error) {
 // Replace atomically replaces chunks belonging to one repository snapshot.
 func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []source.Chunk) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return fmt.Errorf("replace repository snapshot: %w", err)
 	}
 	if err := validateRepositoryID(repositoryID); err != nil {
-		return err
+		return fmt.Errorf("replace repository snapshot: %w", err)
 	}
+	targetName := snapshotName(repositoryID)
 	if err := validateChunks(chunks); err != nil {
-		return err
+		return fmt.Errorf("replace repository snapshot %q: %w", targetName, err)
 	}
 
 	payload, err := json.Marshal(snapshot{
@@ -92,7 +93,7 @@ func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []sourc
 		return fmt.Errorf("encode repository snapshot: %w", err)
 	}
 	if len(payload) > maxSnapshotSize {
-		return ErrSnapshotTooLarge
+		return fmt.Errorf("replace repository snapshot %q: %w", targetName, ErrSnapshotTooLarge)
 	}
 
 	root, err := os.OpenRoot(s.directory)
@@ -101,7 +102,6 @@ func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []sourc
 	}
 	defer root.Close()
 
-	targetName := snapshotName(repositoryID)
 	temporaryName, err := temporarySnapshotName(targetName)
 	if err != nil {
 		return fmt.Errorf("create snapshot name: %w", err)
@@ -129,7 +129,7 @@ func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []sourc
 		return fmt.Errorf("close repository snapshot: %w", closeErr)
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return fmt.Errorf("replace repository snapshot %q: %w", targetName, err)
 	}
 	if err := os.Rename(
 		filepath.Join(s.directory, temporaryName),
@@ -148,11 +148,12 @@ func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []sourc
 // Load reads the current snapshot for a repository.
 func (s *Store) Load(ctx context.Context, repositoryID string) ([]source.Chunk, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load repository snapshot: %w", err)
 	}
 	if err := validateRepositoryID(repositoryID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load repository snapshot: %w", err)
 	}
+	targetName := snapshotName(repositoryID)
 
 	root, err := os.OpenRoot(s.directory)
 	if err != nil {
@@ -160,9 +161,9 @@ func (s *Store) Load(ctx context.Context, repositoryID string) ([]source.Chunk, 
 	}
 	defer root.Close()
 
-	file, err := root.Open(snapshotName(repositoryID))
+	file, err := root.Open(targetName)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, ErrNotFound
+		return nil, fmt.Errorf("load repository snapshot %q: %w", targetName, ErrNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open repository snapshot: %w", err)
@@ -176,21 +177,21 @@ func (s *Store) Load(ctx context.Context, repositoryID string) ([]source.Chunk, 
 		return nil, fmt.Errorf("close repository snapshot: %w", closeErr)
 	}
 	if overLimit {
-		return nil, ErrSnapshotTooLarge
+		return nil, fmt.Errorf("load repository snapshot %q: %w", targetName, ErrSnapshotTooLarge)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load repository snapshot %q: %w", targetName, err)
 	}
 
 	var stored snapshot
 	if err := json.Unmarshal(payload, &stored); err != nil {
-		return nil, fmt.Errorf("decode repository snapshot: %w", err)
+		return nil, fmt.Errorf("decode repository snapshot %q: %w", targetName, err)
 	}
 	if stored.Version != snapshotVersion || stored.RepositoryID != repositoryID {
-		return nil, fmt.Errorf("decode repository snapshot: metadata mismatch")
+		return nil, fmt.Errorf("decode repository snapshot %q: metadata mismatch", targetName)
 	}
 	if err := validateChunks(stored.Chunks); err != nil {
-		return nil, fmt.Errorf("decode repository snapshot: %w", err)
+		return nil, fmt.Errorf("decode repository snapshot %q: %w", targetName, err)
 	}
 	return stored.Chunks, nil
 }
@@ -204,12 +205,12 @@ func validateRepositoryID(repositoryID string) error {
 
 func validateChunks(chunks []source.Chunk) error {
 	seen := make(map[string]struct{}, len(chunks))
-	for _, chunk := range chunks {
+	for index, chunk := range chunks {
 		if chunk.ID == "" || chunk.Text == "" || !chunk.Reference.Valid() {
-			return ErrInvalidChunk
+			return fmt.Errorf("%w: chunk %d has incomplete content or provenance", ErrInvalidChunk, index)
 		}
 		if _, duplicate := seen[chunk.ID]; duplicate {
-			return ErrInvalidChunk
+			return fmt.Errorf("%w: chunk %d duplicates an earlier ID", ErrInvalidChunk, index)
 		}
 		seen[chunk.ID] = struct{}{}
 	}
