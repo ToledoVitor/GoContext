@@ -47,6 +47,8 @@ Nenhum índice externo é necessário. Reindexação completa de repositórios p
 
 `internal/ingest/localstore` oferece persistência inicial antes do índice SQLite. Cada repositório recebe snapshot JSON versionado, identificado no disco pelo SHA-256 do repository ID. Escrita usa arquivo temporário, `fsync` e rename atômico; arquivos usam permissão `0600`. Leitura valida versão, repository ID, chunks duplicados, referências e limite de 64 MiB. Esse adapter não oferece busca e será substituído ou absorvido pelo armazenamento do M2.
 
+`internal/search/lexical` implementa recuperação lexical inicial diretamente sobre snapshots. Consulta e campos de chunk são tokenizados em Unicode, com separação de `camelCase`, `snake_case` e pontuação. Score normalizado combina presença do termo em texto (`0.6`), símbolo (`0.3`) e caminho (`0.1`); empates usam caminho, linha e chunk ID. Snapshot é carregado a cada consulta. Não há índice invertido, frequência de termos ou BM25 nesta fase.
+
 ## Parsing e chunking
 
 Python e TypeScript exigem parser estrutural. Tree-sitter é a direção preferida; binding Go e impacto de CGO precisam ser validados no marco de ingestão.
