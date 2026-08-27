@@ -1,0 +1,13 @@
+# Go build output
+/bin/
+/dist/
+*.test
+*.out
+
+# Local GoContext state
+/.gocontext/
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/
