@@ -30,7 +30,7 @@ Sucesso significa responder perguntas sobre um repositório pequeno com citaçõ
 ## Estado atual
 
 ```text
-cmd/gocontext          CLI mínima e ponto de composição futuro
+cmd/gocontext          CLI de indexação e ponto de composição
 internal/source        tipos centrais: arquivo, símbolo, chunk e citação
 internal/ingest        contratos para scanner, parser, chunker e armazenamento
   └─ filesystem        scanner local seguro para Python e TypeScript
@@ -61,6 +61,18 @@ Saída esperada da última linha:
 
 ```text
 gocontext dev
+```
+
+## Indexar repositório
+
+```bash
+go run ./cmd/gocontext index /caminho/do/repositório
+```
+
+Comando percorre fontes Python/TypeScript, descobre declarações, cria chunks e substitui snapshot local. Store padrão fica no diretório de cache do sistema, fora do repositório. Para escolher outro local:
+
+```bash
+go run ./cmd/gocontext index --store /caminho/do/cache /caminho/do/repositório
 ```
 
 ## Arquitetura proposta
