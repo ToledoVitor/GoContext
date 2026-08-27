@@ -57,6 +57,19 @@ Política inicial de chunking:
 - chunk registra linguagem, símbolo, caminho e linhas;
 - tamanho máximo será medido em tokens do modelo de embedding escolhido.
 
+## Scanner filesystem atual
+
+`internal/ingest/filesystem` implementa `ingest.Scanner` usando `os.Root`, disponível no Go 1.24, para manter leituras confinadas à raiz autorizada. Scanner:
+
+- inclui `.py`, `.ts` e `.tsx`;
+- retorna caminhos relativos normalizados e intervalos de linhas;
+- não segue symlinks;
+- exclui diretórios de VCS, dependências, ambientes virtuais, caches, cobertura e builds;
+- ignora arquivos não regulares, binários com byte NUL e fontes acima de 1 MiB;
+- respeita cancelamento de contexto.
+
+Suporte a regras arbitrárias de `.gitignore` permanece pendente antes de fechar M1. Regras fixas atuais cobrem exclusões de maior risco e custo para recorte inicial.
+
 ## Guardrails
 
 - Canonicalizar raiz autorizada e impedir escape por `..` ou symlink.
