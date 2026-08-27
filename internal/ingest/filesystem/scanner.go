@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -96,11 +97,19 @@ func (s *Scanner) Scan(ctx context.Context, root string) ([]source.File, error) 
 			return nil
 		}
 
-		content, err := repository.ReadFile(relativePath)
+		file, err := repository.Open(relativePath)
 		if err != nil {
-			return fmt.Errorf("read %q: %w", relativePath, err)
+			return fmt.Errorf("open %q: %w", relativePath, err)
 		}
-		if int64(len(content)) > DefaultMaxFileSize || bytes.IndexByte(content, 0) >= 0 {
+		content, overLimit, readErr := readLimited(file)
+		closeErr := file.Close()
+		if readErr != nil {
+			return fmt.Errorf("read %q: %w", relativePath, readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close %q: %w", relativePath, closeErr)
+		}
+		if overLimit || bytes.IndexByte(content, 0) >= 0 {
 			return nil
 		}
 
@@ -125,6 +134,17 @@ func (s *Scanner) Scan(ctx context.Context, root string) ([]source.File, error) 
 	}
 
 	return files, nil
+}
+
+func readLimited(reader io.Reader) ([]byte, bool, error) {
+	content, err := io.ReadAll(io.LimitReader(reader, DefaultMaxFileSize+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(content)) > DefaultMaxFileSize {
+		return nil, true, nil
+	}
+	return content, false, nil
 }
 
 func languageForPath(filePath string) (source.Language, bool) {
