@@ -879,24 +879,62 @@ func generationMetadataMatches(ctx context.Context, database generationMetadataQ
 }
 
 func canonicalContentDigest(chunks []source.Chunk) string {
+	digest, _ := canonicalContentDigestContext(context.Background(), chunks)
+	return digest
+}
+
+func canonicalContentDigestContext(ctx context.Context, chunks []source.Chunk) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	digest := sha256.New()
-	writeCanonicalString(digest, "sqlite-canonical-content-v1")
+	if err := writeCanonicalStringContext(ctx, digest, "sqlite-canonical-content-v1"); err != nil {
+		return "", err
+	}
 	for ordinal, chunk := range chunks {
+		if ordinal%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
 		writeCanonicalInteger(digest, int64(ordinal))
-		writeCanonicalString(digest, chunk.ID)
-		writeCanonicalString(digest, chunk.Text)
-		writeCanonicalString(digest, string(chunk.Language))
-		writeCanonicalString(digest, chunk.SymbolName)
-		writeCanonicalString(digest, chunk.Reference.Path)
+		for _, value := range [...]string{
+			chunk.ID,
+			chunk.Text,
+			string(chunk.Language),
+			chunk.SymbolName,
+			chunk.Reference.Path,
+		} {
+			if err := writeCanonicalStringContext(ctx, digest, value); err != nil {
+				return "", err
+			}
+		}
 		writeCanonicalInteger(digest, int64(chunk.Reference.StartLine))
 		writeCanonicalInteger(digest, int64(chunk.Reference.EndLine))
 	}
-	return hex.EncodeToString(digest.Sum(nil))
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func writeCanonicalString(writer hash.Hash, value string) {
+func writeCanonicalStringContext(ctx context.Context, writer hash.Hash, value string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	writeCanonicalInteger(writer, int64(len(value)))
-	_, _ = writer.Write([]byte(value))
+	for offset := 0; offset < len(value); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := offset + 64*1024
+		if end > len(value) {
+			end = len(value)
+		}
+		_, _ = writer.Write([]byte(value[offset:end]))
+		offset = end
+	}
+	return nil
 }
 
 func writeCanonicalInteger(writer hash.Hash, value int64) {

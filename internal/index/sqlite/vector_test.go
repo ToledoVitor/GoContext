@@ -6,11 +6,14 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -518,6 +521,64 @@ func TestExactSearchReportsLexicalOnlyGenerationUnavailable(t *testing.T) {
 	}
 }
 
+func TestExactSearchLexicalOnlyGenerationRejectsUnexpectedLinkedVectorRows(t *testing.T) {
+	store := newVectorStore(t, t.TempDir())
+	generation := lexicalVectorGeneration(t, "repository", "lexical-corrupt", "chunk", "private/lexical-corrupt.py")
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	blob, err := encodeVector(embedding.Vector{1, 0})
+	if err != nil {
+		t.Fatalf("encodeVector() error = %v", err)
+	}
+	if _, err := store.db.Exec(`
+		INSERT INTO vectors(repository_id, generation_id, chunk_id, encoding_version, dimensions, values_blob)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		generation.RepositoryID, generation.ID, generation.Chunks[0].ID, vectorEncodingVersion, 2, blob,
+	); err != nil {
+		t.Fatalf("insert unexpected linked vector error = %v", err)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+
+	if _, err := reader.Describe(context.Background(), generation.RepositoryID); !errors.Is(err, vectorsearch.ErrVectorIntegrity) {
+		t.Fatalf("Describe(lexical-only corruption) error = %v, want ErrVectorIntegrity", err)
+	}
+	if _, err := reader.Search(context.Background(), lexicalVectorQuery(generation)); !errors.Is(err, vectorsearch.ErrVectorIntegrity) {
+		t.Fatalf("Search(lexical-only corruption) error = %v, want ErrVectorIntegrity", err)
+	}
+}
+
+func TestExactSearchLexicalOnlyIntegrityCheckIsRepositoryScoped(t *testing.T) {
+	store := newVectorStore(t, t.TempDir())
+	isolated := lexicalVectorGeneration(t, "isolated-repository", "shared-generation", "isolated-chunk", "isolated.py")
+	other := lexicalVectorGeneration(t, "other-repository", "shared-generation", "other-chunk", "other.py")
+	if err := store.Replace(context.Background(), isolated); err != nil {
+		t.Fatalf("Replace(isolated) error = %v", err)
+	}
+	if err := store.Replace(context.Background(), other); err != nil {
+		t.Fatalf("Replace(other) error = %v", err)
+	}
+	blob, err := encodeVector(embedding.Vector{1, 0})
+	if err != nil {
+		t.Fatalf("encodeVector() error = %v", err)
+	}
+	if _, err := store.db.Exec(`
+		INSERT INTO vectors(repository_id, generation_id, chunk_id, encoding_version, dimensions, values_blob)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		other.RepositoryID, other.ID, other.Chunks[0].ID, vectorEncodingVersion, 2, blob,
+	); err != nil {
+		t.Fatalf("insert other repository vector error = %v", err)
+	}
+	reader := bindVectorReader(t, store, isolated.RepositoryID)
+
+	if _, err := reader.Describe(context.Background(), isolated.RepositoryID); !errors.Is(err, vectorsearch.ErrVectorUnavailable) {
+		t.Fatalf("Describe(isolated lexical-only) error = %v, want ErrVectorUnavailable", err)
+	}
+	if _, err := reader.Search(context.Background(), lexicalVectorQuery(isolated)); !errors.Is(err, vectorsearch.ErrVectorUnavailable) {
+		t.Fatalf("Search(isolated lexical-only) error = %v, want ErrVectorUnavailable", err)
+	}
+}
+
 func TestExactSearchRejectsMissingMalformedDuplicateAndOrphanedRows(t *testing.T) {
 	validBlob, err := encodeVector(embedding.Vector{1, 0})
 	if err != nil {
@@ -554,10 +615,60 @@ func TestExactSearchRejectsMissingMalformedDuplicateAndOrphanedRows(t *testing.T
 			},
 		},
 		{
+			name: "negative dimensions",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				if _, err := database.Exec(`UPDATE vectors SET dimensions = ? WHERE repository_id = ? AND generation_id = ?`, int64(-1), generation.RepositoryID, generation.ID); err != nil {
+					t.Fatalf("set negative vector dimensions error = %v", err)
+				}
+			},
+		},
+		{
+			name: "maximum dimensions",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				if _, err := database.Exec(`UPDATE vectors SET dimensions = ? WHERE repository_id = ? AND generation_id = ?`, int64(math.MaxInt64), generation.RepositoryID, generation.ID); err != nil {
+					t.Fatalf("set maximum vector dimensions error = %v", err)
+				}
+			},
+		},
+		{
+			name: "32-bit wrapping dimensions",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				wrappingDimensions := (int64(1) << 32) + int64(generation.Dimensions)
+				if _, err := database.Exec(`UPDATE vectors SET dimensions = ? WHERE repository_id = ? AND generation_id = ?`, wrappingDimensions, generation.RepositoryID, generation.ID); err != nil {
+					t.Fatalf("set wrapping vector dimensions error = %v", err)
+				}
+			},
+		},
+		{
 			name: "unknown encoding",
 			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
 				if _, err := database.Exec(`UPDATE vectors SET encoding_version = 2 WHERE repository_id = ? AND generation_id = ?`, generation.RepositoryID, generation.ID); err != nil {
 					t.Fatalf("corrupt vector encoding error = %v", err)
+				}
+			},
+		},
+		{
+			name: "negative encoding",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				if _, err := database.Exec(`UPDATE vectors SET encoding_version = ? WHERE repository_id = ? AND generation_id = ?`, int64(-1), generation.RepositoryID, generation.ID); err != nil {
+					t.Fatalf("set negative vector encoding error = %v", err)
+				}
+			},
+		},
+		{
+			name: "maximum encoding",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				if _, err := database.Exec(`UPDATE vectors SET encoding_version = ? WHERE repository_id = ? AND generation_id = ?`, int64(math.MaxInt64), generation.RepositoryID, generation.ID); err != nil {
+					t.Fatalf("set maximum vector encoding error = %v", err)
+				}
+			},
+		},
+		{
+			name: "32-bit wrapping encoding",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				wrappingVersion := (int64(1) << 32) + int64(vectorEncodingVersion)
+				if _, err := database.Exec(`UPDATE vectors SET encoding_version = ? WHERE repository_id = ? AND generation_id = ?`, wrappingVersion, generation.RepositoryID, generation.ID); err != nil {
+					t.Fatalf("set wrapping vector encoding error = %v", err)
 				}
 			},
 		},
@@ -1057,6 +1168,91 @@ func TestVectorBoundLoadSanitizesMalformedCanonicalRow(t *testing.T) {
 	}
 }
 
+func TestExactSearchCancelsDuringQueryNormalizationBeforeReaderLock(t *testing.T) {
+	store := newVectorStore(t, t.TempDir())
+	generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
+		vectorChunk("chunk", "normalization.py", 1, source.LanguagePython, "NORMALIZATION_SOURCE"),
+	}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	values := make(embedding.Vector, 4096)
+	for position := range values {
+		values[position] = 1
+	}
+	query := vectorIndexQuery(generation, values, 1)
+	query.Dimensions = len(values)
+	ctx := newCancelOnErrCheckContext(2)
+
+	_, err := reader.Search(ctx, query)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Search(cancel during normalization) error = %v, want context.Canceled before reader lock", err)
+	}
+}
+
+func TestExactSearchCancelsDuringCandidateRanking(t *testing.T) {
+	store := newVectorStore(t, t.TempDir())
+	const candidateCount = 512
+	chunks := make([]source.Chunk, candidateCount)
+	records := make([]index.VectorRecord, candidateCount)
+	for position := range chunks {
+		id := fmt.Sprintf("chunk-%04d", position)
+		chunks[position] = vectorChunk(id, fmt.Sprintf("pkg/%04d.py", candidateCount-position), position+1, source.LanguagePython, "RANKING_SOURCE")
+		records[position] = index.VectorRecord{ChunkID: id, Values: embedding.Vector{1, float32(position + 1)}}
+	}
+	generation := vectorGeneration(t, "repository", "ranking", "", chunks, records)
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+	filteredQuery := vectorIndexQuery(generation, embedding.Vector{1, 1}, candidateCount)
+	filteredQuery.Filter = search.Filter{PathPrefixes: []string{"not-ranked"}}
+	baselineCtx := &errCountingContext{Context: context.Background()}
+	candidates, err := reader.Search(baselineCtx, filteredQuery)
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("Search(filtered baseline) = %#v, %v; want empty success", candidates, err)
+	}
+	query := vectorIndexQuery(generation, embedding.Vector{1, 1}, candidateCount)
+	query.Filter = search.Filter{PathPrefixes: []string{"pkg"}}
+	cancelCtx := newCancelOnErrCheckContext(baselineCtx.checks.Load() + 2)
+	searchDone := make(chan exactSearchResult, 1)
+	go func() {
+		found, searchErr := reader.Search(cancelCtx, query)
+		searchDone <- exactSearchResult{candidates: found, err: searchErr}
+	}()
+	select {
+	case <-cancelCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Search did not observe cancellation during candidate ranking")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- reader.Close() }()
+	var result exactSearchResult
+	select {
+	case result = <-searchDone:
+	case <-time.After(time.Second):
+		t.Fatal("Search held reader lock after cancellation during candidate ranking")
+	}
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("Search(cancel during ranking) candidate count = %d, error = %v; want context.Canceled and no candidates", len(result.candidates), result.err)
+	}
+	if result.candidates != nil {
+		t.Fatalf("Search(cancel during ranking) candidates = %#v, want nil", result.candidates)
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close(after canceled ranking) error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close remained blocked after canceled candidate ranking")
+	}
+}
+
 func newVectorStore(t *testing.T, directory string) *Store {
 	t.Helper()
 	store, err := NewStore(directory)
@@ -1118,6 +1314,35 @@ func vectorGeneration(t *testing.T, repositoryID, generationID, baseGeneration s
 	}
 }
 
+func lexicalVectorGeneration(t *testing.T, repositoryID, generationID, chunkID, path string) index.Generation {
+	t.Helper()
+	chunk := vectorChunk(chunkID, path, 1, source.LanguagePython, "LEXICAL_ONLY_SOURCE")
+	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, []source.Chunk{chunk})
+	if err != nil {
+		t.Fatalf("NewCorpus() error = %v", err)
+	}
+	return index.Generation{
+		RepositoryID:      repositoryID,
+		ID:                generationID,
+		CorpusRevision:    corpus.Revision,
+		ScanPolicyVersion: corpus.PolicyVersion,
+		Chunks:            corpus.Chunks,
+		Metric:            index.VectorMetricCosine,
+	}
+}
+
+func lexicalVectorQuery(generation index.Generation) vectorsearch.IndexQuery {
+	return vectorsearch.IndexQuery{
+		RepositoryID: generation.RepositoryID,
+		GenerationID: generation.ID,
+		Profile:      embedding.Profile{Fingerprint: "expected", Model: "expected"},
+		Dimensions:   2,
+		Metric:       index.VectorMetricCosine,
+		Vector:       embedding.Vector{1, 0},
+		Limit:        1,
+	}
+}
+
 func vectorChunk(id, path string, line int, language source.Language, text string) source.Chunk {
 	return source.Chunk{
 		ID:         id,
@@ -1138,4 +1363,51 @@ func osReadFileAllowMissing(path string) ([]byte, error) {
 		return nil, nil
 	}
 	return payload, err
+}
+
+type errCountingContext struct {
+	context.Context
+	checks atomic.Int64
+}
+
+type exactSearchResult struct {
+	candidates []vectorsearch.Candidate
+	err        error
+}
+
+func (c *errCountingContext) Done() <-chan struct{} {
+	return nil
+}
+
+func (c *errCountingContext) Err() error {
+	c.checks.Add(1)
+	return nil
+}
+
+type cancelOnErrCheckContext struct {
+	context.Context
+	cancelAt int64
+	checks   atomic.Int64
+	done     chan struct{}
+	once     sync.Once
+}
+
+func newCancelOnErrCheckContext(cancelAt int64) *cancelOnErrCheckContext {
+	return &cancelOnErrCheckContext{
+		Context:  context.Background(),
+		cancelAt: cancelAt,
+		done:     make(chan struct{}),
+	}
+}
+
+func (c *cancelOnErrCheckContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *cancelOnErrCheckContext) Err() error {
+	if c.checks.Add(1) < c.cancelAt {
+		return nil
+	}
+	c.once.Do(func() { close(c.done) })
+	return context.Canceled
 }

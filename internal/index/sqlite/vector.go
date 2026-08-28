@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 
 	"github.com/ToledoVitor/GoContext/internal/embedding"
@@ -21,6 +20,7 @@ const (
 	vectorEncodingVersion  = 1
 	maxExactCandidateLimit = math.MaxInt32
 	unitNormTolerance      = 1e-4
+	vectorContextStride    = 256
 )
 
 var errInvalidVectorEncoding = errors.New("invalid vector encoding")
@@ -87,12 +87,27 @@ func prepareGenerationVectors(generation index.Generation) ([]preparedVector, er
 }
 
 func normalizeVector(values embedding.Vector, dimensions int) (embedding.Vector, error) {
-	if err := validateVectorComponents(values, dimensions); err != nil {
+	return normalizeVectorContext(context.Background(), values, dimensions)
+}
+
+func normalizeVectorContext(ctx context.Context, values embedding.Vector, dimensions int) (embedding.Vector, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if dimensions <= 0 || len(values) != dimensions {
+		return nil, errInvalidVectorEncoding
+	}
 	var squaredNorm float64
-	for _, value := range values {
+	for position, value := range values {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		component := float64(value)
+		if math.IsNaN(component) || math.IsInf(component, 0) {
+			return nil, errInvalidVectorEncoding
+		}
 		squaredNorm += component * component
 	}
 	norm := math.Sqrt(squaredNorm)
@@ -100,11 +115,18 @@ func normalizeVector(values embedding.Vector, dimensions int) (embedding.Vector,
 		return nil, errInvalidVectorEncoding
 	}
 	normalized := make(embedding.Vector, dimensions)
+	nonZero := false
 	for position, value := range values {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		normalized[position] = float32(float64(value) / norm)
+		nonZero = nonZero || normalized[position] != 0
 	}
-	if err := validateVectorComponents(normalized, dimensions); err != nil {
-		return nil, err
+	if !nonZero {
+		return nil, errInvalidVectorEncoding
 	}
 	return normalized, nil
 }
@@ -119,11 +141,14 @@ func (r *BoundReader) Describe(ctx context.Context, repositoryID string) (vector
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return vectorsearch.Metadata{}, fmt.Errorf("describe bound vector index: %w", err)
+	}
 	if r.closed {
 		return vectorsearch.Metadata{}, fmt.Errorf("describe bound vector index: %w", errBoundReaderClosed)
 	}
 	if r.profileFingerprint == "" && r.profileModel == "" && r.dimensions == 0 {
-		return vectorsearch.Metadata{}, vectorsearch.ErrVectorUnavailable
+		return vectorsearch.Metadata{}, r.lexicalOnlyVectorState(ctx, "describe bound vector index")
 	}
 	return vectorsearch.Metadata{
 		GenerationID:   r.generationID,
@@ -148,8 +173,11 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 	if query.Limit <= 0 || int64(query.Limit) > maxExactCandidateLimit {
 		return nil, vectorsearch.ErrInvalidQueryVector
 	}
-	normalizedQuery, err := normalizeVector(query.Vector, query.Dimensions)
+	normalizedQuery, err := normalizeVectorContext(ctx, query.Vector, query.Dimensions)
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, fmt.Errorf("search bound vector index: %w", contextErr)
+		}
 		return nil, vectorsearch.ErrInvalidQueryVector
 	}
 	if r == nil {
@@ -158,11 +186,14 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("search bound vector index: %w", err)
+	}
 	if r.closed {
 		return nil, fmt.Errorf("search bound vector index: %w", errBoundReaderClosed)
 	}
 	if r.profileFingerprint == "" && r.profileModel == "" && r.dimensions == 0 {
-		return nil, vectorsearch.ErrVectorUnavailable
+		return nil, r.lexicalOnlyVectorState(ctx, "search bound vector index")
 	}
 	if query.RepositoryID != r.repositoryID || query.GenerationID != r.generationID ||
 		query.Profile.Fingerprint != r.profileFingerprint || query.Profile.Model != r.profileModel ||
@@ -210,8 +241,24 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 		}
 		seen[chunk.ID] = struct{}{}
 		chunk.Language = source.Language(language)
-		storedVector, err := decodeVector(int(version.Int64), int(dimensions.Int64), blob)
-		if err != nil || int(dimensions.Int64) != r.dimensions || !hasUnitNorm(storedVector) {
+		if err := validateStoredVectorHeader(version.Int64, dimensions.Int64, r.dimensions); err != nil {
+			_ = rows.Close()
+			return nil, vectorsearch.ErrVectorIntegrity
+		}
+		storedVector, err := decodeVectorContext(ctx, vectorEncodingVersion, r.dimensions, blob)
+		if err != nil {
+			_ = rows.Close()
+			if contextErr := ctx.Err(); contextErr != nil {
+				return nil, fmt.Errorf("search bound vector index: %w", contextErr)
+			}
+			return nil, vectorsearch.ErrVectorIntegrity
+		}
+		unitNorm, err := hasUnitNormContext(ctx, storedVector)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if !unitNorm {
 			_ = rows.Close()
 			return nil, vectorsearch.ErrVectorIntegrity
 		}
@@ -221,7 +268,12 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 			return nil, err
 		}
 		chunks = append(chunks, chunk)
-		if search.MatchesFilter(chunk, query.Filter) {
+		matches, err := vectorMatchesFilterContext(ctx, chunk, query.Filter)
+		if err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if matches {
 			candidates = append(candidates, vectorsearch.Candidate{Chunk: chunk, Similarity: similarity})
 		}
 	}
@@ -231,8 +283,18 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 		return nil, vectorReadError(ctx)
 	}
 
-	corpus, err := source.NewCorpus(r.scanPolicyVersion, chunks)
-	if err != nil || corpus.Revision != r.corpusRevision || canonicalContentDigest(chunks) != r.contentDigest {
+	corpus, err := source.NewCorpusContext(ctx, r.scanPolicyVersion, chunks)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, fmt.Errorf("search bound vector index: %w", contextErr)
+		}
+		return nil, vectorsearch.ErrVectorIntegrity
+	}
+	contentDigest, err := canonicalContentDigestContext(ctx, chunks)
+	if err != nil {
+		return nil, fmt.Errorf("search bound vector index: %w", err)
+	}
+	if corpus.Revision != r.corpusRevision || contentDigest != r.contentDigest {
 		return nil, vectorsearch.ErrVectorIntegrity
 	}
 	var orphaned int
@@ -252,36 +314,166 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 		return nil, vectorsearch.ErrVectorIntegrity
 	}
 
-	sort.Slice(candidates, func(left, right int) bool {
-		if candidates[left].Similarity != candidates[right].Similarity {
-			return candidates[left].Similarity > candidates[right].Similarity
-		}
-		leftReference := candidates[left].Chunk.Reference
-		rightReference := candidates[right].Chunk.Reference
-		if leftReference.Path != rightReference.Path {
-			return leftReference.Path < rightReference.Path
-		}
-		if leftReference.StartLine != rightReference.StartLine {
-			return leftReference.StartLine < rightReference.StartLine
-		}
-		if leftReference.EndLine != rightReference.EndLine {
-			return leftReference.EndLine < rightReference.EndLine
-		}
-		return candidates[left].Chunk.ID < candidates[right].Chunk.ID
-	})
+	if err := sortCandidatesContext(ctx, candidates); err != nil {
+		return nil, fmt.Errorf("search bound vector index: %w", err)
+	}
 	if len(candidates) > query.Limit {
 		candidates = candidates[:query.Limit]
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("search bound vector index: %w", err)
 	}
 	return candidates, nil
 }
 
-func hasUnitNorm(values embedding.Vector) bool {
+func (r *BoundReader) lexicalOnlyVectorState(ctx context.Context, operation string) error {
+	var vectorCount int64
+	if err := r.tx.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM vectors
+		WHERE repository_id = ? AND generation_id = ?`,
+		r.repositoryID, r.generationID,
+	).Scan(&vectorCount); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("%s: %w", operation, contextErr)
+		}
+		return vectorsearch.ErrVectorIntegrity
+	}
+	if vectorCount != 0 {
+		return vectorsearch.ErrVectorIntegrity
+	}
+	return vectorsearch.ErrVectorUnavailable
+}
+
+func vectorMatchesFilterContext(ctx context.Context, chunk source.Chunk, filter search.Filter) (bool, error) {
+	if len(filter.PathPrefixes) > 0 {
+		pathMatched := false
+		for position, prefix := range filter.PathPrefixes {
+			if position%vectorContextStride == 0 {
+				if err := ctx.Err(); err != nil {
+					return false, fmt.Errorf("search bound vector index: %w", err)
+				}
+			}
+			normalized := strings.TrimSuffix(prefix, "/")
+			if chunk.Reference.Path == normalized || strings.HasPrefix(chunk.Reference.Path, normalized+"/") {
+				pathMatched = true
+				break
+			}
+		}
+		if !pathMatched {
+			return false, nil
+		}
+	}
+	if len(filter.Languages) == 0 {
+		return true, nil
+	}
+	for position, language := range filter.Languages {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return false, fmt.Errorf("search bound vector index: %w", err)
+			}
+		}
+		if chunk.Language == language {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func sortCandidatesContext(ctx context.Context, candidates []vectorsearch.Candidate) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(candidates) < 2 {
+		return nil
+	}
+	buffer := make([]vectorsearch.Candidate, len(candidates))
+	sourceCandidates := candidates
+	targetCandidates := buffer
+	inOriginal := true
+	for width := 1; ; width *= 2 {
+		checks := 0
+		for start := 0; start < len(candidates); {
+			mid := boundedVectorIndex(start, width, len(candidates))
+			end := boundedVectorIndex(mid, width, len(candidates))
+			left, right, output := start, mid, start
+			for left < mid || right < end {
+				if checks%vectorContextStride == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				checks++
+				switch {
+				case right >= end || (left < mid && candidateBeforeOrEqual(sourceCandidates[left], sourceCandidates[right])):
+					targetCandidates[output] = sourceCandidates[left]
+					left++
+				default:
+					targetCandidates[output] = sourceCandidates[right]
+					right++
+				}
+				output++
+			}
+			start = end
+		}
+		sourceCandidates, targetCandidates = targetCandidates, sourceCandidates
+		inOriginal = !inOriginal
+		if width >= len(candidates)-width {
+			break
+		}
+	}
+	if !inOriginal {
+		for offset := 0; offset < len(candidates); offset += vectorContextStride {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := offset + vectorContextStride
+			if end > len(candidates) {
+				end = len(candidates)
+			}
+			copy(candidates[offset:end], sourceCandidates[offset:end])
+		}
+	}
+	return ctx.Err()
+}
+
+func candidateBeforeOrEqual(left, right vectorsearch.Candidate) bool {
+	if left.Similarity != right.Similarity {
+		return left.Similarity > right.Similarity
+	}
+	leftReference := left.Chunk.Reference
+	rightReference := right.Chunk.Reference
+	if leftReference.Path != rightReference.Path {
+		return leftReference.Path < rightReference.Path
+	}
+	if leftReference.StartLine != rightReference.StartLine {
+		return leftReference.StartLine < rightReference.StartLine
+	}
+	if leftReference.EndLine != rightReference.EndLine {
+		return leftReference.EndLine < rightReference.EndLine
+	}
+	return left.Chunk.ID <= right.Chunk.ID
+}
+
+func boundedVectorIndex(start, width, length int) int {
+	if width > length-start {
+		return length
+	}
+	return start + width
+}
+
+func hasUnitNormContext(ctx context.Context, values embedding.Vector) (bool, error) {
 	var squaredNorm float64
-	for _, value := range values {
+	for position, value := range values {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return false, fmt.Errorf("search bound vector index: %w", err)
+			}
+		}
 		component := float64(value)
 		squaredNorm += component * component
 	}
-	return math.Abs(math.Sqrt(squaredNorm)-1) <= unitNormTolerance
+	return math.Abs(math.Sqrt(squaredNorm)-1) <= unitNormTolerance, nil
 }
 
 func cosineSimilarity(ctx context.Context, left, right embedding.Vector) (float64, error) {
@@ -290,7 +482,7 @@ func cosineSimilarity(ctx context.Context, left, right embedding.Vector) (float6
 	}
 	var dot, leftSquaredNorm, rightSquaredNorm float64
 	for position := range left {
-		if position%256 == 0 {
+		if position%vectorContextStride == 0 {
 			if err := ctx.Err(); err != nil {
 				return 0, fmt.Errorf("search bound vector index: %w", err)
 			}
@@ -339,25 +531,56 @@ func encodeVector(values embedding.Vector) ([]byte, error) {
 }
 
 func decodeVector(encodingVersion, dimensions int, encoded []byte) (embedding.Vector, error) {
+	return decodeVectorContext(context.Background(), encodingVersion, dimensions, encoded)
+}
+
+func validateStoredVectorHeader(encodingVersion, dimensions int64, expectedDimensions int) error {
+	if encodingVersion != int64(vectorEncodingVersion) || expectedDimensions <= 0 || dimensions != int64(expectedDimensions) {
+		return vectorsearch.ErrVectorIntegrity
+	}
+	return nil
+}
+
+func decodeVectorContext(ctx context.Context, encodingVersion, dimensions int, encoded []byte) (embedding.Vector, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if encodingVersion != vectorEncodingVersion || dimensions <= 0 || len(encoded) == 0 || len(encoded)%4 != 0 || len(encoded)/4 != dimensions {
 		return nil, vectorsearch.ErrVectorIntegrity
 	}
 	values := make(embedding.Vector, dimensions)
 	for position := range values {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		values[position] = math.Float32frombits(binary.LittleEndian.Uint32(encoded[position*4:]))
 	}
-	if err := validateVectorComponents(values, dimensions); err != nil {
+	if err := validateVectorComponentsContext(ctx, values, dimensions); err != nil {
 		return nil, vectorsearch.ErrVectorIntegrity
 	}
 	return values, nil
 }
 
 func validateVectorComponents(values embedding.Vector, dimensions int) error {
+	return validateVectorComponentsContext(context.Background(), values, dimensions)
+}
+
+func validateVectorComponentsContext(ctx context.Context, values embedding.Vector, dimensions int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if dimensions <= 0 || len(values) != dimensions {
 		return errInvalidVectorEncoding
 	}
 	nonZero := false
-	for _, value := range values {
+	for position, value := range values {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		component := float64(value)
 		if math.IsNaN(component) || math.IsInf(component, 0) {
 			return errInvalidVectorEncoding
