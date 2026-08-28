@@ -21,7 +21,7 @@ var (
 type declarationPattern struct {
 	expression *regexp.Regexp
 	kind       string
-	validLine  func(string) bool
+	validLine  func(context.Context, string) bool
 }
 
 var pythonPatterns = []declarationPattern{
@@ -119,8 +119,14 @@ func (p *Parser) Parse(ctx context.Context, file source.File) ([]source.Symbol, 
 					continue
 				}
 			}
-			if pattern.validLine != nil && !pattern.validLine(line) {
-				continue
+			if pattern.validLine != nil {
+				valid := pattern.validLine(ctx, line)
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if !valid {
+					continue
+				}
 			}
 
 			lineNumber := file.Reference.StartLine + index
@@ -141,12 +147,12 @@ func (p *Parser) Parse(ctx context.Context, file source.File) ([]source.Symbol, 
 	return symbols, nil
 }
 
-func validJavaScriptFunctionDeclaration(line string) bool {
+func validJavaScriptFunctionDeclaration(_ context.Context, line string) bool {
 	function := strings.Index(line, "function")
 	return function >= 0 && validJavaScriptFunctionSyntax(line[function:], true)
 }
 
-func validJavaScriptFunctionInitializer(line string) bool {
+func validJavaScriptFunctionInitializer(ctx context.Context, line string) bool {
 	delimiter := strings.IndexByte(line, '=')
 	if delimiter < 0 {
 		return false
@@ -157,15 +163,15 @@ func validJavaScriptFunctionInitializer(line string) bool {
 		if hasJavaScriptKeywordPrefix(remainder, "function") || remainder == "function" {
 			return validJavaScriptFunctionSyntax(remainder, false)
 		}
-		if validJavaScriptArrowFunction(remainder) {
+		if validJavaScriptArrowFunction(ctx, remainder, true) {
 			return true
 		}
-		return validJavaScriptArrowFunction(right)
+		return validJavaScriptArrowFunction(ctx, right, false)
 	}
 	if hasJavaScriptKeywordPrefix(right, "function") || right == "function" {
 		return validJavaScriptFunctionSyntax(right, false)
 	}
-	return validJavaScriptArrowFunction(right)
+	return validJavaScriptArrowFunction(ctx, right, false)
 }
 
 func validJavaScriptFunctionSyntax(value string, requireName bool) bool {
@@ -192,16 +198,16 @@ func validJavaScriptFunctionSyntax(value string, requireName bool) bool {
 	return strings.HasPrefix(tail, "{")
 }
 
-func validJavaScriptArrowFunction(value string) bool {
+func validJavaScriptArrowFunction(ctx context.Context, value string, allowAwait bool) bool {
 	if strings.HasPrefix(value, "(") {
 		tail, valid := validJavaScriptParameterList(value)
-		return valid && validJavaScriptArrowTail(tail)
+		return valid && validJavaScriptArrowTail(ctx, tail, allowAwait)
 	}
 	parameter, rest := leadingJavaScriptIdentifier(value)
-	return validJavaScriptIdentifier(parameter) && validJavaScriptArrowTail(rest)
+	return validJavaScriptIdentifier(parameter) && validJavaScriptArrowTail(ctx, rest, allowAwait)
 }
 
-func validJavaScriptArrowTail(value string) bool {
+func validJavaScriptArrowTail(ctx context.Context, value string, allowAwait bool) bool {
 	tail := strings.TrimSpace(value)
 	if !strings.HasPrefix(tail, "=>") {
 		return false
@@ -211,14 +217,14 @@ func validJavaScriptArrowTail(value string) bool {
 		strings.HasPrefix(body, "/*") {
 		return false
 	}
-	return validJavaScriptArrowBodyStarter(body)
+	return validJavaScriptArrowBodyStarter(ctx, body, allowAwait)
 }
 
 // validJavaScriptArrowBodyStarter deliberately recognizes a small expression
 // prefix subset. The lexical pass validates delimiters and literals; this
 // guard prevents statement/binary keywords and incomplete unary constructs
 // from becoming invented function boundaries without implementing an AST.
-func validJavaScriptArrowBodyStarter(body string) bool {
+func validJavaScriptArrowBodyStarter(ctx context.Context, body string, allowAwait bool) bool {
 	value := strings.TrimLeft(body, " \t\r\n")
 	for value != "" {
 		first := value[0]
@@ -227,7 +233,7 @@ func validJavaScriptArrowBodyStarter(body string) bool {
 			value = strings.TrimLeft(value[1:], " \t\r\n")
 			continue
 		case first == '<':
-			return completeJavaScriptJSXExpression(value)
+			return completeJavaScriptJSXExpression(ctx, value)
 		case first == '/' || first == '\'' || first == '"' || first == '`' ||
 			first == '(' || first == '[' || first == '{':
 			return true
@@ -236,9 +242,17 @@ func validJavaScriptArrowBodyStarter(body string) bool {
 		case isJavaScriptIdentifierStart(first):
 			keyword, rest := leadingJavaScriptIdentifier(value)
 			switch keyword {
-			case "await", "delete", "new", "typeof", "void", "yield":
+			case "await":
+				if !allowAwait {
+					return false
+				}
 				value = strings.TrimLeft(rest, " \t\r\n")
 				continue
+			case "delete", "new", "typeof", "void":
+				value = strings.TrimLeft(rest, " \t\r\n")
+				continue
+			case "yield":
+				return false
 			case "function":
 				return validJavaScriptFunctionSyntax(value, false)
 			case "class":
@@ -287,12 +301,12 @@ func validJavaScriptClassExpressionSyntax(value string) bool {
 	return strings.HasPrefix(remainder, "{")
 }
 
-func completeJavaScriptJSXExpression(value string) bool {
+func completeJavaScriptJSXExpression(ctx context.Context, value string) bool {
 	if !startsJavaScriptJSX(value, 0) {
 		return false
 	}
 	state := newJavaScriptLexicalState()
-	if err := state.consume(context.Background(), value); err != nil {
+	if err := state.consume(ctx, value); err != nil {
 		return false
 	}
 	return state.atTopLevel()

@@ -10,6 +10,8 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
+const javaScriptCancellationTestStride = 4 << 10
+
 func TestParserFindsTopLevelPythonDeclarations(t *testing.T) {
 	file := source.File{
 		Reference: source.Reference{Path: "src/app.py", StartLine: 1, EndLine: 12},
@@ -410,6 +412,59 @@ func TestParserJavaScriptRegexAfterControlBlockDoesNotCorruptTemplateState(t *te
 	assertSymbols(t, symbols, want)
 }
 
+func TestParserJavaScriptRegexAfterStatementBlockDoesNotCorruptTemplateState(t *testing.T) {
+	for _, prefix := range []string{
+		"{} /`/.test(value)",
+		"  {} /* bridge */ /`/.test(value)",
+	} {
+		t.Run(prefix, func(t *testing.T) {
+			lines := []string{
+				prefix,
+				"const source = `first",
+				"function fake() {}",
+				"`",
+				"function real() {}",
+			}
+			file := source.File{
+				Reference: source.Reference{Path: "src/statement-block-regex.js", StartLine: 1, EndLine: len(lines)},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(strings.Join(lines, "\n") + "\n"),
+			}
+
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			want := []source.Symbol{
+				{Name: "real", Kind: "function", Signature: lines[4], Reference: source.Reference{Path: "src/statement-block-regex.js", StartLine: 5, EndLine: 5}},
+			}
+			assertSymbols(t, symbols, want)
+		})
+	}
+}
+
+func TestParserJavaScriptPreservesObjectDivisionContext(t *testing.T) {
+	lines := []string{
+		"const ratio = {} / divisor",
+		"({ value: 1 }) / divisor",
+		"function real() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/object-division.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "real", Kind: "function", Signature: lines[2], Reference: source.Reference{Path: "src/object-division.js", StartLine: 3, EndLine: 3}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
 func TestParserJavaScriptIgnoresDeclarationTextInsideMultilineJSX(t *testing.T) {
 	lines := []string{
 		"<section data-label=\"</section>\">",
@@ -554,6 +609,57 @@ func TestParserJavaScriptArrowBodyUsesConservativeStarterSubset(t *testing.T) {
 	}
 }
 
+func TestParserJavaScriptAwaitRequiresAsyncArrowAndYieldFailsClosed(t *testing.T) {
+	invalidLines := []string{
+		"const nonAsync = () => await load()",
+		"const yielded = () => yield value",
+		"const asyncParameter = async => await load()",
+	}
+	for _, line := range invalidLines {
+		t.Run("invalid "+line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/arrow-context.js", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(symbols) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want none", line, symbols)
+			}
+		})
+	}
+
+	validLines := []struct {
+		line string
+		name string
+	}{
+		{line: "const load = async () => await loadValue()", name: "load"},
+		{line: "const mapped = async value => await transform(value)", name: "mapped"},
+		{line: "const asyncParameter = async => async", name: "asyncParameter"},
+	}
+	for _, test := range validLines {
+		t.Run("valid "+test.line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/async-arrow.js", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(test.line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			want := []source.Symbol{{
+				Name: test.name, Kind: "function", Signature: test.line,
+				Reference: source.Reference{Path: "src/async-arrow.js", StartLine: 1, EndLine: 1},
+			}}
+			assertSymbols(t, symbols, want)
+		})
+	}
+}
+
 func TestParserJavaScriptDelimiterOrderMustBeProperlyNested(t *testing.T) {
 	invalidLines := []string{
 		"const crossedBracket = () => ([)]",
@@ -674,6 +780,51 @@ func TestParserJavaScriptChecksCancellationWithinLongLexicalScan(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Parse() error = %v after %d checks, want context.Canceled during lexical scan", err, ctx.checks)
+	}
+}
+
+func TestParserJavaScriptChecksCancellationDuringJSXValidation(t *testing.T) {
+	ctx := &cancelAfterErrChecksContext{Context: context.Background(), cancelAfter: 5}
+	_, err := lineparser.NewParser().Parse(ctx, source.File{
+		Reference: source.Reference{Path: "view.jsx", StartLine: 1, EndLine: 1},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte("const View = () => <main />"),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Parse() error = %v after %d checks, want context.Canceled during JSX validation", err, ctx.checks)
+	}
+}
+
+func TestParserJavaScriptJSXValidationWorkIsLinearAndDelimiterDepthIsBounded(t *testing.T) {
+	content := "const View = () => <main>" + strings.Repeat("x", 32*1024) + "</main>"
+	ctx := &cancelAfterErrChecksContext{Context: context.Background(), cancelAfter: 1 << 30}
+	symbols, err := lineparser.NewParser().Parse(ctx, source.File{
+		Reference: source.Reference{Path: "large-view.jsx", StartLine: 1, EndLine: 1},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(content),
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(symbols) != 1 || symbols[0].Name != "View" {
+		t.Fatalf("Parse() symbols = %#v, want View", symbols)
+	}
+	maximumChecks := 2*(len(content)/javaScriptCancellationTestStride+2) + 4
+	if ctx.checks > maximumChecks {
+		t.Fatalf("Parse() made %d context checks, want at most %d linear checks", ctx.checks, maximumChecks)
+	}
+
+	tooDeep := "const Deep = () => <main>{" + strings.Repeat("(", 257) + "value" + strings.Repeat(")", 257) + "}</main>"
+	deepSymbols, err := lineparser.NewParser().Parse(context.Background(), source.File{
+		Reference: source.Reference{Path: "deep-view.jsx", StartLine: 1, EndLine: 1},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(tooDeep),
+	})
+	if err != nil {
+		t.Fatalf("Parse(deep) error = %v", err)
+	}
+	if len(deepSymbols) != 0 {
+		t.Fatalf("Parse(deep) symbols = %#v, want bounded fail-closed result", deepSymbols)
 	}
 }
 

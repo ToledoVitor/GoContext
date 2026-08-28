@@ -12,6 +12,7 @@ const (
 	javaScriptControlHeaderParen
 	javaScriptBracket
 	javaScriptGenericBrace
+	javaScriptStatementBlockBrace
 	javaScriptControlBlockBrace
 	javaScriptTemplateInterpolationBrace
 	javaScriptJSXExpressionBrace
@@ -198,6 +199,8 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 				delimiter := javaScriptGenericBrace
 				if state.pendingControlBlock {
 					delimiter = javaScriptControlBlockBrace
+				} else if atLineStart && state.canStartStatementBlock() {
+					delimiter = javaScriptStatementBlockBrace
 				}
 				state.clearPendingControlContext()
 				if !state.pushDelimiter(delimiter) {
@@ -219,7 +222,7 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 				case javaScriptJSXExpressionBrace:
 					state.jsxExpression = false
 					state.canStartRegex = false
-				case javaScriptControlBlockBrace:
+				case javaScriptControlBlockBrace, javaScriptStatementBlockBrace:
 					state.canStartRegex = true
 				default:
 					state.canStartRegex = false
@@ -362,12 +365,25 @@ func (state *javaScriptLexicalState) popParen() (javaScriptDelimiterKind, bool) 
 
 func (state *javaScriptLexicalState) popBrace() (javaScriptDelimiterKind, bool) {
 	delimiter, valid := state.popDelimiter()
-	if !valid || delimiter != javaScriptGenericBrace && delimiter != javaScriptControlBlockBrace &&
+	if !valid || delimiter != javaScriptGenericBrace && delimiter != javaScriptStatementBlockBrace &&
+		delimiter != javaScriptControlBlockBrace &&
 		delimiter != javaScriptTemplateInterpolationBrace && delimiter != javaScriptJSXExpressionBrace {
 		state.uncertain = true
 		return javaScriptGenericBrace, false
 	}
 	return delimiter, true
+}
+
+func (state *javaScriptLexicalState) canStartStatementBlock() bool {
+	if state.templateInterpolation || state.jsxExpression {
+		return false
+	}
+	if state.delimiterDepth == 0 {
+		return true
+	}
+	top := state.delimiters[state.delimiterDepth-1]
+	return top == javaScriptGenericBrace || top == javaScriptStatementBlockBrace ||
+		top == javaScriptControlBlockBrace
 }
 
 func startsJavaScriptJSX(line string, index int) bool {
