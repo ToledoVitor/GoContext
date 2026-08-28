@@ -1052,12 +1052,23 @@ func TestOpenExistingWaitsForFirstCreatorAndOpensPublishedStore(t *testing.T) {
 		store *Store
 		err   error
 	}
+	openerWaiting := make(chan struct{})
 	openerResult := make(chan openResult, 1)
 	go func() {
-		store, err := OpenExisting(directory)
+		store, err := openExisting(directory, openExistingHooks{
+			namespaceLock: storeNamespaceLockHooks{
+				beforeProcessWait: func(string) { close(openerWaiting) },
+			},
+		})
 		openerResult <- openResult{store: store, err: err}
 	}()
-
+	select {
+	case <-openerWaiting:
+	case <-time.After(5 * time.Second):
+		close(releaseCreator)
+		<-creatorResult
+		t.Fatal("OpenExisting() did not reach the live process lock wait")
+	}
 	select {
 	case result := <-openerResult:
 		if result.store != nil {
@@ -1066,7 +1077,7 @@ func TestOpenExistingWaitsForFirstCreatorAndOpensPublishedStore(t *testing.T) {
 		close(releaseCreator)
 		<-creatorResult
 		t.Fatalf("OpenExisting() returned before first creator published: %v", result.err)
-	case <-time.After(200 * time.Millisecond):
+	default:
 	}
 	close(releaseCreator)
 	if err := <-creatorResult; err != nil {
@@ -1109,20 +1120,32 @@ func TestOpenExistingWaitsForAbortedFirstCreatorAndReturnsAbsenceWithoutMutation
 	}()
 	<-creatorEntered
 
+	openerWaiting := make(chan struct{})
 	openerResult := make(chan error, 1)
 	go func() {
-		store, err := OpenExisting(directory)
+		store, err := openExisting(directory, openExistingHooks{
+			namespaceLock: storeNamespaceLockHooks{
+				beforeProcessWait: func(string) { close(openerWaiting) },
+			},
+		})
 		if store != nil {
 			err = errors.Join(err, store.Close())
 		}
 		openerResult <- err
 	}()
 	select {
+	case <-openerWaiting:
+	case <-time.After(5 * time.Second):
+		close(releaseCreator)
+		<-creatorResult
+		t.Fatal("OpenExisting() did not reach the live process lock wait")
+	}
+	select {
 	case err := <-openerResult:
 		close(releaseCreator)
 		<-creatorResult
 		t.Fatalf("OpenExisting() returned before first creator aborted: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	default:
 	}
 	close(releaseCreator)
 	if err := <-creatorResult; !errors.Is(err, index.ErrReindexRequired) {

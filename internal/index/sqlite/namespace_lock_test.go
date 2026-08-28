@@ -103,71 +103,89 @@ func TestStoreNamespaceLockSerializesAcrossProcesses(t *testing.T) {
 
 func TestOpenExistingSerializesWithFirstCreatorAcrossProcesses(t *testing.T) {
 	directory := t.TempDir()
-	command := exec.Command(os.Args[0], "-test.run=^TestStoreNamespaceLockHelperProcess$")
+	creatorEntered := make(chan struct{})
+	releaseCreator := make(chan struct{})
+	creatorResult := make(chan error, 1)
+	go func() {
+		store, err := newStore(directory, storeOpenHooks{
+			beforeFreshIdentityInsert: func(string) error {
+				close(creatorEntered)
+				<-releaseCreator
+				return nil
+			},
+		})
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		creatorResult <- err
+	}()
+	<-creatorEntered
+
+	var command *exec.Cmd
+	commandFinished := false
+	t.Cleanup(func() {
+		select {
+		case <-releaseCreator:
+		default:
+			close(releaseCreator)
+		}
+		if !commandFinished && command != nil && command.Process != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+	command = exec.Command(os.Args[0], "-test.run=^TestStoreNamespaceLockHelperProcess$")
 	command.Env = append(
 		os.Environ(),
-		namespaceLockHelperEnvironment+"=first-creator",
+		namespaceLockHelperEnvironment+"=open-existing",
 		namespaceLockDirectoryEnv+"="+directory,
 	)
-	stdin, err := command.StdinPipe()
-	if err != nil {
-		t.Fatalf("StdinPipe() error = %v", err)
-	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatalf("StdoutPipe() error = %v", err)
 	}
 	if err := command.Start(); err != nil {
-		t.Fatalf("Start(first creator helper) error = %v", err)
+		t.Fatalf("Start(subprocess opener) error = %v", err)
 	}
-	commandFinished := false
-	t.Cleanup(func() {
-		_ = stdin.Close()
-		if !commandFinished && command.Process != nil {
-			_ = command.Process.Kill()
-			_ = command.Wait()
-		}
-	})
 	output := bufio.NewReader(stdout)
-	line, err := output.ReadString('\n')
-	if err != nil || strings.TrimSpace(line) != "creating" {
-		t.Fatalf("first creator readiness = (%q, %v), want creating", line, err)
+	type outputResult struct {
+		line string
+		err  error
 	}
-
-	type openResult struct {
-		store *Store
-		err   error
-	}
-	openerResult := make(chan openResult, 1)
+	waitingResult := make(chan outputResult, 1)
 	go func() {
-		store, err := OpenExisting(directory)
-		openerResult <- openResult{store: store, err: err}
+		line, err := output.ReadString('\n')
+		waitingResult <- outputResult{line: line, err: err}
 	}()
 	select {
-	case result := <-openerResult:
-		if result.store != nil {
-			_ = result.store.Close()
-		}
-		t.Fatalf("OpenExisting() returned before subprocess creator published: %v", result.err)
-	case <-time.After(200 * time.Millisecond):
-	}
-	if _, err := stdin.Write([]byte("publish\n")); err != nil {
-		t.Fatalf("release first creator helper error = %v", err)
-	}
-	select {
-	case result := <-openerResult:
-		if result.err != nil || result.store == nil {
-			t.Fatalf("OpenExisting(after subprocess publication) = (%v, %v), want store", result.store, result.err)
-		}
-		if err := result.store.Close(); err != nil {
-			t.Fatalf("Close(opened store) error = %v", err)
+	case result := <-waitingResult:
+		if result.err != nil || strings.TrimSpace(result.line) != "waiting" {
+			t.Fatalf("subprocess opener boundary = (%q, %v), want waiting", result.line, result.err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("OpenExisting() remained blocked after subprocess creator published")
+		t.Fatal("subprocess opener did not reach the live OS lock wait")
 	}
-	line, err = output.ReadString('\n')
-	if err != nil || strings.TrimSpace(line) != "created" {
-		t.Fatalf("first creator completion = (%q, %v), want created", line, err)
+	openedResult := make(chan outputResult, 1)
+	go func() {
+		line, err := output.ReadString('\n')
+		openedResult <- outputResult{line: line, err: err}
+	}()
+	select {
+	case result := <-openedResult:
+		t.Fatalf("subprocess OpenExisting returned before first creator published: (%q, %v)", result.line, result.err)
+	default:
+	}
+	close(releaseCreator)
+	if err := <-creatorResult; err != nil {
+		t.Fatalf("newStore(first creator) error = %v", err)
+	}
+	select {
+	case result := <-openedResult:
+		if result.err != nil || strings.TrimSpace(result.line) != "opened" {
+			t.Fatalf("subprocess opener completion = (%q, %v), want opened", result.line, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("subprocess OpenExisting remained blocked after first creator published")
 	}
 	if err := command.Wait(); err != nil {
 		t.Fatalf("Wait(first creator helper) error = %v", err)
@@ -255,24 +273,23 @@ func TestStoreNamespaceLockHelperProcess(t *testing.T) {
 		return
 	}
 	directory := os.Getenv(namespaceLockDirectoryEnv)
-	if mode == "first-creator" {
-		store, err := newStore(directory, storeOpenHooks{
-			beforeFreshIdentityInsert: func(string) error {
-				if _, err := fmt.Fprintln(os.Stdout, "creating"); err != nil {
+	if mode == "open-existing" {
+		store, err := openExisting(directory, openExistingHooks{
+			namespaceLock: storeNamespaceLockHooks{
+				beforeFileLock: func(string) error {
+					_, err := fmt.Fprintln(os.Stdout, "waiting")
 					return err
-				}
-				_, err := bufio.NewReader(os.Stdin).ReadString('\n')
-				return err
+				},
 			},
 		})
 		if err != nil {
-			t.Fatalf("newStore(first creator helper) error = %v", err)
+			t.Fatalf("openExisting(subprocess opener) error = %v", err)
 		}
 		if err := store.Close(); err != nil {
-			t.Fatalf("Close(first creator helper) error = %v", err)
+			t.Fatalf("Close(subprocess opener) error = %v", err)
 		}
-		if _, err := fmt.Fprintln(os.Stdout, "created"); err != nil {
-			t.Fatalf("announce first creator completion error = %v", err)
+		if _, err := fmt.Fprintln(os.Stdout, "opened"); err != nil {
+			t.Fatalf("announce subprocess opener completion error = %v", err)
 		}
 		return
 	}
