@@ -151,6 +151,8 @@ Erros degradáveis em `preferred`: timeout interno, conexão indisponível, HTTP
 
 Primeiro store persistente será SQLite local, usando driver Go sem CGO após teste de compatibilidade com Go 1.24. SQLite guarda:
 
+O gate executado em 2026-08-28 resolveu a release corrente `modernc.org/sqlite v1.57.0` (tag `v1.57.0`, commit `6e86ac4a89e3f36359d1947e36355c469b18430c`, fonte `https://gitlab.com/cznic/sqlite`) via tooling de módulos Go. A licença da distribuição é BSD-3-Clause, permissiva. Essa release declara `go 1.25.0` e foi rejeitada porque o projeto exige compatibilidade com Go 1.24; por isso nenhum driver foi adotado, o teste `CGO_ENABLED=0` não prosseguiu e a implementação do store permanece bloqueada até decisão específica. Não houve substituição por driver CGO nem downgrade silencioso.
+
 - gerações e manifest ativo por repositório;
 - chunks canônicos e `source.Reference`;
 - perfil, dimensão, métrica e revisão do corpus;
