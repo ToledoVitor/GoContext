@@ -3,9 +3,13 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io/fs"
 	"net/url"
 	"os"
@@ -34,6 +38,7 @@ type BoundReader struct {
 	repositoryID      string
 	generationID      string
 	corpusRevision    string
+	contentDigest     string
 	scanPolicyVersion string
 
 	mu     sync.Mutex
@@ -59,17 +64,56 @@ func NewStore(directory string) (*Store, error) {
 	if !info.IsDir() {
 		return nil, fmt.Errorf("create sqlite index store: path is not a directory")
 	}
-	if err := os.Chmod(abs, 0o700); err != nil {
-		return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
-	}
 	canonical, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return nil, fmt.Errorf("create sqlite index store: resolve directory: %w", err)
 	}
 	databasePath := filepath.Join(canonical, databaseName)
-	created, err := createPrivateDatabaseFile(databasePath)
-	if err != nil {
-		return nil, fmt.Errorf("create sqlite index store: create database: %w", err)
+	_, statErr := os.Stat(databasePath)
+	databaseExists := statErr == nil
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("create sqlite index store: inspect database: %w", statErr)
+	}
+	if databaseExists {
+		if err := inspectDatabase(databasePath); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: %w", err)
+		}
+		if err := os.Chmod(canonical, 0o700); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
+		}
+	}
+
+	created := false
+	if !databaseExists {
+		if err := os.Chmod(canonical, 0o700); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
+		}
+		created, err = createPrivateDatabaseFile(databasePath)
+		if err != nil {
+			return nil, fmt.Errorf("create sqlite index store: create database: %w", err)
+		}
+	}
+	if created {
+		if err := initializeNewDatabase(databasePath); err != nil {
+			removeCreatedDatabase(databasePath)
+			return nil, fmt.Errorf("create sqlite index store: initialize database: %w", err)
+		}
+	}
+	if !databaseExists {
+		if err := inspectDatabase(databasePath); err != nil {
+			if created {
+				removeCreatedDatabase(databasePath)
+			}
+			return nil, fmt.Errorf("create sqlite index store: %w", err)
+		}
+	}
+	if databaseExists || created {
+		if err := os.Chmod(databasePath, 0o600); err != nil {
+			if created {
+				removeCreatedDatabase(databasePath)
+			}
+			return nil, fmt.Errorf("create sqlite index store: secure database: %w", err)
+		}
 	}
 
 	db, err := sql.Open("sqlite", dataSourceName(databasePath))
@@ -78,12 +122,12 @@ func NewStore(directory string) (*Store, error) {
 	}
 	store := &Store{db: db, writeToken: make(chan struct{}, 1)}
 	store.writeToken <- struct{}{}
-	if err := store.initialize(context.Background()); err != nil {
+	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
 		if created {
-			_ = os.Remove(databasePath)
+			removeCreatedDatabase(databasePath)
 		}
-		return nil, fmt.Errorf("create sqlite index store: %w", err)
+		return nil, fmt.Errorf("create sqlite index store: open operational database: %w", err)
 	}
 	return store, nil
 }
@@ -113,36 +157,144 @@ func dataSourceName(path string) string {
 	return dsn.String()
 }
 
-func (s *Store) initialize(ctx context.Context) error {
+func bootstrapDataSourceName(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String()
+}
+
+func inspectionDataSourceName(path string) string {
+	dsn := &url.URL{Scheme: "file", Path: path}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	query.Set("immutable", "1")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
+}
+
+func initializeNewDatabase(path string) error {
+	db, err := sql.Open("sqlite", bootstrapDataSourceName(path))
+	if err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(context.Background(), schemaSQL); err != nil {
+		_ = db.Close()
+		return err
+	}
+	return db.Close()
+}
+
+func inspectDatabase(path string) error {
+	db, err := sql.Open("sqlite", inspectionDataSourceName(path))
+	if err != nil {
+		return err
+	}
+	validationErr := validateSchema(context.Background(), db)
+	closeErr := db.Close()
+	if validationErr != nil {
+		return validationErr
+	}
+	return closeErr
+}
+
+type schemaQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type schemaColumn struct {
+	name               string
+	typeName           string
+	notNull            int
+	primaryKeyPosition int
+}
+
+type schemaForeignKey struct {
+	sequence int
+	table    string
+	from     string
+	to       string
+	onUpdate string
+	onDelete string
+}
+
+var requiredSchemaColumns = map[string][]schemaColumn{
+	"schema_version": {
+		{name: "version", typeName: "INTEGER", notNull: 1},
+	},
+	"repositories": {
+		{name: "repository_id", typeName: "TEXT", primaryKeyPosition: 1},
+		{name: "active_generation", typeName: "TEXT"},
+	},
+	"generations": {
+		{name: "repository_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 1},
+		{name: "generation_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 2},
+		{name: "corpus_revision", typeName: "TEXT", notNull: 1},
+		{name: "content_digest", typeName: "TEXT", notNull: 1},
+		{name: "scan_policy_version", typeName: "TEXT", notNull: 1},
+		{name: "profile_fingerprint", typeName: "TEXT"},
+		{name: "profile_model", typeName: "TEXT"},
+		{name: "dimensions", typeName: "INTEGER", notNull: 1},
+		{name: "metric", typeName: "TEXT", notNull: 1},
+	},
+	"chunks": {
+		{name: "repository_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 1},
+		{name: "generation_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 2},
+		{name: "chunk_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 3},
+		{name: "ordinal", typeName: "INTEGER", notNull: 1},
+		{name: "text", typeName: "TEXT", notNull: 1},
+		{name: "language", typeName: "TEXT", notNull: 1},
+		{name: "symbol_name", typeName: "TEXT", notNull: 1},
+		{name: "path", typeName: "TEXT", notNull: 1},
+		{name: "start_line", typeName: "INTEGER", notNull: 1},
+		{name: "end_line", typeName: "INTEGER", notNull: 1},
+	},
+	"vectors": {
+		{name: "repository_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 1},
+		{name: "generation_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 2},
+		{name: "chunk_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 3},
+		{name: "encoding_version", typeName: "INTEGER", notNull: 1},
+		{name: "dimensions", typeName: "INTEGER", notNull: 1},
+		{name: "values_blob", typeName: "BLOB", notNull: 1},
+	},
+}
+
+var requiredSchemaForeignKeys = map[string][]schemaForeignKey{
+	"repositories": {
+		{sequence: 0, table: "generations", from: "repository_id", to: "repository_id", onUpdate: "NO ACTION", onDelete: "NO ACTION"},
+		{sequence: 1, table: "generations", from: "active_generation", to: "generation_id", onUpdate: "NO ACTION", onDelete: "NO ACTION"},
+	},
+	"generations": {
+		{sequence: 0, table: "repositories", from: "repository_id", to: "repository_id", onUpdate: "NO ACTION", onDelete: "CASCADE"},
+	},
+	"chunks": {
+		{sequence: 0, table: "generations", from: "repository_id", to: "repository_id", onUpdate: "NO ACTION", onDelete: "CASCADE"},
+		{sequence: 1, table: "generations", from: "generation_id", to: "generation_id", onUpdate: "NO ACTION", onDelete: "CASCADE"},
+	},
+	"vectors": {
+		{sequence: 0, table: "chunks", from: "repository_id", to: "repository_id", onUpdate: "NO ACTION", onDelete: "CASCADE"},
+		{sequence: 1, table: "chunks", from: "generation_id", to: "generation_id", onUpdate: "NO ACTION", onDelete: "CASCADE"},
+		{sequence: 2, table: "chunks", from: "chunk_id", to: "chunk_id", onUpdate: "NO ACTION", onDelete: "CASCADE"},
+	},
+}
+
+func validateSchema(ctx context.Context, database schemaQuerier) error {
 	var markerTables int
-	if err := s.db.QueryRowContext(ctx,
+	if err := database.QueryRowContext(ctx,
 		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_version'`,
 	).Scan(&markerTables); err != nil {
 		return fmt.Errorf("inspect schema: %w", err)
 	}
-	if markerTables == 0 {
-		var applicationTables int
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
-		).Scan(&applicationTables); err != nil {
-			return fmt.Errorf("inspect schema: %w", err)
-		}
-		if applicationTables != 0 {
-			return index.ErrReindexRequired
-		}
-		if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
-			return fmt.Errorf("initialize schema: %w", err)
-		}
+	if markerTables != 1 {
+		return index.ErrReindexRequired
 	}
 	var version, rows int
-	if err := s.db.QueryRowContext(ctx, `SELECT min(version), count(*) FROM schema_version`).Scan(&version, &rows); err != nil {
+	if err := database.QueryRowContext(ctx, `SELECT min(version), count(*) FROM schema_version`).Scan(&version, &rows); err != nil {
 		return fmt.Errorf("%w: unreadable schema marker", index.ErrReindexRequired)
 	}
 	if rows != 1 || version != schemaVersion {
 		return index.ErrReindexRequired
 	}
 	var schemaTables int
-	if err := s.db.QueryRowContext(ctx, `
+	if err := database.QueryRowContext(ctx, `
 		SELECT count(*) FROM sqlite_schema
 		WHERE type = 'table'
 		  AND name IN ('schema_version', 'repositories', 'generations', 'chunks', 'vectors')`,
@@ -152,7 +304,152 @@ func (s *Store) initialize(ctx context.Context) error {
 	if schemaTables != 5 {
 		return index.ErrReindexRequired
 	}
+	for table, columns := range requiredSchemaColumns {
+		if err := validateTableColumns(ctx, database, table, columns); err != nil {
+			return index.ErrReindexRequired
+		}
+	}
+	for table, foreignKeys := range requiredSchemaForeignKeys {
+		if err := validateTableForeignKeys(ctx, database, table, foreignKeys); err != nil {
+			return index.ErrReindexRequired
+		}
+	}
+	if err := validateUniqueIndex(ctx, database, "chunks", []string{"repository_id", "generation_id", "ordinal"}); err != nil {
+		return index.ErrReindexRequired
+	}
 	return nil
+}
+
+func validateTableColumns(ctx context.Context, database schemaQuerier, table string, expected []schemaColumn) error {
+	rows, err := database.QueryContext(ctx, `PRAGMA table_info("`+table+`")`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	actual := make([]schemaColumn, 0, len(expected))
+	for rows.Next() {
+		var cid int
+		var column schemaColumn
+		var defaultValue any
+		if err := rows.Scan(&cid, &column.name, &column.typeName, &column.notNull, &defaultValue, &column.primaryKeyPosition); err != nil {
+			return err
+		}
+		column.typeName = strings.ToUpper(column.typeName)
+		actual = append(actual, column)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(actual) != len(expected) {
+		return index.ErrReindexRequired
+	}
+	for position := range expected {
+		if actual[position] != expected[position] {
+			return index.ErrReindexRequired
+		}
+	}
+	return nil
+}
+
+func validateTableForeignKeys(ctx context.Context, database schemaQuerier, table string, expected []schemaForeignKey) error {
+	rows, err := database.QueryContext(ctx, `PRAGMA foreign_key_list("`+table+`")`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	actual := make([]schemaForeignKey, 0, len(expected))
+	for rows.Next() {
+		var id int
+		var key schemaForeignKey
+		var match string
+		if err := rows.Scan(&id, &key.sequence, &key.table, &key.from, &key.to, &key.onUpdate, &key.onDelete, &match); err != nil {
+			return err
+		}
+		actual = append(actual, key)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(actual) != len(expected) {
+		return index.ErrReindexRequired
+	}
+	for position := range expected {
+		if actual[position] != expected[position] {
+			return index.ErrReindexRequired
+		}
+	}
+	return nil
+}
+
+func validateUniqueIndex(ctx context.Context, database schemaQuerier, table string, expectedColumns []string) error {
+	rows, err := database.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var candidates []string
+	for rows.Next() {
+		var sequence, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&sequence, &name, &unique, &origin, &partial); err != nil {
+			return err
+		}
+		if unique == 1 && partial == 0 {
+			candidates = append(candidates, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		indexRows, err := database.QueryContext(ctx, `PRAGMA index_info("`+candidate+`")`)
+		if err != nil {
+			return err
+		}
+		var columns []string
+		for indexRows.Next() {
+			var sequence, cid int
+			var column string
+			if err := indexRows.Scan(&sequence, &cid, &column); err != nil {
+				_ = indexRows.Close()
+				return err
+			}
+			columns = append(columns, column)
+		}
+		iterationErr := indexRows.Err()
+		closeErr := indexRows.Close()
+		if iterationErr != nil {
+			return iterationErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if equalStrings(columns, expectedColumns) {
+			return nil
+		}
+	}
+	return index.ErrReindexRequired
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for position := range left {
+		if left[position] != right[position] {
+			return false
+		}
+	}
+	return true
+}
+
+func removeCreatedDatabase(path string) {
+	_ = os.Remove(path)
+	_ = os.Remove(path + "-wal")
+	_ = os.Remove(path + "-shm")
 }
 
 // Close releases database resources.
@@ -180,6 +477,9 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	if len(generation.Vectors) != 0 {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
 	}
+	if !validGenerationVectorMetadata(generation) {
+		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
+	}
 	corpus, err := source.NewCorpus(generation.ScanPolicyVersion, generation.Chunks)
 	if err != nil || corpus.Revision != generation.CorpusRevision {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
@@ -198,10 +498,10 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelCleanup()
 	if err := s.purgeInactive(cleanupCtx); err != nil {
-		return fmt.Errorf("replace sqlite index: purge inactive generations: %w", err)
+		return fmt.Errorf("replace sqlite index: %w", index.NewCommittedCleanupError(index.CleanupStagePurge, err))
 	}
 	if err := s.checkpoint(cleanupCtx); err != nil {
-		return fmt.Errorf("replace sqlite index: checkpoint database: %w", err)
+		return fmt.Errorf("replace sqlite index: %w", index.NewCommittedCleanupError(index.CleanupStageCheckpoint, err))
 	}
 	return nil
 }
@@ -298,11 +598,11 @@ func (s *Store) publishAttempt(ctx context.Context, generation index.Generation)
 	}
 	if _, err := connection.ExecContext(ctx, `
 		INSERT INTO generations(
-			repository_id, generation_id, corpus_revision, scan_policy_version,
-			profile_fingerprint, profile_model, dimensions
-		) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		generation.RepositoryID, generation.ID, generation.CorpusRevision, generation.ScanPolicyVersion,
-		storedFingerprint, storedModel, generation.Dimensions,
+			repository_id, generation_id, corpus_revision, content_digest, scan_policy_version,
+			profile_fingerprint, profile_model, dimensions, metric
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		generation.RepositoryID, generation.ID, generation.CorpusRevision, canonicalContentDigest(generation.Chunks), generation.ScanPolicyVersion,
+		storedFingerprint, storedModel, generation.Dimensions, string(generation.Metric),
 	); err != nil {
 		return false, fmt.Errorf("insert generation: %w", err)
 	}
@@ -379,28 +679,57 @@ type queryRower interface {
 }
 
 func generationMetadataMatches(ctx context.Context, database queryRower, generation index.Generation) (bool, error) {
-	var revision, policy, fingerprint, model string
+	var revision, contentDigest, policy, fingerprint, model, metric string
 	var dimensions, chunks int
 	err := database.QueryRowContext(ctx, `
-		SELECT g.corpus_revision, g.scan_policy_version,
+		SELECT g.corpus_revision, g.content_digest, g.scan_policy_version,
 		       COALESCE(g.profile_fingerprint, ''), COALESCE(g.profile_model, ''),
-		       g.dimensions, count(c.chunk_id)
+		       g.dimensions, g.metric, count(c.chunk_id)
 		FROM generations AS g
 		LEFT JOIN chunks AS c
 		  ON c.repository_id = g.repository_id AND c.generation_id = g.generation_id
 		WHERE g.repository_id = ? AND g.generation_id = ?
 		GROUP BY g.repository_id, g.generation_id`, generation.RepositoryID, generation.ID,
-	).Scan(&revision, &policy, &fingerprint, &model, &dimensions, &chunks)
+	).Scan(&revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric, &chunks)
 	if err != nil {
 		return false, err
 	}
 	expectedFingerprint, expectedModel := profileMetadata(generation)
 	return revision == generation.CorpusRevision &&
+		contentDigest == canonicalContentDigest(generation.Chunks) &&
 		policy == generation.ScanPolicyVersion &&
 		fingerprint == expectedFingerprint &&
 		model == expectedModel &&
 		dimensions == generation.Dimensions &&
+		metric == string(generation.Metric) &&
 		chunks == len(generation.Chunks), nil
+}
+
+func canonicalContentDigest(chunks []source.Chunk) string {
+	digest := sha256.New()
+	writeCanonicalString(digest, "sqlite-canonical-content-v1")
+	for ordinal, chunk := range chunks {
+		writeCanonicalInteger(digest, int64(ordinal))
+		writeCanonicalString(digest, chunk.ID)
+		writeCanonicalString(digest, chunk.Text)
+		writeCanonicalString(digest, string(chunk.Language))
+		writeCanonicalString(digest, chunk.SymbolName)
+		writeCanonicalString(digest, chunk.Reference.Path)
+		writeCanonicalInteger(digest, int64(chunk.Reference.StartLine))
+		writeCanonicalInteger(digest, int64(chunk.Reference.EndLine))
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func writeCanonicalString(writer hash.Hash, value string) {
+	writeCanonicalInteger(writer, int64(len(value)))
+	_, _ = writer.Write([]byte(value))
+}
+
+func writeCanonicalInteger(writer hash.Hash, value int64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(value))
+	_, _ = writer.Write(encoded[:])
 }
 
 func isSQLiteBusy(err error) bool {
@@ -417,6 +746,18 @@ func profileMetadata(generation index.Generation) (string, string) {
 		return "", ""
 	}
 	return generation.Profile.Fingerprint, generation.Profile.Model
+}
+
+func validGenerationVectorMetadata(generation index.Generation) bool {
+	if generation.Metric != index.VectorMetricCosine {
+		return false
+	}
+	if generation.Profile == nil {
+		return generation.Dimensions == 0
+	}
+	return strings.TrimSpace(generation.Profile.Fingerprint) != "" &&
+		strings.TrimSpace(generation.Profile.Model) != "" &&
+		generation.Dimensions > 0
 }
 
 // ActiveGeneration returns the active generation ID for one repository.
@@ -453,15 +794,18 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 	if err != nil {
 		return nil, fmt.Errorf("bind active sqlite index: begin transaction: %w", err)
 	}
-	var generationID, revision, policy string
+	var generationID, revision, contentDigest, policy, fingerprint, model, metric string
+	var dimensions int
 	err = tx.QueryRowContext(ctx, `
-		SELECT g.generation_id, g.corpus_revision, g.scan_policy_version
+		SELECT g.generation_id, g.corpus_revision, g.content_digest, g.scan_policy_version,
+		       COALESCE(g.profile_fingerprint, ''), COALESCE(g.profile_model, ''),
+		       g.dimensions, g.metric
 		FROM repositories AS r
 		JOIN generations AS g
 		  ON g.repository_id = r.repository_id
 		 AND g.generation_id = r.active_generation
 		WHERE r.repository_id = ?`, repositoryID,
-	).Scan(&generationID, &revision, &policy)
+	).Scan(&generationID, &revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = tx.Rollback()
 		return nil, index.ErrNotFound
@@ -474,13 +818,25 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 		_ = tx.Rollback()
 		return nil, index.ErrReindexRequired
 	}
+	if metric != string(index.VectorMetricCosine) || !validStoredVectorMetadata(fingerprint, model, dimensions) {
+		_ = tx.Rollback()
+		return nil, index.ErrReindexRequired
+	}
 	return &BoundReader{
 		tx:                tx,
 		repositoryID:      repositoryID,
 		generationID:      generationID,
 		corpusRevision:    revision,
+		contentDigest:     contentDigest,
 		scanPolicyVersion: policy,
 	}, nil
+}
+
+func validStoredVectorMetadata(fingerprint, model string, dimensions int) bool {
+	if fingerprint == "" && model == "" {
+		return dimensions == 0
+	}
+	return strings.TrimSpace(fingerprint) != "" && strings.TrimSpace(model) != "" && dimensions > 0
 }
 
 // GenerationID returns the generation pinned by the reader.
@@ -531,7 +887,7 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 		return nil, fmt.Errorf("load bound sqlite index: read chunks: %w", err)
 	}
 	corpus, err := source.NewCorpus(r.scanPolicyVersion, chunks)
-	if err != nil || corpus.Revision != r.corpusRevision {
+	if err != nil || corpus.Revision != r.corpusRevision || canonicalContentDigest(chunks) != r.contentDigest {
 		return nil, index.ErrReindexRequired
 	}
 	return chunks, nil
@@ -561,10 +917,25 @@ func (s *Store) Load(ctx context.Context, repositoryID string) ([]source.Chunk, 
 	if err != nil {
 		return nil, fmt.Errorf("load sqlite index: %w", err)
 	}
-	defer reader.Close()
+	return loadAndClose(ctx, repositoryID, reader)
+}
+
+type corpusReadCloser interface {
+	Load(context.Context, string) ([]source.Chunk, error)
+	Close() error
+}
+
+func loadAndClose(ctx context.Context, repositoryID string, reader corpusReadCloser) ([]source.Chunk, error) {
 	chunks, err := reader.Load(ctx, repositoryID)
+	closeErr := reader.Close()
+	if err != nil && closeErr != nil {
+		return nil, fmt.Errorf("load sqlite index: %w", errors.Join(err, fmt.Errorf("close bound reader: %w", closeErr)))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load sqlite index: %w", err)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("load sqlite index: close bound reader: %w", closeErr)
 	}
 	return chunks, nil
 }

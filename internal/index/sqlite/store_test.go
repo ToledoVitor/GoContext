@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ToledoVitor/GoContext/internal/embedding"
 	"github.com/ToledoVitor/GoContext/internal/index"
 	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
@@ -33,6 +34,7 @@ func TestStorePublishesAndLoadsCorpus(t *testing.T) {
 		ID:                "generation-one",
 		CorpusRevision:    corpus.Revision,
 		ScanPolicyVersion: corpus.PolicyVersion,
+		Metric:            index.VectorMetricCosine,
 		Chunks:            corpus.Chunks,
 	}
 
@@ -55,6 +57,107 @@ func TestStorePublishesAndLoadsCorpus(t *testing.T) {
 	}
 }
 
+func TestStorePersistsAndValidatesVectorMetric(t *testing.T) {
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	generation := generationFromCorpus(t, "repository", "generation", "", []source.Chunk{
+		sampleChunk("chunk", "metric.py", "METRIC = 1"),
+	})
+	generation.Profile = &embedding.Profile{Fingerprint: "profile-fingerprint", Model: "model"}
+	generation.Dimensions = 3
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	db := openRawDatabase(t, directory)
+	var metric string
+	if err := db.QueryRow(`SELECT metric FROM generations WHERE repository_id = ? AND generation_id = ?`, generation.RepositoryID, generation.ID).Scan(&metric); err != nil {
+		t.Fatalf("query metric error = %v", err)
+	}
+	if metric != string(index.VectorMetricCosine) {
+		t.Fatalf("stored metric = %q, want %q", metric, index.VectorMetricCosine)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database error = %v", err)
+	}
+
+	reopened := openStore(t, directory)
+	if err := reopened.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace(idempotent after reopen) error = %v", err)
+	}
+}
+
+func TestStoreRejectsPersistedVectorMetricMismatchAfterReopen(t *testing.T) {
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	generation := generationFromCorpus(t, "repository", "generation", "", []source.Chunk{
+		sampleChunk("chunk", "private-metric.py", "PRIVATE_METRIC_CANARY"),
+	})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	db := openRawDatabase(t, directory)
+	if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON; UPDATE generations SET metric = 'dot-product'`); err != nil {
+		t.Fatalf("corrupt metric error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database error = %v", err)
+	}
+
+	reopened := openStore(t, directory)
+	_, err := reopened.Load(context.Background(), generation.RepositoryID)
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("Load(metric mismatch) error = %v, want ErrReindexRequired", err)
+	}
+	for _, private := range []string{"PRIVATE_METRIC_CANARY", "private-metric.py"} {
+		if strings.Contains(err.Error(), private) {
+			t.Fatalf("Load(metric mismatch) error exposes source %q: %v", private, err)
+		}
+	}
+}
+
+func TestStoreRejectsInconsistentVectorMetadata(t *testing.T) {
+	valid := generationFromCorpus(t, "repository", "generation", "", []source.Chunk{
+		sampleChunk("chunk", "metadata.py", "METADATA = 1"),
+	})
+	missingMetric := valid
+	missingMetric.Metric = ""
+	unsupportedMetric := valid
+	unsupportedMetric.Metric = index.VectorMetric("dot-product")
+	dimensionsWithoutProfile := valid
+	dimensionsWithoutProfile.Dimensions = 3
+	profileWithoutDimensions := valid
+	profileWithoutDimensions.Profile = &embedding.Profile{Fingerprint: "fingerprint", Model: "model"}
+	emptyProfile := valid
+	emptyProfile.Profile = &embedding.Profile{}
+	emptyProfile.Dimensions = 3
+
+	for _, tt := range []struct {
+		name       string
+		generation index.Generation
+	}{
+		{name: "missing metric", generation: missingMetric},
+		{name: "unsupported metric", generation: unsupportedMetric},
+		{name: "dimensions without profile", generation: dimensionsWithoutProfile},
+		{name: "profile without dimensions", generation: profileWithoutDimensions},
+		{name: "empty profile", generation: emptyProfile},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newStore(t)
+			if err := store.Replace(context.Background(), tt.generation); !errors.Is(err, index.ErrInvalidGeneration) {
+				t.Fatalf("Replace(inconsistent vector metadata) error = %v, want ErrInvalidGeneration", err)
+			}
+		})
+	}
+}
+
 func TestStoreRejectsEmptyGenerationIdentifiers(t *testing.T) {
 	store := newStore(t)
 	corpus := mustCorpus(t, []source.Chunk{sampleChunk("chunk", "private/canary.py", "PRIVATE_CANARY")})
@@ -63,6 +166,7 @@ func TestStoreRejectsEmptyGenerationIdentifiers(t *testing.T) {
 		ID:                "generation",
 		CorpusRevision:    corpus.Revision,
 		ScanPolicyVersion: corpus.PolicyVersion,
+		Metric:            index.VectorMetricCosine,
 		Chunks:            corpus.Chunks,
 	}
 
@@ -84,6 +188,7 @@ func TestStoreRejectsInvalidChunkProvenance(t *testing.T) {
 		ID:                "generation",
 		CorpusRevision:    "forged-revision",
 		ScanPolicyVersion: ingest.ScanPolicyVersion,
+		Metric:            index.VectorMetricCosine,
 		Chunks: []source.Chunk{{
 			ID:        "chunk",
 			Text:      "PRIVATE_INVALID_REFERENCE_CANARY",
@@ -113,6 +218,7 @@ func TestStoreRequiresCurrentScanPolicy(t *testing.T) {
 		ID:                "legacy-generation",
 		CorpusRevision:    legacy.Revision,
 		ScanPolicyVersion: legacy.PolicyVersion,
+		Metric:            index.VectorMetricCosine,
 		Chunks:            legacy.Chunks,
 	}
 
@@ -202,6 +308,50 @@ func TestStoreRejectsGenerationIDCollisionWithDifferentMetadata(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "PRIVATE_DIFFERENT_CANARY") || strings.Contains(err.Error(), "private-different.py") {
 		t.Fatalf("Replace(ID collision) error exposes source: %q", err)
+	}
+}
+
+func TestStoreRejectsActiveGenerationWithChangedCanonicalContent(t *testing.T) {
+	store := newStore(t)
+	first := generationFromCorpus(t, "repository", "same-generation", "", []source.Chunk{
+		sampleChunk("first", "private-first.py", "PRIVATE_FIRST_CANARY"),
+		sampleChunk("second", "private-second.py", "PRIVATE_SECOND_CANARY"),
+	})
+	if err := store.Replace(context.Background(), first); err != nil {
+		t.Fatalf("Replace(first) error = %v", err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func([]source.Chunk)
+	}{
+		{name: "text", mutate: func(chunks []source.Chunk) { chunks[0].Text = "PRIVATE_CHANGED_TEXT_CANARY" }},
+		{name: "reference path", mutate: func(chunks []source.Chunk) { chunks[0].Reference.Path = "private-changed.py" }},
+		{name: "reference start", mutate: func(chunks []source.Chunk) { chunks[0].Reference.StartLine++ }},
+		{name: "reference end", mutate: func(chunks []source.Chunk) { chunks[0].Reference.EndLine++ }},
+		{name: "language", mutate: func(chunks []source.Chunk) { chunks[0].Language = source.LanguageTypeScript }},
+		{name: "symbol", mutate: func(chunks []source.Chunk) { chunks[0].SymbolName = "PrivateChangedSymbol" }},
+		{name: "order", mutate: func(chunks []source.Chunk) { chunks[0], chunks[1] = chunks[1], chunks[0] }},
+	}
+	for _, tt := range mutations {
+		t.Run(tt.name, func(t *testing.T) {
+			changedChunks := append([]source.Chunk(nil), first.Chunks...)
+			tt.mutate(changedChunks)
+			changed := generationFromCorpus(t, first.RepositoryID, first.ID, first.BaseGeneration, changedChunks)
+			if changed.CorpusRevision != first.CorpusRevision {
+				t.Fatalf("mutation changed corpus revision = %q, want stable %q", changed.CorpusRevision, first.CorpusRevision)
+			}
+
+			err := store.Replace(context.Background(), changed)
+			if !errors.Is(err, index.ErrInvalidGeneration) {
+				t.Fatalf("Replace(changed canonical content) error = %v, want ErrInvalidGeneration", err)
+			}
+			for _, private := range []string{"PRIVATE_CHANGED_TEXT_CANARY", "private-changed.py", "PrivateChangedSymbol"} {
+				if strings.Contains(err.Error(), private) {
+					t.Fatalf("Replace(changed canonical content) error exposes source %q: %v", private, err)
+				}
+			}
+		})
 	}
 }
 
@@ -392,7 +542,138 @@ func TestStoreTransactionFailurePreservesActiveManifest(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsPersistedStalePolicyAndRevision(t *testing.T) {
+func TestStoreReportsCommittedPublicationWhenPurgeFails(t *testing.T) {
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	first := generationFromCorpus(t, "repository", "generation-one", "", []source.Chunk{
+		sampleChunk("first", "private-first.py", "PRIVATE_FIRST_CANARY"),
+	})
+	if err := store.Replace(context.Background(), first); err != nil {
+		t.Fatalf("Replace(first) error = %v", err)
+	}
+
+	db := openRawDatabase(t, directory)
+	if _, err := db.Exec(`
+		CREATE TRIGGER fail_inactive_generation_purge
+		BEFORE DELETE ON generations
+		WHEN OLD.generation_id = 'generation-one'
+		BEGIN
+			SELECT RAISE(ABORT, 'PRIVATE_CLEANUP_FAILURE_CANARY');
+		END`); err != nil {
+		t.Fatalf("create cleanup failure trigger error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close cleanup failure database error = %v", err)
+	}
+
+	second := generationFromCorpus(t, first.RepositoryID, "generation-two", first.ID, []source.Chunk{
+		sampleChunk("second", "private-second.py", "PRIVATE_SECOND_CANARY"),
+	})
+	err := store.Replace(context.Background(), second)
+	var committed *index.CommittedCleanupError
+	if !errors.As(err, &committed) {
+		t.Fatalf("Replace(second) error = %T %v, want CommittedCleanupError", err, err)
+	}
+	if !errors.Is(err, index.ErrCleanupIncomplete) || !committed.Published() {
+		t.Fatalf("Replace(second) error = %v, want published cleanup-incomplete outcome", err)
+	}
+	if committed.Stage() != index.CleanupStagePurge {
+		t.Fatalf("Replace(second) cleanup stage = %q, want %q", committed.Stage(), index.CleanupStagePurge)
+	}
+	if strings.Contains(err.Error(), "PRIVATE_CLEANUP_FAILURE_CANARY") {
+		t.Fatalf("Replace(second) error exposes cleanup trigger content: %v", err)
+	}
+	active, activeErr := store.ActiveGeneration(context.Background(), first.RepositoryID)
+	if activeErr != nil {
+		t.Fatalf("ActiveGeneration() error = %v", activeErr)
+	}
+	if active != second.ID {
+		t.Fatalf("ActiveGeneration() = %q, want committed %q", active, second.ID)
+	}
+	loaded, loadErr := store.Load(context.Background(), second.RepositoryID)
+	if loadErr != nil {
+		t.Fatalf("Load(committed) error = %v", loadErr)
+	}
+	if !reflect.DeepEqual(loaded, second.Chunks) {
+		t.Fatalf("Load(committed) = %#v, want %#v", loaded, second.Chunks)
+	}
+
+	db = openRawDatabase(t, directory)
+	if _, err := db.Exec(`DROP TRIGGER fail_inactive_generation_purge`); err != nil {
+		t.Fatalf("drop cleanup failure trigger error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close cleanup retry database error = %v", err)
+	}
+	if err := store.Replace(context.Background(), second); err != nil {
+		t.Fatalf("Replace(retry committed generation) error = %v", err)
+	}
+
+	db = openRawDatabase(t, directory)
+	defer db.Close()
+	var generationCount int
+	if err := db.QueryRow(`SELECT count(*) FROM generations WHERE repository_id = ?`, second.RepositoryID).Scan(&generationCount); err != nil {
+		t.Fatalf("count generations after retry error = %v", err)
+	}
+	if generationCount != 1 {
+		t.Fatalf("generation count after retry = %d, want 1", generationCount)
+	}
+}
+
+func TestStoreReportsCommittedPublicationWhenCheckpointIsBlocked(t *testing.T) {
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	first := generationFromCorpus(t, "repository", "generation-one", "", []source.Chunk{
+		sampleChunk("first", "first.py", "FIRST = 1"),
+	})
+	if err := store.Replace(context.Background(), first); err != nil {
+		t.Fatalf("Replace(first) error = %v", err)
+	}
+	reader, err := store.BindActive(context.Background(), first.RepositoryID)
+	if err != nil {
+		t.Fatalf("BindActive(first) error = %v", err)
+	}
+
+	second := generationFromCorpus(t, first.RepositoryID, "generation-two", first.ID, []source.Chunk{
+		sampleChunk("second", "second.py", "SECOND = 2"),
+	})
+	err = store.Replace(context.Background(), second)
+	var committed *index.CommittedCleanupError
+	if !errors.As(err, &committed) {
+		_ = reader.Close()
+		t.Fatalf("Replace(second) error = %T %v, want CommittedCleanupError", err, err)
+	}
+	if committed.Stage() != index.CleanupStageCheckpoint || !committed.Published() {
+		_ = reader.Close()
+		t.Fatalf("Replace(second) outcome = stage %q published %v, want checkpoint/true", committed.Stage(), committed.Published())
+	}
+	active, activeErr := store.ActiveGeneration(context.Background(), first.RepositoryID)
+	if activeErr != nil {
+		_ = reader.Close()
+		t.Fatalf("ActiveGeneration() error = %v", activeErr)
+	}
+	if active != second.ID {
+		_ = reader.Close()
+		t.Fatalf("ActiveGeneration() = %q, want committed %q", active, second.ID)
+	}
+	pinned, pinnedErr := reader.Load(context.Background(), first.RepositoryID)
+	if pinnedErr != nil {
+		_ = reader.Close()
+		t.Fatalf("bound Load(first) error = %v", pinnedErr)
+	}
+	if !reflect.DeepEqual(pinned, first.Chunks) {
+		_ = reader.Close()
+		t.Fatalf("bound Load(first) = %#v, want %#v", pinned, first.Chunks)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close(reader) error = %v", err)
+	}
+	if err := store.Replace(context.Background(), second); err != nil {
+		t.Fatalf("Replace(retry committed generation) error = %v", err)
+	}
+}
+
+func TestStoreRejectsPersistedStalePolicyRevisionAndContent(t *testing.T) {
 	tests := []struct {
 		name     string
 		mutate   string
@@ -400,6 +681,7 @@ func TestStoreRejectsPersistedStalePolicyAndRevision(t *testing.T) {
 	}{
 		{name: "stale policy", mutate: `UPDATE generations SET scan_policy_version = ?`, argument: "scanner-v3"},
 		{name: "forged revision", mutate: `UPDATE generations SET corpus_revision = ?`, argument: "forged-private-revision"},
+		{name: "changed canonical content", mutate: `UPDATE chunks SET text = ?`, argument: "PERSISTED_CHANGED_PRIVATE_CANARY"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -426,7 +708,7 @@ func TestStoreRejectsPersistedStalePolicyAndRevision(t *testing.T) {
 			if loaded != nil {
 				t.Fatalf("Load() = %#v, want nil", loaded)
 			}
-			for _, private := range []string{"PERSISTED_PRIVATE_CANARY", "persisted-private.py", "forged-private-revision"} {
+			for _, private := range []string{"PERSISTED_PRIVATE_CANARY", "PERSISTED_CHANGED_PRIVATE_CANARY", "persisted-private.py", "forged-private-revision"} {
 				if strings.Contains(err.Error(), private) {
 					t.Errorf("Load() error exposes %q: %q", private, err)
 				}
@@ -573,6 +855,22 @@ func TestStoreRejectsUnknownSchemaWithoutMutatingIt(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close future schema database error = %v", err)
 	}
+	if err := os.Chmod(directory, 0o750); err != nil {
+		t.Fatalf("Chmod(future schema directory) error = %v", err)
+	}
+	beforeBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(before) error = %v", err)
+	}
+	beforeInfo, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatalf("Stat(before) error = %v", err)
+	}
+	beforeEntries := directoryEntryNames(t, directory)
+	beforeDirectoryInfo, err := os.Stat(directory)
+	if err != nil {
+		t.Fatalf("Stat(directory before) error = %v", err)
+	}
 
 	store, err := indexsqlite.NewStore(directory)
 	if store != nil {
@@ -581,6 +879,30 @@ func TestStoreRejectsUnknownSchemaWithoutMutatingIt(t *testing.T) {
 	}
 	if !errors.Is(err, index.ErrReindexRequired) {
 		t.Fatalf("NewStore(future schema) error = %v, want ErrReindexRequired", err)
+	}
+	afterBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(after) error = %v", err)
+	}
+	afterInfo, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatalf("Stat(after) error = %v", err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) {
+		t.Error("future schema database bytes changed during rejection")
+	}
+	if afterInfo.ModTime() != beforeInfo.ModTime() || afterInfo.Mode() != beforeInfo.Mode() || afterInfo.Size() != beforeInfo.Size() {
+		t.Errorf("future schema metadata changed: before=%v after=%v", beforeInfo, afterInfo)
+	}
+	if afterEntries := directoryEntryNames(t, directory); !reflect.DeepEqual(afterEntries, beforeEntries) {
+		t.Errorf("future schema directory entries = %v, want unchanged %v", afterEntries, beforeEntries)
+	}
+	afterDirectoryInfo, err := os.Stat(directory)
+	if err != nil {
+		t.Fatalf("Stat(directory after) error = %v", err)
+	}
+	if afterDirectoryInfo.Mode() != beforeDirectoryInfo.Mode() || afterDirectoryInfo.ModTime() != beforeDirectoryInfo.ModTime() {
+		t.Errorf("future schema directory metadata changed: before=%v after=%v", beforeDirectoryInfo, afterDirectoryInfo)
 	}
 
 	db, err = sql.Open("sqlite", databasePath)
@@ -594,6 +916,209 @@ func TestStoreRejectsUnknownSchemaWithoutMutatingIt(t *testing.T) {
 	}
 	if createdTables != 0 {
 		t.Fatalf("future schema gained %d v1 tables, want no mutation", createdTables)
+	}
+}
+
+func TestStoreRejectsUnknownWALSchemaWithoutMutatingDatabaseFamily(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "index-v2.sqlite3")
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		PRAGMA wal_autocheckpoint=0;
+		CREATE TABLE schema_version(version INTEGER NOT NULL);
+		INSERT INTO schema_version VALUES (2)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create future WAL schema error = %v", err)
+	}
+
+	type fileSnapshot struct {
+		content []byte
+		mode    os.FileMode
+		modTime time.Time
+	}
+	before := make(map[string]fileSnapshot)
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			_ = db.Close()
+			t.Fatalf("ReadFile(%s) error = %v", filepath.Base(path), err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			_ = db.Close()
+			t.Fatalf("Stat(%s) error = %v", filepath.Base(path), err)
+		}
+		before[path] = fileSnapshot{content: content, mode: info.Mode(), modTime: info.ModTime()}
+	}
+	beforeEntries := directoryEntryNames(t, directory)
+
+	store, err := indexsqlite.NewStore(directory)
+	if store != nil {
+		_ = store.Close()
+		_ = db.Close()
+		t.Fatal("NewStore(future WAL schema) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		_ = db.Close()
+		t.Fatalf("NewStore(future WAL schema) error = %v, want ErrReindexRequired", err)
+	}
+	if afterEntries := directoryEntryNames(t, directory); !reflect.DeepEqual(afterEntries, beforeEntries) {
+		_ = db.Close()
+		t.Errorf("future WAL schema directory entries = %v, want unchanged %v", afterEntries, beforeEntries)
+	}
+	for path, want := range before {
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			_ = db.Close()
+			t.Fatalf("ReadFile(%s after) error = %v", filepath.Base(path), readErr)
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			_ = db.Close()
+			t.Fatalf("Stat(%s after) error = %v", filepath.Base(path), statErr)
+		}
+		if !bytes.Equal(content, want.content) || info.Mode() != want.mode || info.ModTime() != want.modTime {
+			t.Errorf("future WAL schema file changed: %s", filepath.Base(path))
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close future WAL schema database error = %v", err)
+	}
+}
+
+func TestStoreRejectsMalformedV1SchemaWithoutMutatingIt(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "index-v2.sqlite3")
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE schema_version(version INTEGER NOT NULL);
+		INSERT INTO schema_version VALUES (1);
+		CREATE TABLE repositories(repository_id TEXT PRIMARY KEY, active_generation TEXT);
+		CREATE TABLE generations(repository_id TEXT, generation_id TEXT);
+		CREATE TABLE chunks(repository_id TEXT, generation_id TEXT, chunk_id TEXT);
+		CREATE TABLE vectors(repository_id TEXT, generation_id TEXT, chunk_id TEXT);`); err != nil {
+		t.Fatalf("create malformed v1 error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close malformed v1 database error = %v", err)
+	}
+	beforeBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(before) error = %v", err)
+	}
+	beforeInfo, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatalf("Stat(before) error = %v", err)
+	}
+	beforeEntries := directoryEntryNames(t, directory)
+
+	store, err := indexsqlite.NewStore(directory)
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("NewStore(malformed v1) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("NewStore(malformed v1) error = %v, want ErrReindexRequired", err)
+	}
+	afterBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(after) error = %v", err)
+	}
+	afterInfo, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatalf("Stat(after) error = %v", err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) {
+		t.Error("malformed v1 database bytes changed during rejection")
+	}
+	if afterInfo.ModTime() != beforeInfo.ModTime() || afterInfo.Mode() != beforeInfo.Mode() || afterInfo.Size() != beforeInfo.Size() {
+		t.Errorf("malformed v1 metadata changed: before=%v after=%v", beforeInfo, afterInfo)
+	}
+	if afterEntries := directoryEntryNames(t, directory); !reflect.DeepEqual(afterEntries, beforeEntries) {
+		t.Errorf("malformed v1 directory entries = %v, want unchanged %v", afterEntries, beforeEntries)
+	}
+}
+
+func TestStoreRejectsV1SchemaWithMissingRelationalConstraints(t *testing.T) {
+	tests := []struct {
+		name        string
+		chunksTable string
+	}{
+		{
+			name: "foreign key",
+			chunksTable: `CREATE TABLE chunks (
+				repository_id TEXT NOT NULL,
+				generation_id TEXT NOT NULL,
+				chunk_id TEXT NOT NULL,
+				ordinal INTEGER NOT NULL,
+				text TEXT NOT NULL,
+				language TEXT NOT NULL,
+				symbol_name TEXT NOT NULL,
+				path TEXT NOT NULL,
+				start_line INTEGER NOT NULL,
+				end_line INTEGER NOT NULL,
+				PRIMARY KEY (repository_id, generation_id, chunk_id),
+				UNIQUE (repository_id, generation_id, ordinal)
+			)`,
+		},
+		{
+			name: "ordinal uniqueness",
+			chunksTable: `CREATE TABLE chunks (
+				repository_id TEXT NOT NULL,
+				generation_id TEXT NOT NULL,
+				chunk_id TEXT NOT NULL,
+				ordinal INTEGER NOT NULL,
+				text TEXT NOT NULL,
+				language TEXT NOT NULL,
+				symbol_name TEXT NOT NULL,
+				path TEXT NOT NULL,
+				start_line INTEGER NOT NULL,
+				end_line INTEGER NOT NULL,
+				PRIMARY KEY (repository_id, generation_id, chunk_id),
+				FOREIGN KEY (repository_id, generation_id)
+					REFERENCES generations(repository_id, generation_id) ON DELETE CASCADE
+			)`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			store := openStore(t, directory)
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			db := openRawDatabase(t, directory)
+			if _, err := db.Exec(`
+				PRAGMA foreign_keys=OFF;
+				PRAGMA legacy_alter_table=ON;
+				BEGIN;
+				ALTER TABLE chunks RENAME TO old_chunks;
+				` + tt.chunksTable + `;
+				DROP TABLE old_chunks;
+				COMMIT;`); err != nil {
+				t.Fatalf("replace chunks schema error = %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close malformed schema database error = %v", err)
+			}
+
+			store, err := indexsqlite.NewStore(directory)
+			if store != nil {
+				_ = store.Close()
+				t.Fatal("NewStore(missing constraint) returned store, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) {
+				t.Fatalf("NewStore(missing constraint) error = %v, want ErrReindexRequired", err)
+			}
+		})
 	}
 }
 
@@ -741,6 +1266,19 @@ func openRawDatabase(t *testing.T, directory string) *sql.DB {
 	return db
 }
 
+func directoryEntryNames(t *testing.T, directory string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	names := make([]string, len(entries))
+	for index, entry := range entries {
+		names[index] = entry.Name()
+	}
+	return names
+}
+
 func holdWriteLock(t *testing.T, directory string) func() error {
 	t.Helper()
 	db := openRawDatabase(t, directory)
@@ -791,6 +1329,7 @@ func generationFromCorpus(t *testing.T, repositoryID, generationID, baseGenerati
 		BaseGeneration:    baseGeneration,
 		CorpusRevision:    corpus.Revision,
 		ScanPolicyVersion: corpus.PolicyVersion,
+		Metric:            index.VectorMetricCosine,
 		Chunks:            corpus.Chunks,
 	}
 }
