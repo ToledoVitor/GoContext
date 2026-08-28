@@ -10,45 +10,50 @@ import (
 )
 
 var (
-	ErrNotFound          = errors.New("repository index not found")
-	ErrInvalidGeneration = errors.New("invalid index generation")
-	ErrConcurrentIndex   = errors.New("concurrent index publication")
-	ErrReindexRequired   = errors.New("repository index requires reindex")
-	ErrCleanupIncomplete = errors.New("published index cleanup incomplete")
+	ErrNotFound                = errors.New("repository index not found")
+	ErrInvalidGeneration       = errors.New("invalid index generation")
+	ErrConcurrentIndex         = errors.New("concurrent index publication")
+	ErrReindexRequired         = errors.New("repository index requires reindex")
+	ErrCleanupIncomplete       = errors.New("published index cleanup incomplete")
+	ErrCommittedInfrastructure = errors.New("published index connection finalization incomplete")
 )
 
 // CleanupStage identifies post-commit maintenance that did not complete.
 type CleanupStage string
 
 const (
-	CleanupStagePurge      CleanupStage = "purge"
-	CleanupStageCheckpoint CleanupStage = "checkpoint"
+	CleanupStagePurge                   CleanupStage = "purge"
+	CleanupStageCheckpoint              CleanupStage = "checkpoint"
+	CleanupStagePublicationFinalization CleanupStage = "publication-finalization"
+	CleanupStageConnectionRestore       CleanupStage = "connection-restore"
+	CleanupStageConnectionRelease       CleanupStage = "connection-release"
 )
 
 // CommittedCleanupError reports that publication committed but post-commit
-// maintenance needs a safe retry. Its message intentionally excludes the
-// underlying database error so source-bearing database state cannot leak.
+// cleanup or connection finalization needs a safe retry. Its message
+// intentionally excludes the underlying database error so source-bearing
+// database state cannot leak.
 type CommittedCleanupError struct {
 	stage CleanupStage
-	cause error
 }
 
 // NewCommittedCleanupError creates an explicit committed publication outcome.
-func NewCommittedCleanupError(stage CleanupStage, cause error) *CommittedCleanupError {
-	return &CommittedCleanupError{stage: stage, cause: cause}
+func NewCommittedCleanupError(stage CleanupStage) *CommittedCleanupError {
+	return &CommittedCleanupError{stage: stage}
 }
 
 func (e *CommittedCleanupError) Error() string {
-	return "index generation published; cleanup incomplete"
+	return "index generation published; post-commit maintenance incomplete"
 }
 
-// Unwrap retains categorical and operational matching without exposing either
-// through the user-facing error string.
-func (e *CommittedCleanupError) Unwrap() []error {
-	if e == nil || e.cause == nil {
-		return []error{ErrCleanupIncomplete}
+// Unwrap exposes only a public outcome category. Raw database causes remain
+// private so formatting, logging, errors.As, and recursive traversal cannot
+// recover source-bearing database state.
+func (e *CommittedCleanupError) Unwrap() error {
+	if e != nil && (e.stage == CleanupStagePurge || e.stage == CleanupStageCheckpoint) {
+		return ErrCleanupIncomplete
 	}
-	return []error{ErrCleanupIncomplete, e.cause}
+	return ErrCommittedInfrastructure
 }
 
 // Published reports that the manifest update committed successfully.

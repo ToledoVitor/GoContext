@@ -205,6 +205,8 @@ type schemaColumn struct {
 	typeName           string
 	notNull            int
 	primaryKeyPosition int
+	defaultSQL         string
+	hasDefault         bool
 }
 
 type schemaForeignKey struct {
@@ -232,7 +234,7 @@ var requiredSchemaColumns = map[string][]schemaColumn{
 		{name: "scan_policy_version", typeName: "TEXT", notNull: 1},
 		{name: "profile_fingerprint", typeName: "TEXT"},
 		{name: "profile_model", typeName: "TEXT"},
-		{name: "dimensions", typeName: "INTEGER", notNull: 1},
+		{name: "dimensions", typeName: "INTEGER", notNull: 1, defaultSQL: "0", hasDefault: true},
 		{name: "metric", typeName: "TEXT", notNull: 1},
 	},
 	"chunks": {
@@ -304,6 +306,9 @@ func validateSchema(ctx context.Context, database schemaQuerier) error {
 	if schemaTables != 5 {
 		return index.ErrReindexRequired
 	}
+	if err := validateCanonicalTableSQL(ctx, database, "generations", generationsTableSQL); err != nil {
+		return index.ErrReindexRequired
+	}
 	for table, columns := range requiredSchemaColumns {
 		if err := validateTableColumns(ctx, database, table, columns); err != nil {
 			return index.ErrReindexRequired
@@ -331,11 +336,13 @@ func validateTableColumns(ctx context.Context, database schemaQuerier, table str
 	for rows.Next() {
 		var cid int
 		var column schemaColumn
-		var defaultValue any
+		var defaultValue sql.NullString
 		if err := rows.Scan(&cid, &column.name, &column.typeName, &column.notNull, &defaultValue, &column.primaryKeyPosition); err != nil {
 			return err
 		}
 		column.typeName = strings.ToUpper(column.typeName)
+		column.defaultSQL = defaultValue.String
+		column.hasDefault = defaultValue.Valid
 		actual = append(actual, column)
 	}
 	if err := rows.Err(); err != nil {
@@ -350,6 +357,25 @@ func validateTableColumns(ctx context.Context, database schemaQuerier, table str
 		}
 	}
 	return nil
+}
+
+func validateCanonicalTableSQL(ctx context.Context, database schemaQuerier, table, expected string) error {
+	var actual string
+	if err := database.QueryRowContext(ctx, `
+		SELECT sql
+		FROM sqlite_schema
+		WHERE type = 'table' AND name = ?`, table).Scan(&actual); err != nil {
+		return err
+	}
+	if canonicalSQLiteDDL(actual) != canonicalSQLiteDDL(expected) {
+		return index.ErrReindexRequired
+	}
+	return nil
+}
+
+func canonicalSQLiteDDL(value string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSuffix(strings.TrimSpace(value), ";")), " ")
+	return strings.Replace(normalized, "CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1)
 }
 
 func validateTableForeignKeys(ctx context.Context, database schemaQuerier, table string, expected []schemaForeignKey) error {
@@ -384,7 +410,11 @@ func validateTableForeignKeys(ctx context.Context, database schemaQuerier, table
 }
 
 func validateUniqueIndex(ctx context.Context, database schemaQuerier, table string, expectedColumns []string) error {
-	rows, err := database.QueryContext(ctx, `PRAGMA index_list("`+table+`")`)
+	rows, err := database.QueryContext(ctx, `
+		SELECT name
+		FROM pragma_index_list(?)
+		WHERE "unique" = 1 AND partial = 0
+		ORDER BY seq`, table)
 	if err != nil {
 		return err
 	}
@@ -392,28 +422,27 @@ func validateUniqueIndex(ctx context.Context, database schemaQuerier, table stri
 
 	var candidates []string
 	for rows.Next() {
-		var sequence, unique, partial int
-		var name, origin string
-		if err := rows.Scan(&sequence, &name, &unique, &origin, &partial); err != nil {
+		var name string
+		if err := rows.Scan(&name); err != nil {
 			return err
 		}
-		if unique == 1 && partial == 0 {
-			candidates = append(candidates, name)
-		}
+		candidates = append(candidates, name)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	for _, candidate := range candidates {
-		indexRows, err := database.QueryContext(ctx, `PRAGMA index_info("`+candidate+`")`)
+		indexRows, err := database.QueryContext(ctx, `
+			SELECT name
+			FROM pragma_index_info(?)
+			ORDER BY seqno`, candidate)
 		if err != nil {
 			return err
 		}
 		var columns []string
 		for indexRows.Next() {
-			var sequence, cid int
 			var column string
-			if err := indexRows.Scan(&sequence, &cid, &column); err != nil {
+			if err := indexRows.Scan(&column); err != nil {
 				_ = indexRows.Close()
 				return err
 			}
@@ -491,17 +520,23 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	}
 	defer func() { s.writeToken <- struct{}{} }()
 
-	_, err = s.publish(ctx, generation)
+	published, err := s.publish(ctx, generation)
 	if err != nil {
+		if published {
+			var committed *index.CommittedCleanupError
+			if !errors.As(err, &committed) {
+				err = index.NewCommittedCleanupError(index.CleanupStagePublicationFinalization)
+			}
+		}
 		return fmt.Errorf("replace sqlite index: %w", err)
 	}
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelCleanup()
 	if err := s.purgeInactive(cleanupCtx); err != nil {
-		return fmt.Errorf("replace sqlite index: %w", index.NewCommittedCleanupError(index.CleanupStagePurge, err))
+		return fmt.Errorf("replace sqlite index: %w", index.NewCommittedCleanupError(index.CleanupStagePurge))
 	}
 	if err := s.checkpoint(cleanupCtx); err != nil {
-		return fmt.Errorf("replace sqlite index: %w", index.NewCommittedCleanupError(index.CleanupStageCheckpoint, err))
+		return fmt.Errorf("replace sqlite index: %w", index.NewCommittedCleanupError(index.CleanupStageCheckpoint))
 	}
 	return nil
 }
@@ -510,8 +545,8 @@ func (s *Store) publish(ctx context.Context, generation index.Generation) (bool,
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		published, err := s.publishAttempt(ctx, generation)
-		if err == nil {
-			return published, nil
+		if err == nil || published {
+			return published, err
 		}
 		if !isSQLiteBusy(err) {
 			return false, err
@@ -542,15 +577,28 @@ func (s *Store) publishAttempt(ctx context.Context, generation index.Generation)
 	if err != nil {
 		return false, fmt.Errorf("acquire write connection: %w", err)
 	}
+	return publishOnConnection(ctx, connection, generation)
+}
+
+type writeConnection interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	Close() error
+}
+
+func publishOnConnection(ctx context.Context, connection writeConnection, generation index.Generation) (published bool, returnedErr error) {
+	committed := false
 	defer func() {
-		restoreCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		if _, err := connection.ExecContext(restoreCtx, `PRAGMA busy_timeout=5000`); returnedErr == nil && err != nil {
-			returnedErr = fmt.Errorf("restore write connection: %w", err)
+		stage, finalizationErr := finalizeWriteConnection(connection)
+		if finalizationErr == nil || returnedErr != nil {
+			return
 		}
-		if err := connection.Close(); returnedErr == nil && err != nil {
-			returnedErr = fmt.Errorf("release write connection: %w", err)
+		if committed {
+			published = true
+			returnedErr = index.NewCommittedCleanupError(stage)
+			return
 		}
+		returnedErr = fmt.Errorf("finalize write connection")
 	}()
 	if _, err := connection.ExecContext(ctx, `PRAGMA busy_timeout=25`); err != nil {
 		return false, fmt.Errorf("configure write connection: %w", err)
@@ -639,7 +687,21 @@ func (s *Store) publishAttempt(ctx context.Context, generation index.Generation)
 		return false, fmt.Errorf("commit transaction: %w", err)
 	}
 	transactionOpen = false
+	committed = true
 	return true, nil
+}
+
+func finalizeWriteConnection(connection writeConnection) (index.CleanupStage, error) {
+	restoreCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := connection.ExecContext(restoreCtx, `PRAGMA busy_timeout=5000`); err != nil {
+		_ = connection.Close()
+		return index.CleanupStageConnectionRestore, err
+	}
+	if err := connection.Close(); err != nil {
+		return index.CleanupStageConnectionRelease, err
+	}
+	return "", nil
 }
 
 func (s *Store) purgeInactive(ctx context.Context) error {

@@ -2,6 +2,20 @@ package sqlite
 
 const schemaVersion = 1
 
+const generationsTableSQL = `CREATE TABLE IF NOT EXISTS generations (
+    repository_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    corpus_revision TEXT NOT NULL,
+	content_digest TEXT NOT NULL,
+    scan_policy_version TEXT NOT NULL,
+    profile_fingerprint TEXT,
+    profile_model TEXT,
+    dimensions INTEGER NOT NULL DEFAULT 0,
+	metric TEXT NOT NULL CHECK (metric = 'cosine'),
+    PRIMARY KEY (repository_id, generation_id),
+    FOREIGN KEY (repository_id) REFERENCES repositories(repository_id) ON DELETE CASCADE
+)`
+
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -18,19 +32,7 @@ CREATE TABLE IF NOT EXISTS repositories (
         DEFERRABLE INITIALLY DEFERRED
 );
 
-CREATE TABLE IF NOT EXISTS generations (
-    repository_id TEXT NOT NULL,
-    generation_id TEXT NOT NULL,
-    corpus_revision TEXT NOT NULL,
-	content_digest TEXT NOT NULL,
-    scan_policy_version TEXT NOT NULL,
-    profile_fingerprint TEXT,
-    profile_model TEXT,
-    dimensions INTEGER NOT NULL DEFAULT 0,
-	metric TEXT NOT NULL CHECK (metric = 'cosine'),
-    PRIMARY KEY (repository_id, generation_id),
-    FOREIGN KEY (repository_id) REFERENCES repositories(repository_id) ON DELETE CASCADE
-);
+` + generationsTableSQL + `;
 
 CREATE TABLE IF NOT EXISTS chunks (
     repository_id TEXT NOT NULL,

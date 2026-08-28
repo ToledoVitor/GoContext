@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -580,8 +581,12 @@ func TestStoreReportsCommittedPublicationWhenPurgeFails(t *testing.T) {
 	if committed.Stage() != index.CleanupStagePurge {
 		t.Fatalf("Replace(second) cleanup stage = %q, want %q", committed.Stage(), index.CleanupStagePurge)
 	}
-	if strings.Contains(err.Error(), "PRIVATE_CLEANUP_FAILURE_CANARY") {
-		t.Fatalf("Replace(second) error exposes cleanup trigger content: %v", err)
+	if errorTreeContainsForTest(err, "PRIVATE_CLEANUP_FAILURE_CANARY") || strings.Contains(fmt.Sprintf("%+v", err), "PRIVATE_CLEANUP_FAILURE_CANARY") {
+		t.Fatalf("Replace(second) error tree exposes cleanup trigger content: %v", err)
+	}
+	var sqliteCause interface{ Code() int }
+	if errors.As(err, &sqliteCause) {
+		t.Fatalf("Replace(second) exposes raw SQLite cause with code %d", sqliteCause.Code())
 	}
 	active, activeErr := store.ActiveGeneration(context.Background(), first.RepositoryID)
 	if activeErr != nil {
@@ -1122,6 +1127,167 @@ func TestStoreRejectsV1SchemaWithMissingRelationalConstraints(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsMaliciousSchemaIndexNameWithoutExecutingIt(t *testing.T) {
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	db := openRawDatabase(t, directory)
+	if _, err := db.Exec(`
+		PRAGMA foreign_keys=OFF;
+		PRAGMA legacy_alter_table=ON;
+		BEGIN;
+		DROP TABLE vectors;
+		ALTER TABLE chunks RENAME TO old_chunks;
+		CREATE TABLE chunks (
+			repository_id TEXT NOT NULL,
+			generation_id TEXT NOT NULL,
+			chunk_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			text TEXT NOT NULL,
+			language TEXT NOT NULL,
+			symbol_name TEXT NOT NULL,
+			path TEXT NOT NULL,
+			start_line INTEGER NOT NULL,
+			end_line INTEGER NOT NULL,
+			PRIMARY KEY (repository_id, generation_id, chunk_id),
+			FOREIGN KEY (repository_id, generation_id)
+				REFERENCES generations(repository_id, generation_id) ON DELETE CASCADE
+		);
+		DROP TABLE old_chunks;
+		CREATE TABLE vectors (
+			repository_id TEXT NOT NULL,
+			generation_id TEXT NOT NULL,
+			chunk_id TEXT NOT NULL,
+			encoding_version INTEGER NOT NULL,
+			dimensions INTEGER NOT NULL,
+			values_blob BLOB NOT NULL,
+			PRIMARY KEY (repository_id, generation_id, chunk_id),
+			FOREIGN KEY (repository_id, generation_id, chunk_id)
+				REFERENCES chunks(repository_id, generation_id, chunk_id) ON DELETE CASCADE
+		);
+		CREATE INDEX safe_expected_columns
+			ON chunks(repository_id, generation_id, ordinal);
+		CREATE UNIQUE INDEX "malicious""); PRAGMA index_info(""safe_expected_columns"
+			ON chunks(repository_id);
+		COMMIT;`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create malicious index schema error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close malicious index database error = %v", err)
+	}
+
+	store, err := indexsqlite.NewStore(directory)
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("NewStore(malicious index schema) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("NewStore(malicious index schema) error = %v, want ErrReindexRequired", err)
+	}
+
+	db = openRawDatabase(t, directory)
+	defer db.Close()
+	var marker, injectedTables int
+	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&marker); err != nil {
+		t.Fatalf("read schema marker after rejection error = %v", err)
+	}
+	if marker != 1 {
+		t.Fatalf("schema marker after rejection = %d, want 1", marker)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name = 'injected'`).Scan(&injectedTables); err != nil {
+		t.Fatalf("inspect injected schema objects error = %v", err)
+	}
+	if injectedTables != 0 {
+		t.Fatalf("injected schema objects = %d, want 0", injectedTables)
+	}
+}
+
+func TestStoreRejectsMalformedV1DefaultsAndMetricConstraint(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate string
+		canary string
+	}{
+		{
+			name: "dimensions default",
+			mutate: `UPDATE sqlite_schema
+				SET sql = replace(
+					sql,
+					'dimensions INTEGER NOT NULL DEFAULT 0',
+					'dimensions INTEGER NOT NULL DEFAULT ''PRIVATE_DEFAULT_DDL_CANARY'''
+				)
+				WHERE type = 'table' AND name = 'generations'`,
+			canary: "PRIVATE_DEFAULT_DDL_CANARY",
+		},
+		{
+			name: "metric check",
+			mutate: `UPDATE sqlite_schema
+				SET sql = replace(
+					sql,
+					'metric TEXT NOT NULL CHECK (metric = ''cosine'')',
+					'metric TEXT NOT NULL CHECK (metric = ''cosine'' OR metric = ''PRIVATE_METRIC_DDL_CANARY'')'
+				)
+				WHERE type = 'table' AND name = 'generations'`,
+			canary: "PRIVATE_METRIC_DDL_CANARY",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			store := openStore(t, directory)
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			db := openRawDatabase(t, directory)
+			if _, err := db.Exec(`PRAGMA writable_schema=ON`); err != nil {
+				_ = db.Close()
+				t.Fatalf("enable writable_schema error = %v", err)
+			}
+			result, err := db.Exec(tt.mutate)
+			if err != nil {
+				_ = db.Close()
+				t.Fatalf("mutate generations DDL error = %v", err)
+			}
+			updated, err := result.RowsAffected()
+			if err != nil || updated != 1 {
+				_ = db.Close()
+				t.Fatalf("mutate generations DDL rows = %d, error = %v; want 1", updated, err)
+			}
+			if _, err := db.Exec(`PRAGMA schema_version=2; PRAGMA writable_schema=OFF`); err != nil {
+				_ = db.Close()
+				t.Fatalf("finish writable_schema mutation error = %v", err)
+			}
+			var storedDDL string
+			if err := db.QueryRow(`SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'generations'`).Scan(&storedDDL); err != nil {
+				_ = db.Close()
+				t.Fatalf("read mutated generations DDL error = %v", err)
+			}
+			if !strings.Contains(storedDDL, tt.canary) {
+				_ = db.Close()
+				t.Fatalf("mutated generations DDL does not contain canary")
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close malformed DDL database error = %v", err)
+			}
+
+			store, err = indexsqlite.NewStore(directory)
+			if store != nil {
+				_ = store.Close()
+				t.Fatal("NewStore(malformed generations DDL) returned store, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) {
+				t.Fatalf("NewStore(malformed generations DDL) error = %v, want ErrReindexRequired", err)
+			}
+			if errorTreeContainsForTest(err, tt.canary) {
+				t.Fatalf("NewStore(malformed generations DDL) error exposes DDL canary %q", tt.canary)
+			}
+		})
+	}
+}
+
 func TestStoreRespectsCanceledContext(t *testing.T) {
 	store := newStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1346,4 +1512,22 @@ func sampleChunk(id, path, text string) source.Chunk {
 			EndLine:   4,
 		},
 	}
+}
+
+func errorTreeContainsForTest(err error, value string) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), value) {
+		return true
+	}
+	if multiple, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, nested := range multiple.Unwrap() {
+			if errorTreeContainsForTest(nested, value) {
+				return true
+			}
+		}
+		return false
+	}
+	return errorTreeContainsForTest(errors.Unwrap(err), value)
 }
