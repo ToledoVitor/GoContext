@@ -151,7 +151,9 @@ Erros degradáveis em `preferred`: timeout interno, conexão indisponível, HTTP
 
 Primeiro store persistente será SQLite local, usando driver Go sem CGO após teste de compatibilidade com Go 1.24. SQLite guarda:
 
-O gate executado em 2026-08-28 resolveu a release corrente `modernc.org/sqlite v1.57.0` (tag `v1.57.0`, commit `6e86ac4a89e3f36359d1947e36355c469b18430c`, fonte `https://gitlab.com/cznic/sqlite`) via tooling de módulos Go. A licença da distribuição é BSD-3-Clause, permissiva. Essa release declara `go 1.25.0` e foi rejeitada porque o projeto exige compatibilidade com Go 1.24; por isso nenhum driver foi adotado, o teste `CGO_ENABLED=0` não prosseguiu e a implementação do store permanece bloqueada até decisão específica. Não houve substituição por driver CGO nem downgrade silencioso.
+O gate executado em 2026-08-28 resolveu a release corrente `modernc.org/sqlite v1.57.0` (tag `v1.57.0`, commit `6e86ac4a89e3f36359d1947e36355c469b18430c`, fonte `https://gitlab.com/cznic/sqlite`) via tooling de módulos Go. A licença da distribuição é BSD-3-Clause, permissiva. Essa release declara `go 1.25.0` e foi rejeitada porque o projeto exige compatibilidade com Go 1.24; `v1.46.2` também já declara Go 1.25.
+
+A decisão de compatibilidade fixa explicitamente `modernc.org/sqlite v1.46.1`, a versão mais nova cujo módulo declara `go 1.24.0`. O tag é de 2026-02-18, fonte `https://gitlab.com/cznic/sqlite`, commit `c777b9066dd7f97147b35345fce4c6a7a728c3ff`, checksum `h1:eFJ2ShBLIEnUWlLy12raN0Z1plqmFX9Qe3rjQTKt6sU=` e licença BSD-3-Clause. O source gate não encontrou `import "C"` ou diretivas `#cgo`; build do driver e suite completa passaram com `CGO_ENABLED=0`. O custo aceito é manter um pin anterior à release corrente e revisar manualmente correções upstream enquanto o baseline do projeto permanecer Go 1.24; aumentar o baseline ou trocar o pin exige nova decisão e repetição dos gates de licença, CGO e testes.
 
 - gerações e manifest ativo por repositório;
 - chunks canônicos e `source.Reference`;
