@@ -472,6 +472,68 @@ func TestExactSearchReportsGenerationChangedSeparatelyFromSpaceMismatch(t *testi
 	}
 }
 
+func TestExactSearchGenerationChangePrecedesMalformedQueryValidation(t *testing.T) {
+	store := newVectorStore(t, t.TempDir())
+	generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
+		vectorChunk("chunk", "generation-preflight.py", 1, source.LanguagePython, "GENERATION_PREFLIGHT_SOURCE"),
+	}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+
+	staleQueries := []struct {
+		name   string
+		mutate func(*vectorsearch.IndexQuery)
+		lower  error
+	}{
+		{
+			name: "invalid filter",
+			mutate: func(query *vectorsearch.IndexQuery) {
+				query.Filter = search.Filter{PathPrefixes: []string{"../private"}}
+			},
+			lower: search.ErrInvalidFilter,
+		},
+		{
+			name: "malformed vector",
+			mutate: func(query *vectorsearch.IndexQuery) {
+				query.Vector = nil
+			},
+			lower: vectorsearch.ErrInvalidQueryVector,
+		},
+	}
+	for _, test := range staleQueries {
+		t.Run("stale generation with "+test.name, func(t *testing.T) {
+			query := vectorIndexQuery(generation, embedding.Vector{1, 0}, 1)
+			query.GenerationID = "stale-generation"
+			test.mutate(&query)
+
+			_, err := reader.Search(context.Background(), query)
+			if !errors.Is(err, vectorsearch.ErrGenerationChanged) {
+				t.Fatalf("Search() error = %v, want ErrGenerationChanged", err)
+			}
+			if errors.Is(err, test.lower) {
+				t.Fatalf("Search() error = %v, stale generation must precede %v", err, test.lower)
+			}
+		})
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	for _, test := range staleQueries {
+		t.Run("same generation "+test.name+" before closed reader access", func(t *testing.T) {
+			query := vectorIndexQuery(generation, embedding.Vector{1, 0}, 1)
+			test.mutate(&query)
+
+			_, err := reader.Search(context.Background(), query)
+			if !errors.Is(err, test.lower) {
+				t.Fatalf("Search() error = %v, want %v before closed reader/database access", err, test.lower)
+			}
+		})
+	}
+}
+
 func TestExactSearchRejectsInvalidQueryVectorsAndLimits(t *testing.T) {
 	store := newVectorStore(t, t.TempDir())
 	generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
@@ -1191,10 +1253,14 @@ func TestVectorBoundLoadSanitizesMalformedCanonicalRow(t *testing.T) {
 }
 
 func TestExactSearchCancelsDuringQueryNormalizationBeforeReaderLock(t *testing.T) {
+	const dimensions = 4096
 	store := newVectorStore(t, t.TempDir())
+	storedValues := make(embedding.Vector, dimensions)
+	storedValues[0] = 1
 	generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
 		vectorChunk("chunk", "normalization.py", 1, source.LanguagePython, "NORMALIZATION_SOURCE"),
-	}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+	}, []index.VectorRecord{{ChunkID: "chunk", Values: storedValues}})
+	generation.Dimensions = dimensions
 	if err := store.Replace(context.Background(), generation); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
@@ -1202,12 +1268,11 @@ func TestExactSearchCancelsDuringQueryNormalizationBeforeReaderLock(t *testing.T
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	values := make(embedding.Vector, 4096)
+	values := make(embedding.Vector, dimensions)
 	for position := range values {
 		values[position] = 1
 	}
 	query := vectorIndexQuery(generation, values, 1)
-	query.Dimensions = len(values)
 	ctx := newCancelOnErrCheckContext(2)
 
 	_, err := reader.Search(ctx, query)

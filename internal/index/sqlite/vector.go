@@ -167,6 +167,17 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("search bound vector index: %w", err)
 	}
+	if r == nil || query.RepositoryID != r.repositoryID {
+		return nil, vectorsearch.ErrIncompatibleSpace
+	}
+	if query.GenerationID != r.generationID {
+		return nil, vectorsearch.ErrGenerationChanged
+	}
+	lexicalOnly := r.profileFingerprint == "" && r.profileModel == "" && r.dimensions == 0
+	if !lexicalOnly && (query.Profile.Fingerprint != r.profileFingerprint || query.Profile.Model != r.profileModel ||
+		query.Dimensions != r.dimensions || query.Metric != r.metric) {
+		return nil, vectorsearch.ErrIncompatibleSpace
+	}
 	if err := search.ValidateFilter(query.Filter); err != nil {
 		return nil, fmt.Errorf("search bound vector index: %w", err)
 	}
@@ -180,10 +191,6 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 		}
 		return nil, vectorsearch.ErrInvalidQueryVector
 	}
-	if r == nil {
-		return nil, vectorsearch.ErrIncompatibleSpace
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -192,18 +199,8 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 	if r.closed {
 		return nil, fmt.Errorf("search bound vector index: %w", errBoundReaderClosed)
 	}
-	if r.profileFingerprint == "" && r.profileModel == "" && r.dimensions == 0 {
+	if lexicalOnly {
 		return nil, r.lexicalOnlyVectorState(ctx, "search bound vector index")
-	}
-	if query.RepositoryID != r.repositoryID {
-		return nil, vectorsearch.ErrIncompatibleSpace
-	}
-	if query.GenerationID != r.generationID {
-		return nil, vectorsearch.ErrGenerationChanged
-	}
-	if query.Profile.Fingerprint != r.profileFingerprint || query.Profile.Model != r.profileModel ||
-		query.Dimensions != r.dimensions || query.Metric != r.metric {
-		return nil, vectorsearch.ErrIncompatibleSpace
 	}
 
 	rows, err := r.tx.QueryContext(ctx, `
