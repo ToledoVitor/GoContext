@@ -6,8 +6,25 @@ import (
 	"testing"
 
 	evaluation "github.com/ToledoVitor/GoContext/internal/eval"
+	"github.com/ToledoVitor/GoContext/internal/source"
 	"github.com/ToledoVitor/GoContext/internal/testsupport/taintcheck"
 )
+
+func TestMarshalValidatedAllowsAggregateJavaScriptInventory(t *testing.T) {
+	report := evaluation.EmptyReport("repo-a1", evaluation.DecisionGo)
+	report.Inventory.EligibleFiles = 2
+	report.Inventory.EligibleBytes = 32
+	report.Inventory.IncludedFiles = 2
+	report.Inventory.IncludedBytes = 32
+	report.Inventory.SupportedLanguages[source.LanguageJavaScript] = 2
+	report.Inventory.SupportedExtensions[".js"] = 1
+	report.Inventory.SupportedExtensions[".jsx"] = 1
+	report.Inventory.SizeBands[evaluation.SizeBand0To4KiB] = 2
+
+	if _, err := evaluation.MarshalValidated(report); err != nil {
+		t.Fatalf("MarshalValidated(JavaScript inventory) error = %v", err)
+	}
+}
 
 func TestMarshalValidatedEmitsOnlyAggregateAllowlistedSchema(t *testing.T) {
 	report := evaluation.EmptyReport("repo-a1", evaluation.DecisionGo)

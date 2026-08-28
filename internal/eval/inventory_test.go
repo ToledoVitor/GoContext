@@ -51,6 +51,8 @@ func TestEvaluateBuildsExactAggregateInventoryAndUsesOneTraversal(t *testing.T) 
 	writeEvalFile(t, root, "tests/test_worker.py", "def UniqueName():\n    return 2\n")
 	writeEvalFile(t, root, "migrations/001_change.ts", "export function SharedName() { return 3 }\n")
 	writeEvalFile(t, root, "config.ts", "export const value = 1\n")
+	writeEvalFile(t, root, "src/shared.js", "export function SharedName() { return 4 }\n")
+	writeEvalFile(t, root, "src/view.jsx", "export const value = <main />\n")
 	writeEvalFile(t, root, "README.md", "seven!!")
 
 	scanner := &countingScanner{inner: filesystem.NewScanner()}
@@ -66,16 +68,20 @@ func TestEvaluateBuildsExactAggregateInventoryAndUsesOneTraversal(t *testing.T) 
 	if report.Decision != evaluation.DecisionGo {
 		t.Fatalf("decision = %q; blockers = %#v", report.Decision, report.Blockers)
 	}
-	if report.Inventory.EligibleFiles != 4 || report.Inventory.IncludedFiles != 4 || report.Inventory.Chunks != 4 {
+	if report.Inventory.EligibleFiles != 6 || report.Inventory.IncludedFiles != 6 || report.Inventory.Chunks != 6 {
 		t.Fatalf("inventory = %#v", report.Inventory)
 	}
-	if report.Inventory.SupportedExtensions[".py"] != 2 || report.Inventory.SupportedExtensions[".ts"] != 2 {
+	if report.Inventory.SupportedExtensions[".py"] != 2 || report.Inventory.SupportedExtensions[".ts"] != 2 ||
+		report.Inventory.SupportedExtensions[".js"] != 1 || report.Inventory.SupportedExtensions[".jsx"] != 1 {
 		t.Fatalf("supported extensions = %#v", report.Inventory.SupportedExtensions)
+	}
+	if report.Inventory.SupportedLanguages[source.LanguageJavaScript] != 2 {
+		t.Fatalf("supported languages = %#v, want two JavaScript files", report.Inventory.SupportedLanguages)
 	}
 	if got := report.Inventory.UnsupportedExtensions[".md"]; got.Files != 1 || got.Bytes != 7 {
 		t.Fatalf("unsupported .md = %#v", got)
 	}
-	if report.Inventory.SymbolKinds[evaluation.SymbolFunction] != 3 || report.Inventory.FilesWithoutSymbols != 1 {
+	if report.Inventory.SymbolKinds[evaluation.SymbolFunction] != 4 || report.Inventory.FilesWithoutSymbols != 2 {
 		t.Fatalf("symbol aggregates = %#v, files_without=%d", report.Inventory.SymbolKinds, report.Inventory.FilesWithoutSymbols)
 	}
 	if report.Inventory.PatternBuckets[evaluation.PatternTest] != 1 || report.Inventory.PatternBuckets[evaluation.PatternMigration] != 1 ||

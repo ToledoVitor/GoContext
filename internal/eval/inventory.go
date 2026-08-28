@@ -196,7 +196,8 @@ func validScanResult(result ingest.ScanResult) bool {
 	includedBytes := int64(0)
 	languages := make(map[source.Language]int)
 	for _, file := range result.Files {
-		if !file.Reference.Valid() || (file.Language != source.LanguagePython && file.Language != source.LanguageTypeScript) {
+		if !file.Reference.Valid() ||
+			(file.Language != source.LanguageJavaScript && file.Language != source.LanguagePython && file.Language != source.LanguageTypeScript) {
 			return false
 		}
 		includedBytes += int64(len(file.Content))

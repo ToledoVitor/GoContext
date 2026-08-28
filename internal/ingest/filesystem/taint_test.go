@@ -34,6 +34,7 @@ const (
 	taintPEMCanary           = "TAINT_PEM_CONTENT_CANARY_TASK13"
 	taintPythonSecretCanary  = "TAINT_PYTHON_SECRET_CANARY_TASK13"
 	taintTypedSecretCanary   = "TAINT_TYPED_SECRET_CANARY_TASK13"
+	taintJavaScriptCanary    = "TAINT_JAVASCRIPT_EXCLUDED_CANARY_TASK14D"
 	taintControlPathCanary   = "TAINT_CONTROL_PATH_CANARY_TASK13"
 )
 
@@ -59,11 +60,12 @@ func TestExcludedContentCannotCrossScannerParserChunkerBoundary(t *testing.T) {
 	if result.Report.UnsupportedByExtension["<other>"] != 1 || len(result.Report.UnsupportedByExtension) != 1 {
 		t.Fatalf("UnsupportedByExtension = %#v, want only <other>:1", result.Report.UnsupportedByExtension)
 	}
-	if result.Report.IncludedFiles != 2 || result.Report.IncludedByLanguage[source.LanguagePython] != 1 ||
+	if result.Report.IncludedFiles != 3 || result.Report.IncludedByLanguage[source.LanguageJavaScript] != 1 ||
+		result.Report.IncludedByLanguage[source.LanguagePython] != 1 ||
 		result.Report.IncludedByLanguage[source.LanguageTypeScript] != 1 {
-		t.Fatalf("included report = %#v, want one permitted Python and one permitted TypeScript file", result.Report)
+		t.Fatalf("included report = %#v, want one permitted JavaScript, Python and TypeScript file", result.Report)
 	}
-	if got, want := filePaths(result.Files), []string{"safe/allowed.py", "safe/allowed.ts"}; !reflect.DeepEqual(got, want) {
+	if got, want := filePaths(result.Files), []string{"safe/allowed.jsx", "safe/allowed.py", "safe/allowed.ts"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Scan() paths = %v, want %v", got, want)
 	}
 	assertAggregateOnlyReport(t, result.Report)
@@ -103,16 +105,17 @@ func TestExcludedContentCannotCrossScannerParserChunkerBoundary(t *testing.T) {
 		allChunks = append(allChunks, chunks...)
 	}
 
-	if len(allSymbols) != 2 || len(allChunks) != 2 {
-		t.Fatalf("pipeline produced %d symbols and %d chunks, want 2 and 2", len(allSymbols), len(allChunks))
+	if len(allSymbols) != 3 || len(allChunks) != 3 {
+		t.Fatalf("pipeline produced %d symbols and %d chunks, want 3 and 3", len(allSymbols), len(allChunks))
 	}
 	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, allChunks)
 	if err != nil {
 		t.Fatalf("NewCorpus() error = %v", err)
 	}
 	assertNoTaintValue(t, "canonical corpus", corpus, fixture.forbidden)
-	if corpus.Revision == "" || !strings.Contains(corpus.Chunks[0].Text, "SAFE_PYTHON_SEARCH_TOKEN") ||
-		!strings.Contains(corpus.Chunks[1].Text, "SAFE_TYPESCRIPT_SEARCH_TOKEN") {
+	if corpus.Revision == "" || !strings.Contains(corpus.Chunks[0].Text, "SAFE_JAVASCRIPT_SEARCH_TOKEN") ||
+		!strings.Contains(corpus.Chunks[1].Text, "SAFE_PYTHON_SEARCH_TOKEN") ||
+		!strings.Contains(corpus.Chunks[2].Text, "SAFE_TYPESCRIPT_SEARCH_TOKEN") {
 		t.Fatalf("canonical corpus = %#v, want functional permitted content and revision", corpus)
 	}
 	for _, chunk := range corpus.Chunks {
@@ -151,50 +154,51 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 
 	writeFile(t, root, "safe/allowed.py", "def permitted_python_lookup():\n    return \"SAFE_PYTHON_SEARCH_TOKEN\"\n")
 	writeFile(t, root, "safe/allowed.ts", "export function permittedTypeScriptLookup() {\n  return \"SAFE_TYPESCRIPT_SEARCH_TOKEN\"\n}\n")
+	writeFile(t, root, "safe/allowed.jsx", "export const safeJavaScriptEntry = () => \"SAFE_JAVASCRIPT_SEARCH_TOKEN\"\n")
 
 	for _, path := range []string{
-		".env", ".env.local", ".env.ts", ".git/config", ".github/workflows/ci.ts",
-		"credentials.py", "secret.ts", "material.pem", "certificate.crt",
+		".env", ".env.local", ".env.jsx", ".git/config", ".github/workflows/ci.js",
+		"credentials.js", "secret.jsx", "material.pem", "certificate.crt",
 	} {
-		writeFile(t, root, path, taintSecurityCanary+"\n")
+		writeFile(t, root, path, taintSecurityCanary+taintJavaScriptCanary+"\n")
 	}
 	for _, path := range []string{
-		"node_modules/dependency.ts", "vendor/vendor.py", "build/output.ts", ".cache/cache.py",
+		"node_modules/dependency.js", "vendor/vendor.jsx", "build/output.js", ".cache/cache.jsx",
 	} {
-		writeFile(t, root, path, taintDependencyCanary+"\n")
+		writeFile(t, root, path, taintDependencyCanary+taintJavaScriptCanary+"\n")
 	}
 	newDependencyPaths := []string{
-		"Pods/dependency.ts", ".gradle/dependency.ts", ".dart_tool/dependency.ts", ".pub-cache/dependency.ts",
-		"DerivedData/dependency.ts", "Carthage/dependency.ts", ".cxx/dependency.ts", ".expo/dependency.ts",
-		".turbo/dependency.ts", ".nx/dependency.ts", ".parcel-cache/dependency.ts", ".vite/dependency.ts",
-		".bundle/dependency.ts",
+		"Pods/dependency.js", ".gradle/dependency.jsx", ".dart_tool/dependency.js", ".pub-cache/dependency.jsx",
+		"DerivedData/dependency.js", "Carthage/dependency.jsx", ".cxx/dependency.js", ".expo/dependency.jsx",
+		".turbo/dependency.js", ".nx/dependency.jsx", ".parcel-cache/dependency.js", ".vite/dependency.jsx",
+		".bundle/dependency.js",
 	}
 	for index, path := range newDependencyPaths {
 		writeFile(t, root, path, fmt.Sprintf("%s_%02d\n", taintNewDependencyCanary, index))
 	}
 	writeFile(t, root, "nested-repository/.git/config", taintNestedCanary+"\n")
-	writeFile(t, root, "nested-repository/00-child.py", "def "+taintNestedCanary+"():\n    return True\n")
+	writeFile(t, root, "nested-repository/00-child.js", "export function "+taintNestedCanary+"() { return '"+taintJavaScriptCanary+"' }\n")
 
-	writeFile(t, root, "client.generated.ts", taintGeneratedCanary+"\n")
-	writeFile(t, root, "generated-header.py", "# Code generated for "+taintGeneratedCanary+". DO NOT EDIT.\nVALUE = 1\n")
-	writeFileBytes(t, root, "binary.py", append([]byte(taintBinaryCanary), 0, 'x'))
-	oversized := append([]byte(taintTooLargeCanary), bytes.Repeat([]byte{'x'}, int(filesystem.DefaultMaxFileSize)+1)...)
-	writeFileBytes(t, root, "oversized.ts", oversized)
-	writeFileBytes(t, root, "invalid-utf8.py", append([]byte(taintInvalidUTF8Canary), 0xff))
+	writeFile(t, root, "client.generated.js", taintGeneratedCanary+taintJavaScriptCanary+"\n")
+	writeFile(t, root, "generated-header.jsx", "// Code generated for "+taintGeneratedCanary+taintJavaScriptCanary+". DO NOT EDIT.\nconst value = 1\n")
+	writeFileBytes(t, root, "binary.js", append([]byte(taintBinaryCanary+taintJavaScriptCanary), 0, 'x'))
+	oversized := append([]byte(taintTooLargeCanary+taintJavaScriptCanary), bytes.Repeat([]byte{'x'}, int(filesystem.DefaultMaxFileSize)+1)...)
+	writeFileBytes(t, root, "oversized.jsx", oversized)
+	writeFileBytes(t, root, "invalid-utf8.js", append([]byte(taintInvalidUTF8Canary+taintJavaScriptCanary), 0xff))
 	writeFile(t, root, "opaque.TAINT_UNSUPPORTED_NAME_TASK13", taintUnsupportedCanary+"\n")
 	writeFile(t, root, "pem-material.py", "MATERIAL = '''-----BEGIN PRIVATE KEY-----\n"+taintPEMCanary+"\n-----END PRIVATE KEY-----'''\n")
 	writeFile(t, root, "embedded-secret.py", "safe = \"x\"; password: str = \""+taintPythonSecretCanary+"\"\n")
-	writeFile(t, root, "embedded-secret.ts", "const safe = \"x\"; const token: string = \""+taintTypedSecretCanary+"\"\n")
+	writeFile(t, root, "embedded-secret.jsx", "const safe = \"x\"; const token = \""+taintTypedSecretCanary+taintJavaScriptCanary+"\"\n")
 
 	symlinkCount := 0
 	securityCount := 9
 	if runtime.GOOS != "windows" {
-		writeFile(t, outside, "outside.py", taintSymlinkCanary+"\n")
+		writeFile(t, outside, "outside.jsx", taintSymlinkCanary+taintJavaScriptCanary+"\n")
 		writeFile(t, root, ".env.internal-link", taintSymlinkCanary+"\n")
-		if err := os.Symlink(filepath.Join(outside, "outside.py"), filepath.Join(root, "external-link.py")); err != nil {
+		if err := os.Symlink(filepath.Join(outside, "outside.jsx"), filepath.Join(root, "external-link.jsx")); err != nil {
 			t.Fatalf("Symlink(external) error = %v", err)
 		}
-		if err := os.Symlink(".env.internal-link", filepath.Join(root, "internal-link.ts")); err != nil {
+		if err := os.Symlink(".env.internal-link", filepath.Join(root, "internal-link.js")); err != nil {
 			t.Fatalf("Symlink(internal) error = %v", err)
 		}
 		symlinkCount = 2
@@ -204,13 +208,13 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 	forbidden := []string{
 		taintSecurityCanary, taintDependencyCanary, taintNewDependencyCanary, taintNestedCanary, taintBinaryCanary,
 		taintTooLargeCanary, taintGeneratedCanary, taintUnsupportedCanary, taintInvalidUTF8Canary,
-		taintPEMCanary, taintPythonSecretCanary, taintTypedSecretCanary,
-		".env", ".env.local", ".env.ts", ".git/config", ".github/workflows/ci.ts",
-		"credentials.py", "secret.ts", "material.pem", "certificate.crt",
-		"node_modules/dependency.ts", "vendor/vendor.py", "build/output.ts", ".cache/cache.py",
-		"nested-repository/.git/config", "nested-repository/00-child.py", "client.generated.ts",
-		"generated-header.py", "binary.py", "oversized.ts", "invalid-utf8.py",
-		"opaque.TAINT_UNSUPPORTED_NAME_TASK13", "pem-material.py", "embedded-secret.py", "embedded-secret.ts",
+		taintPEMCanary, taintPythonSecretCanary, taintTypedSecretCanary, taintJavaScriptCanary,
+		".env", ".env.local", ".env.jsx", ".git/config", ".github/workflows/ci.js",
+		"credentials.js", "secret.jsx", "material.pem", "certificate.crt",
+		"node_modules/dependency.js", "vendor/vendor.jsx", "build/output.js", ".cache/cache.jsx",
+		"nested-repository/.git/config", "nested-repository/00-child.js", "client.generated.js",
+		"generated-header.jsx", "binary.js", "oversized.jsx", "invalid-utf8.js",
+		"opaque.TAINT_UNSUPPORTED_NAME_TASK13", "pem-material.py", "embedded-secret.py", "embedded-secret.jsx",
 	}
 	forbidden = append(forbidden, newDependencyPaths...)
 	if symlinkCount != 0 {
@@ -218,9 +222,9 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 			forbidden,
 			taintSymlinkCanary,
 			".env.internal-link",
-			"external-link.py",
-			"internal-link.ts",
-			filepath.Join(outside, "outside.py"),
+			"external-link.jsx",
+			"internal-link.js",
+			filepath.Join(outside, "outside.jsx"),
 		)
 	}
 

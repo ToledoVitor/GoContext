@@ -2,6 +2,19 @@ package source
 
 import "testing"
 
+func TestSupportedLanguageIdentifiersRemainStable(t *testing.T) {
+	want := map[Language]string{
+		LanguagePython:     "python",
+		LanguageTypeScript: "typescript",
+		LanguageJavaScript: "javascript",
+	}
+	for language, identifier := range want {
+		if got := string(language); got != identifier {
+			t.Errorf("language identifier = %q, want %q", got, identifier)
+		}
+	}
+}
+
 func TestReferenceValid(t *testing.T) {
 	tests := []struct {
 		name      string

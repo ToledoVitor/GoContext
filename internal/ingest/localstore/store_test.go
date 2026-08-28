@@ -224,7 +224,7 @@ func TestStoreRejectsCorpusWhosePolicyOrRevisionWasNotValidated(t *testing.T) {
 
 func TestStoreLoadRejectsPersistedV2WithOldPolicyOrForgedRevision(t *testing.T) {
 	chunk := sampleChunk("persisted-canary", "persisted-canary.py", "PERSISTED_V2_CANARY = 1")
-	legacyCorpus, err := source.NewCorpus("scanner-v4", []source.Chunk{chunk})
+	legacyCorpus, err := source.NewCorpus("scanner-v5", []source.Chunk{chunk})
 	if err != nil {
 		t.Fatalf("NewCorpus(old policy) error = %v", err)
 	}

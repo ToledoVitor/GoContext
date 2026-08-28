@@ -61,6 +61,8 @@ A primeira execução autorizada desta fase produziu somente agregados e mostrou
 
 Esses buckets continuam report-only: não habilitam parser ou ingestão. JSON permanece `unknown/not evaluated` e unsupported; não será habilitado cegamente porque configuração JSON pode incluir credenciais ou outros dados sensíveis. Qualquer suporte futuro exige plano próprio, fixtures sintéticas e novo gate de segurança. Snapshots/corpora anteriores a `scanner-v5` exigem reindex completo e nunca são migrados no lugar.
 
+Task 14D implementa depois desse baseline um tracer bullet `scanner-v6` para `.js`/`.jsx` usando somente fixtures sintéticas. A ampliação não autoriza automaticamente nova leitura profissional e não transforma o baseline `scanner-v5` em evidência de qualidade JavaScript. Antes de repetir qualquer raiz, o operador deve reindexar explicitamente, repetir taint/no-egress/hard-deny/secret scan e preencher novamente o checklist go/no-go individual. JSON permanece `unknown/not evaluated` e unsupported. Relatórios continuam aggregate-only, sem registros por query.
+
 ## Fase B — benchmark de recuperação
 
 Executar primeiro baseline lexical. Vetorial/híbrido somente depois, com Ollama loopback e mesmo corpus permitido.

@@ -205,7 +205,7 @@ type ScanResult struct {
 	Report        ScanReport
 }
 
-const ScanPolicyVersion = "scanner-v5"
+const ScanPolicyVersion = "scanner-v6"
 
 // internal/source/corpus.go
 type Corpus struct {
@@ -293,6 +293,8 @@ Report contém somente contagens, bytes elegíveis/incluídos, linguagens, size 
 Bump do snapshot JSON para schema/policy segura invalida snapshot legado. Depois do chunking, composition root cria `source.Corpus` com policy do `ScanResult`; revisão é SHA-256 de versão do corpus + policy + IDs ordenados. `localstore.Replace` recebe corpus completo e nunca marca versão implicitamente; `Load` retorna erro tipado pedindo reindex. Testes cobrem payload v1 contendo canário e confirmam ausência em search/output. Bump é obrigatório quando deny/precedência/classificadores de segredo, binário, UTF-8, gerado, symlink ou nested repo mudarem. Tasks SQLite recebem mesmo corpus.
 
 Refinamento Task 14C: `scanner-v5` acrescenta os roots de dependências/build/cache acima com decisão em `classifyPath` antes de `inspectRepositoryEntry`/open e mantém nomes ambíguos como `packages` permitidos. A taxonomia central de buckets agrega extensões source/build não sensíveis e assets/binários comuns, sempre lowercase e sem paths, nomes ou amostras; `<none>` e `<other>` continuam cobrindo extension-less e valores arbitrários. Isso melhora somente o sinal de inventário e não torna extensão nova ingestível. Corpora/snapshots `scanner-v4` são rejeitados e exigem reindex completo, sem migração.
+
+Refinamento Task 14D: `scanner-v6` torna `.js`/`.jsx` elegíveis, case-insensitive, somente depois de todos os gates anteriores. `source.LanguageJavaScript` atravessa scanner, parser conservador, chunker, snapshot/SQLite, busca lexical/vetorial/híbrida, filtro CLI e evaluator aggregate-only. O parser reconhece apenas funções/classes nomeadas e variáveis top-level diretamente atribuídas a arrow/function expression; não inventa default anônimo nem afirma completude estrutural. JSON continua unsupported e não há fallback de bytes crus. Corpora/snapshots `scanner-v5` exigem reindex completo pela categoria existente. A implementação e o taint renovado usam exclusivamente fixtures sintéticas; o baseline profissional `scanner-v5` não é reinterpretado e nenhuma qualidade profissional nova é alegada antes de outra execução gated.
 
 - [ ] **Step 8: Verificar regressão e commit**
 
@@ -1162,7 +1164,7 @@ git commit -m "feat: add privacy-safe local retrieval evaluation"
 3. Reindexar fixtures e repositórios de teste; comparar lexical antes/depois.
 4. Habilitar `preferred` somente em ambiente de teste com endpoint controlado.
 5. Medir latência, requests, tokens, degradação e qualidade conceitual.
-6. Manter snapshot JSON de policy `scanner-v5` durante M2; `scanner-v4` ou anterior exige reindex seguro, sem migração in-place.
+6. Manter snapshot JSON de policy `scanner-v6` durante M2; `scanner-v5` ou anterior exige reindex seguro, sem migração in-place.
 7. Em regressão, garantir snapshot atual e selecionar `--index-backend snapshot`; não apagar banco.
 8. Tornar SQLite default somente em ADR futuro com evidência de uso e migração.
 

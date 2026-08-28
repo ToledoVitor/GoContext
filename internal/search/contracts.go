@@ -89,7 +89,7 @@ func normalizedPathPrefix(prefix string) (string, bool) {
 
 func supportedLanguage(language source.Language) bool {
 	switch language {
-	case source.LanguagePython, source.LanguageTypeScript:
+	case source.LanguageJavaScript, source.LanguagePython, source.LanguageTypeScript:
 		return true
 	default:
 		return false

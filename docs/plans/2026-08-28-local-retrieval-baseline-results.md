@@ -124,3 +124,13 @@ Próximo checkpoint recomendado: implementar P0 com TDD e revisão independente;
 revalidar taint, hard-deny, secret scan, no-egress e checklist individual;
 somente então repetir baseline local protegido. Depois, criar gold set P1 sem
 versionar queries ou hits.
+
+## Estado após o tracer bullet sintético
+
+Task 14D implementa o P0 em `scanner-v6` somente com fixtures sintéticas e
+renova os gates de taint para a nova fronteira `.js`/`.jsx`. Os números e as
+métricas deste documento continuam sendo o baseline histórico `scanner-v5`:
+nenhum repositório profissional foi reaberto e nenhuma melhora de cobertura,
+recall, ranking ou qualidade é alegada aqui. Uma comparação antes/depois exige
+nova autorização operacional, reindex explícito e repetição completa do
+checklist go/no-go, mantendo output apenas agregado.

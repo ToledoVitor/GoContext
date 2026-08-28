@@ -2,14 +2,14 @@
 
 GoContext é um copiloto local de inteligência para repositórios. A proposta é transformar código-fonte em contexto pesquisável, responder perguntas com evidências verificáveis e expor esse contexto por uma interface MCP somente leitura.
 
-O núcleo de recuperação do **M2** está implementado: snapshot JSON e busca lexical continuam sendo o caminho padrão offline; SQLite, embeddings OpenAI-compatible, busca vetorial exata e fusão híbrida são capacidades opt-in. Parsing estrutural, prova taint ponta a ponta e validação em repositórios profissionais continuam pendentes nas Tasks 13/14. LLM, MCP, frontend, ANN, reranker e reuso incremental também permanecem futuros.
+O núcleo de recuperação do **M2** está implementado: snapshot JSON e busca lexical continuam sendo o caminho padrão offline; SQLite, embeddings OpenAI-compatible, busca vetorial exata e fusão híbrida são capacidades opt-in. A prova taint ponta a ponta, o primeiro baseline profissional agregado e um tracer bullet sintético de JavaScript/JSX estão concluídos. Parsing estrutural, nova medição profissional após esse suporte, LLM, MCP, frontend, ANN, reranker e reuso incremental permanecem futuros.
 
 ## Objetivo do MVP
 
 Em um fim de semana, provar um fluxo vertical pequeno:
 
 1. abrir um repositório local autorizado;
-2. encontrar arquivos Python e TypeScript elegíveis;
+2. encontrar arquivos JavaScript/JSX, Python e TypeScript elegíveis;
 3. extrair símbolos e produzir chunks rastreáveis;
 4. indexar texto e vetores localmente;
 5. responder perguntas combinando busca lexical e vetorial;
@@ -33,7 +33,7 @@ Sucesso significa responder perguntas sobre um repositório pequeno com citaçõ
 cmd/gocontext          CLI de indexação, consulta e ponto de composição
 internal/source        tipos centrais: arquivo, símbolo, chunk e citação
 internal/ingest        contratos para scanner, parser, chunker e armazenamento
-  └─ filesystem        scanner local seguro para Python e TypeScript
+  └─ filesystem        scanner local seguro para JavaScript/JSX, Python e TypeScript
   └─ lineparser        descoberta top-level preliminar, sem AST
   └─ symbolchunker     chunks por limites de declarações top-level
   └─ localstore        snapshots JSON locais e atômicos por repositório
@@ -75,17 +75,17 @@ gocontext dev
 go run ./cmd/gocontext index /caminho/do/repositório
 ```
 
-Sem flags, o comando percorre fontes Python/TypeScript, descobre declarações, cria chunks e substitui somente o snapshot local; não abre SQLite nem rede. O store padrão fica no diretório de cache do sistema, fora do repositório. Para escolher outro local:
+Sem flags, o comando percorre fontes JavaScript/JSX, Python e TypeScript, descobre declarações conservadoras, cria chunks e substitui somente o snapshot local; não abre SQLite nem rede. O store padrão fica no diretório de cache do sistema, fora do repositório. Para escolher outro local:
 
 ```bash
 go run ./cmd/gocontext index --store /caminho/do/cache /caminho/do/repositório
 ```
 
-### Policy de scanner v5 e reindexação
+### Policy de scanner v6 e reindexação
 
-A policy `scanner-v5` amplia somente a taxonomia sanitizada de extensões não suportadas usada em contagens agregadas e bloqueia, antes de inspeção de metadata ou abertura, raízes de dependências/build/cache de alta confiança como `Pods`, `.gradle`, `.dart_tool`, `DerivedData` e equivalentes documentados na ADR. Isso não habilita parser, chunker ou ingestão para nenhuma extensão nova. Em particular, JSON continua não suportado e não deve ser habilitado cegamente: arquivos JSON podem misturar configuração útil com credenciais ou outros dados sensíveis.
+A policy `scanner-v6` mantém todos os hard denies e classificadores de `scanner-v5` e adiciona somente `.js` e `.jsx`, com comparação case-insensitive, à allowlist de fontes. Todos os gates de filename, diretório, nested repo, symlink, arquivo regular, tamanho, binário, UTF-8, gerado e segredo continuam anteriores à criação de `source.File`. JSON, Markdown, assets, binários e extensões arbitrárias permanecem não suportados; em particular, JSON não é habilitado cegamente porque pode misturar configuração útil com credenciais ou outros dados sensíveis.
 
-Snapshots e corpora `scanner-v4` ou anteriores são incompatíveis e falham com pedido sanitizado de reindexação; não existe migração in-place. Reexecute `index` no backend desejado para produzir um corpus `scanner-v5`. A descoberta que motivou a mudança continha somente agregados: ela mostrou taxonomia incompleta e ruído provavelmente associado a dependências/build/cache, sem observar ou afirmar conteúdo dos diretórios negados.
+Snapshots e corpora `scanner-v5` ou anteriores são incompatíveis e falham com pedido sanitizado de reindexação; não existe migração in-place. Reexecute `index` no backend desejado para produzir um corpus `scanner-v6`. O suporte JavaScript foi provado somente com fixtures sintéticas e não altera os resultados profissionais já registrados sob `scanner-v5`; nenhuma melhoria de qualidade profissional é alegada antes de uma nova execução local que repita os gates de taint, no-egress e go/no-go.
 
 ### Opt-in SQLite sem embeddings
 
@@ -187,7 +187,7 @@ Detalhes e decisões: [arquitetura](docs/architecture.md), [stack](docs/decision
 - sincronização com GitHub, GitLab ou serviços SaaS;
 - autenticação, times e multi-tenancy;
 - agentes autônomos;
-- suporte amplo a linguagens além de Python e TypeScript.
+- suporte amplo a linguagens além do recorte atual de JavaScript/JSX, Python e TypeScript.
 
 ## Licença
 

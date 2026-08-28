@@ -3,6 +3,7 @@ package lineparser_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest/lineparser"
@@ -72,6 +73,122 @@ func TestParserFindsTopLevelTypeScriptDeclarations(t *testing.T) {
 		{Name: "Options", Kind: "interface", Signature: "export interface Options {}", Reference: source.Reference{Path: "src/app.ts", StartLine: 9, EndLine: 9}},
 		{Name: "Result", Kind: "type", Signature: "export type Result = string", Reference: source.Reference{Path: "src/app.ts", StartLine: 10, EndLine: 10}},
 		{Name: "State", Kind: "enum", Signature: "export const enum State { Ready }", Reference: source.Reference{Path: "src/app.ts", StartLine: 11, EndLine: 11}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserFindsConservativeTopLevelJavaScriptDeclarations(t *testing.T) {
+	file := source.File{
+		Reference: source.Reference{Path: "src/view.jsx", StartLine: 7, EndLine: 26},
+		Language:  source.LanguageJavaScript,
+		Content: []byte("" +
+			"export async function loadData() {}\r\n" +
+			"function* iterate() {}\r\n" +
+			"export default class Repository {}\r\n" +
+			"export const View = (props) => <main />\r\n" +
+			"const helper = function (value) { return value }\r\n" +
+			"let refresh = async value => value\r\n" +
+			"var sequence = async function* named() {}\r\n" +
+			"function render() {}\r\n" +
+			"const answer = 42\r\n" +
+			"export default function () {}\r\n" +
+			"export default class {}\r\n" +
+			"  function nested() {}\r\n" +
+			"\tconst nestedArrow = () => true\r\n" +
+			"const malformed = (value) = value\r\n" +
+			"export default const invalid = () => true\r\n" +
+			"const constructed = class Named {}\r\n" +
+			"// function commentedOut() {}\r\n" +
+			"function default() {}\r\n" +
+			"class return {}\r\n" +
+			"const invalidKeyword = function => true\r\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	want := []source.Symbol{
+		{Name: "loadData", Kind: "function", Signature: "export async function loadData() {}", Reference: source.Reference{Path: "src/view.jsx", StartLine: 7, EndLine: 7}},
+		{Name: "iterate", Kind: "function", Signature: "function* iterate() {}", Reference: source.Reference{Path: "src/view.jsx", StartLine: 8, EndLine: 8}},
+		{Name: "Repository", Kind: "class", Signature: "export default class Repository {}", Reference: source.Reference{Path: "src/view.jsx", StartLine: 9, EndLine: 9}},
+		{Name: "View", Kind: "function", Signature: "export const View = (props) => <main />", Reference: source.Reference{Path: "src/view.jsx", StartLine: 10, EndLine: 10}},
+		{Name: "helper", Kind: "function", Signature: "const helper = function (value) { return value }", Reference: source.Reference{Path: "src/view.jsx", StartLine: 11, EndLine: 11}},
+		{Name: "refresh", Kind: "function", Signature: "let refresh = async value => value", Reference: source.Reference{Path: "src/view.jsx", StartLine: 12, EndLine: 12}},
+		{Name: "sequence", Kind: "function", Signature: "var sequence = async function* named() {}", Reference: source.Reference{Path: "src/view.jsx", StartLine: 13, EndLine: 13}},
+		{Name: "render", Kind: "function", Signature: "function render() {}", Reference: source.Reference{Path: "src/view.jsx", StartLine: 14, EndLine: 14}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptLongMalformedLineRemainsConservative(t *testing.T) {
+	line := "const value = (" + strings.Repeat("x", 256*1024) + "\n"
+	file := source.File{
+		Reference: source.Reference{Path: "long.js", StartLine: 1, EndLine: 1},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(line),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("Parse() symbols = %#v, want no invented malformed declaration", symbols)
+	}
+}
+
+func TestParserJavaScriptIgnoresDeclarationsInsideMultilineCommentsAndTemplates(t *testing.T) {
+	file := source.File{
+		Reference: source.Reference{Path: "src/app.js", StartLine: 1, EndLine: 12},
+		Language:  source.LanguageJavaScript,
+		Content: []byte("" +
+			"/*\n" +
+			"function commentedOut() {}\n" +
+			"*/\n" +
+			"const source = `first\n" +
+			"class TemplateOnly {}\n" +
+			"${function expressionOnly() {}}\n" +
+			"`\n" +
+			"const blockMarker = \"/*\"\n" +
+			"const templateMarker = '`'\n" +
+			"function visible() {}\n" +
+			"/* trailing comment */\n" +
+			"class AlsoVisible {}\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	want := []source.Symbol{
+		{Name: "visible", Kind: "function", Signature: "function visible() {}", Reference: source.Reference{Path: "src/app.js", StartLine: 10, EndLine: 10}},
+		{Name: "AlsoVisible", Kind: "class", Signature: "class AlsoVisible {}", Reference: source.Reference{Path: "src/app.js", StartLine: 12, EndLine: 12}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptRejectsPartialMalformedDeclarations(t *testing.T) {
+	file := source.File{
+		Reference: source.Reference{Path: "src/malformed.js", StartLine: 1, EndLine: 5},
+		Language:  source.LanguageJavaScript,
+		Content: []byte("" +
+			"function half-name() {}\n" +
+			"class Broken.member {}\n" +
+			"const invalidParameter = (return) => 1\n" +
+			"const missingParameter = (value,,other) => 1\n" +
+			"function visible() {}\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	want := []source.Symbol{
+		{Name: "visible", Kind: "function", Signature: "function visible() {}", Reference: source.Reference{Path: "src/malformed.js", StartLine: 5, EndLine: 5}},
 	}
 	assertSymbols(t, symbols, want)
 }

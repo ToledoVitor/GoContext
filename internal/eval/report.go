@@ -76,8 +76,12 @@ func validInventory(value InventoryReport) bool {
 		ingest.ExclusionTooLarge: {}, ingest.ExclusionBinary: {}, ingest.ExclusionInvalidUTF8: {},
 		ingest.ExclusionGenerated: {}, ingest.ExclusionSecret: {},
 	}
-	languages := map[source.Language]struct{}{source.LanguagePython: {}, source.LanguageTypeScript: {}}
-	supportedExtensions := map[Extension]struct{}{Extension(".py"): {}, Extension(".ts"): {}, Extension(".tsx"): {}}
+	languages := map[source.Language]struct{}{
+		source.LanguageJavaScript: {}, source.LanguagePython: {}, source.LanguageTypeScript: {},
+	}
+	supportedExtensions := map[Extension]struct{}{
+		Extension(".js"): {}, Extension(".jsx"): {}, Extension(".py"): {}, Extension(".ts"): {}, Extension(".tsx"): {},
+	}
 	sizeBands := map[SizeBand]struct{}{
 		SizeBand0To4KiB: {}, SizeBand4To16KiB: {}, SizeBand16To64KiB: {},
 		SizeBand64To256KiB: {}, SizeBand256KiBTo1MiB: {},

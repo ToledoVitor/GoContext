@@ -1032,7 +1032,7 @@ func TestSearcherIsolatesConcurrentFiltersAndDoesNotMutateBackendHits(t *testing
 	query := validQuery()
 	query.Filter = search.Filter{
 		PathPrefixes: []string{"internal", "pkg"},
-		Languages:    []source.Language{source.LanguagePython, source.LanguageTypeScript},
+		Languages:    []source.Language{source.LanguageJavaScript, source.LanguagePython, source.LanguageTypeScript},
 	}
 	wantQuery := cloneQuery(query)
 	lexicalHits := []search.Hit{{Chunk: testChunk("lexical", "internal/lexical.py", 1, 2, "LEXICAL_SOURCE"), Score: 0.8}}

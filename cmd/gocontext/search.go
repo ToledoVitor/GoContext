@@ -55,7 +55,7 @@ func runSearchWithObserver(
 	flags := flag.NewFlagSet("search", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "uso: gocontext search [--store DIR] [--limit N] [--path-prefix PREFIX] [--language python|typescript] [opções semânticas] <repositório> <consulta...>")
+		fmt.Fprintln(stderr, "uso: gocontext search [--store DIR] [--limit N] [--path-prefix PREFIX] [--language javascript|python|typescript] [opções semânticas] <repositório> <consulta...>")
 		fmt.Fprintln(stderr, "semântica: --semantic off|preferred|required --embedding-base-url URL --embedding-model MODELO --embedding-dimensions N --index-backend snapshot|sqlite|auto")
 	}
 	storeFlag := flags.String("store", "", "diretório local de snapshots")

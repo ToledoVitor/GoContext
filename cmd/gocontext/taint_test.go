@@ -49,6 +49,7 @@ const (
 	cliTaintPEMCanary           = "CLI_TAINT_PEM_CONTENT_CANARY_TASK13"
 	cliTaintPythonSecretCanary  = "CLI_TAINT_PYTHON_SECRET_CANARY_TASK13"
 	cliTaintTypedSecretCanary   = "CLI_TAINT_TYPED_SECRET_CANARY_TASK13"
+	cliTaintJavaScriptCanary    = "CLI_TAINT_JAVASCRIPT_EXCLUDED_CANARY_TASK14D"
 	cliTaintControlPathCanary   = "CLI_TAINT_CONTROL_PATH_CANARY_TASK13"
 	cliTaintProviderKey         = "CLI_TAINT_PROVIDER_KEY_TASK13"
 	cliTaintProviderBody        = "CLI_TAINT_PROVIDER_BODY_TASK13"
@@ -137,11 +138,12 @@ func TestRunSnapshotOffTaintNeverReachesHTTPStoreOrOutput(t *testing.T) {
 
 	indexCode, indexOut, indexErr := runTaintCommand(t, "index", "--store", storeDirectory, fixture.repository)
 	searchCode, searchOut, searchErr, searchHits := runTaintSearchCommand(
-		t, "search", "--store", storeDirectory, fixture.repository, "permitted", "python", "lookup",
+		t, "search", "--store", storeDirectory, "--language", "python", "--language", "typescript",
+		fixture.repository, "permitted", "python", "lookup",
 	)
 	server.Close()
 
-	if indexCode != 0 || indexOut != "indexado: 2 arquivos, 2 símbolos, 2 chunks\n" || indexErr != "" {
+	if indexCode != 0 || indexOut != "indexado: 3 arquivos, 3 símbolos, 3 chunks\n" || indexErr != "" {
 		t.Fatalf("snapshot/off index = code %d stdout %q stderr %q", indexCode, indexOut, indexErr)
 	}
 	assertPermittedSearchOutput(t, searchCode, searchOut, searchErr)
@@ -158,7 +160,11 @@ func TestRunSnapshotOffTaintNeverReachesHTTPStoreOrOutput(t *testing.T) {
 		t.Fatalf("snapshot/off rollback marker stat error = %v, want no marker", err)
 	}
 	assertPermittedTaintHits(t, searchHits, chunks, permittedTaintLexicalScores(), fixture.forbidden)
-	assertCLITaintSinksClean(t, fixture, []string{cliTaintProviderKey}, indexOut, indexErr, searchOut, searchErr)
+	javaScriptCode, javaScriptOut, javaScriptErr, javaScriptHits := runTaintSearchCommand(
+		t, "search", "--store", storeDirectory, "--language", "javascript", fixture.repository, "javascript",
+	)
+	assertPermittedJavaScriptSearch(t, javaScriptCode, javaScriptOut, javaScriptErr, javaScriptHits, chunks, fixture.forbidden)
+	assertCLITaintSinksClean(t, fixture, []string{cliTaintProviderKey}, indexOut, indexErr, searchOut, searchErr, javaScriptOut, javaScriptErr)
 	assertTaintStoreClean(t, storeDirectory, appendCopy(fixture.forbidden, cliTaintProviderKey))
 }
 
@@ -178,11 +184,11 @@ func TestRunSQLiteOffTaintNeverReachesHTTPStoreOrOutput(t *testing.T) {
 	)
 	searchCode, searchOut, searchErr, searchHits := runTaintSearchCommand(
 		t, "search", "--store", storeDirectory, "--index-backend", "auto",
-		fixture.repository, "permitted", "python", "lookup",
+		"--language", "python", "--language", "typescript", fixture.repository, "permitted", "python", "lookup",
 	)
 	server.Close()
 
-	if indexCode != 0 || indexOut != "indexado: 2 arquivos, 2 símbolos, 2 chunks\n" || indexErr != "" {
+	if indexCode != 0 || indexOut != "indexado: 3 arquivos, 3 símbolos, 3 chunks\n" || indexErr != "" {
 		t.Fatalf("SQLite/off index = code %d stdout %q stderr %q", indexCode, indexOut, indexErr)
 	}
 	assertPermittedSearchOutput(t, searchCode, searchOut, searchErr)
@@ -216,11 +222,11 @@ func TestRunSQLitePreferredRetriesOnlyPermittedCorpusAndFallsBackLexically(t *te
 	indexArgs = append(indexArgs, fixture.repository)
 	indexCode, indexOut, indexErr := runTaintCommand(t, indexArgs...)
 	searchArgs := append([]string{"search", "--store", storeDirectory, "--index-backend", "auto", "--semantic", "preferred"}, providerFlags...)
-	searchArgs = append(searchArgs, fixture.repository, "permitted", "python", "lookup")
+	searchArgs = append(searchArgs, "--language", "python", "--language", "typescript", fixture.repository, "permitted", "python", "lookup")
 	searchCode, searchOut, searchErr, searchHits := runTaintSearchCommand(t, searchArgs...)
 	server.Close()
 
-	if indexCode != 0 || indexOut != "indexado: 2 arquivos, 2 símbolos, 2 chunks\nsemântica: status=degraded vetores=0 requests=3 tokens=0\n" ||
+	if indexCode != 0 || indexOut != "indexado: 3 arquivos, 3 símbolos, 3 chunks\nsemântica: status=degraded vetores=0 requests=3 tokens=0\n" ||
 		indexErr != semanticDegradedWarning {
 		t.Fatalf("SQLite/preferred index = code %d stdout %q stderr %q", indexCode, indexOut, indexErr)
 	}
@@ -266,11 +272,11 @@ func TestRunSQLiteRequiredSendsOnlyPermittedDocumentsAndExplicitQuery(t *testing
 	indexArgs = append(indexArgs, fixture.repository)
 	indexCode, indexOut, indexErr := runTaintCommand(t, indexArgs...)
 	searchArgs := append([]string{"search", "--store", storeDirectory, "--index-backend", "auto", "--semantic", "required"}, providerFlags...)
-	searchArgs = append(searchArgs, fixture.repository, cliTaintQueryCanary)
+	searchArgs = append(searchArgs, "--language", "python", "--language", "typescript", fixture.repository, cliTaintQueryCanary)
 	searchCode, searchOut, searchErr, searchHits := runTaintSearchCommand(t, searchArgs...)
 	server.Close()
 
-	if indexCode != 0 || indexOut != "indexado: 2 arquivos, 2 símbolos, 2 chunks\nsemântica: status=indexed vetores=2 requests=1 tokens=7\n" || indexErr != "" {
+	if indexCode != 0 || indexOut != "indexado: 3 arquivos, 3 símbolos, 3 chunks\nsemântica: status=indexed vetores=3 requests=1 tokens=7\n" || indexErr != "" {
 		t.Fatalf("SQLite/required index = code %d stdout %q stderr %q", indexCode, indexOut, indexErr)
 	}
 	if searchCode != 0 || searchErr != "" || !strings.Contains(searchOut, "safe/allowed.py:1-2") {
@@ -314,7 +320,7 @@ func TestRunSQLiteRequiredRetryThenMalformedResponsePreservesPriorGeneration(t *
 
 	baselineCode, baselineOut, baselineErr := runTaintCommand(t, baselineArgs...)
 	baselineServer.Close()
-	if baselineCode != 0 || baselineOut != "indexado: 2 arquivos, 2 símbolos, 2 chunks\nsemântica: status=indexed vetores=2 requests=1 tokens=7\n" || baselineErr != "" {
+	if baselineCode != 0 || baselineOut != "indexado: 3 arquivos, 3 símbolos, 3 chunks\nsemântica: status=indexed vetores=3 requests=1 tokens=7\n" || baselineErr != "" {
 		t.Fatalf("required baseline = code %d stdout %q stderr %q", baselineCode, baselineOut, baselineErr)
 	}
 	baselineRequests := baselineCapture.snapshot()
@@ -382,9 +388,11 @@ func TestRunSQLiteRequiredRetryThenMalformedResponsePreservesPriorGeneration(t *
 	if len(failureRequests) != 3 || failureAttempts.Load() != 3 {
 		t.Fatalf("required failure requests = %d with %d attempts, want three captured attempts", len(failureRequests), failureAttempts.Load())
 	}
+	permittedInputs := permittedTaintDocumentInputs()
 	wantFailureInputs := []string{
+		permittedInputs[0],
 		"def unpublished_replacement():\n    return \"" + cliTaintReplacement + "\"",
-		permittedTaintDocumentInputs()[1],
+		permittedInputs[2],
 	}
 	assertExactTaintHTTPRequests(
 		t, failureRequests, fixture,
@@ -393,7 +401,7 @@ func TestRunSQLiteRequiredRetryThenMalformedResponsePreservesPriorGeneration(t *
 
 	rollbackCode, rollbackOut, rollbackErr, rollbackHits := runTaintSearchCommand(
 		t, "search", "--store", storeDirectory, "--index-backend", "snapshot",
-		fixture.repository, "permitted", "python", "lookup",
+		"--language", "python", "--language", "typescript", fixture.repository, "permitted", "python", "lookup",
 	)
 	assertPermittedSearchOutput(t, rollbackCode, rollbackOut, rollbackErr)
 	assertPermittedTaintHits(t, rollbackHits, baselineChunks, permittedTaintLexicalScores(), structuredForbidden)
@@ -453,68 +461,69 @@ func newCLITaintFixture(t *testing.T) cliTaintFixture {
 	outside := t.TempDir()
 	writeCLIFile(t, repository, "safe/allowed.py", "def permitted_python_lookup():\n    return \"SAFE_PYTHON_SEARCH_TOKEN\"\n")
 	writeCLIFile(t, repository, "safe/allowed.ts", "export function permittedTypeScriptLookup() {\n  return \"SAFE_TYPESCRIPT_SEARCH_TOKEN\"\n}\n")
+	writeCLIFile(t, repository, "safe/allowed.jsx", "export const safeJavaScriptEntry = () => \"SAFE_JAVASCRIPT_SEARCH_TOKEN\"\n")
 
 	for _, path := range []string{
-		".env", ".env.local", ".env.ts", ".git/config", ".github/workflows/ci.ts",
-		"credentials.py", "secret.ts", "material.pem", "certificate.crt",
+		".env", ".env.local", ".env.jsx", ".git/config", ".github/workflows/ci.js",
+		"credentials.js", "secret.jsx", "material.pem", "certificate.crt",
 	} {
-		writeCLIFile(t, repository, path, cliTaintSecurityCanary+"\n")
+		writeCLIFile(t, repository, path, cliTaintSecurityCanary+cliTaintJavaScriptCanary+"\n")
 	}
 	for _, path := range []string{
-		"node_modules/dependency.ts", "vendor/vendor.py", "build/output.ts", ".cache/cache.py",
+		"node_modules/dependency.js", "vendor/vendor.jsx", "build/output.js", ".cache/cache.jsx",
 	} {
-		writeCLIFile(t, repository, path, cliTaintDependencyCanary+"\n")
+		writeCLIFile(t, repository, path, cliTaintDependencyCanary+cliTaintJavaScriptCanary+"\n")
 	}
 	newDependencyPaths := []string{
-		"Pods/dependency.ts", ".gradle/dependency.ts", ".dart_tool/dependency.ts", ".pub-cache/dependency.ts",
-		"DerivedData/dependency.ts", "Carthage/dependency.ts", ".cxx/dependency.ts", ".expo/dependency.ts",
-		".turbo/dependency.ts", ".nx/dependency.ts", ".parcel-cache/dependency.ts", ".vite/dependency.ts",
-		".bundle/dependency.ts",
+		"Pods/dependency.js", ".gradle/dependency.jsx", ".dart_tool/dependency.js", ".pub-cache/dependency.jsx",
+		"DerivedData/dependency.js", "Carthage/dependency.jsx", ".cxx/dependency.js", ".expo/dependency.jsx",
+		".turbo/dependency.js", ".nx/dependency.jsx", ".parcel-cache/dependency.js", ".vite/dependency.jsx",
+		".bundle/dependency.js",
 	}
 	for index, path := range newDependencyPaths {
 		writeCLIFile(t, repository, path, fmt.Sprintf("%s_%02d\n", cliTaintNewDependencyCanary, index))
 	}
 	writeCLIFile(t, repository, "nested-repository/.git/config", cliTaintNestedCanary+"\n")
-	writeCLIFile(t, repository, "nested-repository/00-child.py", "def "+cliTaintNestedCanary+"():\n    return True\n")
-	writeCLIFile(t, repository, "client.generated.ts", cliTaintGeneratedCanary+"\n")
-	writeCLIFile(t, repository, "generated-header.py", "# Code generated for "+cliTaintGeneratedCanary+". DO NOT EDIT.\nVALUE = 1\n")
-	writeCLIBytes(t, repository, "binary.py", append([]byte(cliTaintBinaryCanary), 0, 'x'))
-	oversized := append([]byte(cliTaintTooLargeCanary), bytes.Repeat([]byte{'x'}, int(filesystem.DefaultMaxFileSize)+1)...)
-	writeCLIBytes(t, repository, "oversized.ts", oversized)
-	writeCLIBytes(t, repository, "invalid-utf8.py", append([]byte(cliTaintInvalidUTF8Canary), 0xff))
+	writeCLIFile(t, repository, "nested-repository/00-child.js", "export function "+cliTaintNestedCanary+"() { return '"+cliTaintJavaScriptCanary+"' }\n")
+	writeCLIFile(t, repository, "client.generated.js", cliTaintGeneratedCanary+cliTaintJavaScriptCanary+"\n")
+	writeCLIFile(t, repository, "generated-header.jsx", "// Code generated for "+cliTaintGeneratedCanary+cliTaintJavaScriptCanary+". DO NOT EDIT.\nconst value = 1\n")
+	writeCLIBytes(t, repository, "binary.js", append([]byte(cliTaintBinaryCanary+cliTaintJavaScriptCanary), 0, 'x'))
+	oversized := append([]byte(cliTaintTooLargeCanary+cliTaintJavaScriptCanary), bytes.Repeat([]byte{'x'}, int(filesystem.DefaultMaxFileSize)+1)...)
+	writeCLIBytes(t, repository, "oversized.jsx", oversized)
+	writeCLIBytes(t, repository, "invalid-utf8.js", append([]byte(cliTaintInvalidUTF8Canary+cliTaintJavaScriptCanary), 0xff))
 	writeCLIFile(t, repository, "opaque.CLI_TAINT_UNSUPPORTED_NAME_TASK13", cliTaintUnsupportedCanary+"\n")
 	writeCLIFile(t, repository, "pem-material.py", "MATERIAL = '''-----BEGIN PRIVATE KEY-----\n"+cliTaintPEMCanary+"\n-----END PRIVATE KEY-----'''\n")
 	writeCLIFile(t, repository, "embedded-secret.py", "safe = \"x\"; password: str = \""+cliTaintPythonSecretCanary+"\"\n")
-	writeCLIFile(t, repository, "embedded-secret.ts", "const safe = \"x\"; const token: string = \""+cliTaintTypedSecretCanary+"\"\n")
+	writeCLIFile(t, repository, "embedded-secret.jsx", "const safe = \"x\"; const token = \""+cliTaintTypedSecretCanary+cliTaintJavaScriptCanary+"\"\n")
 
 	forbidden := []string{
 		cliTaintSecurityCanary, cliTaintDependencyCanary, cliTaintNewDependencyCanary, cliTaintNestedCanary, cliTaintBinaryCanary,
 		cliTaintTooLargeCanary, cliTaintGeneratedCanary, cliTaintUnsupportedCanary, cliTaintInvalidUTF8Canary,
-		cliTaintPEMCanary, cliTaintPythonSecretCanary, cliTaintTypedSecretCanary,
-		".env", ".env.local", ".env.ts", ".git/config", ".github/workflows/ci.ts",
-		"credentials.py", "secret.ts", "material.pem", "certificate.crt",
-		"node_modules/dependency.ts", "vendor/vendor.py", "build/output.ts", ".cache/cache.py",
-		"nested-repository/.git/config", "nested-repository/00-child.py", "client.generated.ts",
-		"generated-header.py", "binary.py", "oversized.ts", "invalid-utf8.py",
-		"opaque.CLI_TAINT_UNSUPPORTED_NAME_TASK13", "pem-material.py", "embedded-secret.py", "embedded-secret.ts",
+		cliTaintPEMCanary, cliTaintPythonSecretCanary, cliTaintTypedSecretCanary, cliTaintJavaScriptCanary,
+		".env", ".env.local", ".env.jsx", ".git/config", ".github/workflows/ci.js",
+		"credentials.js", "secret.jsx", "material.pem", "certificate.crt",
+		"node_modules/dependency.js", "vendor/vendor.jsx", "build/output.js", ".cache/cache.jsx",
+		"nested-repository/.git/config", "nested-repository/00-child.js", "client.generated.js",
+		"generated-header.jsx", "binary.js", "oversized.jsx", "invalid-utf8.js",
+		"opaque.CLI_TAINT_UNSUPPORTED_NAME_TASK13", "pem-material.py", "embedded-secret.py", "embedded-secret.jsx",
 	}
 	forbidden = append(forbidden, newDependencyPaths...)
 	if runtime.GOOS != "windows" {
-		writeCLIFile(t, outside, "outside.py", cliTaintSymlinkCanary+"\n")
+		writeCLIFile(t, outside, "outside.jsx", cliTaintSymlinkCanary+cliTaintJavaScriptCanary+"\n")
 		writeCLIFile(t, repository, ".env.internal-link", cliTaintSymlinkCanary+"\n")
-		if err := os.Symlink(filepath.Join(outside, "outside.py"), filepath.Join(repository, "external-link.py")); err != nil {
+		if err := os.Symlink(filepath.Join(outside, "outside.jsx"), filepath.Join(repository, "external-link.jsx")); err != nil {
 			t.Fatalf("Symlink(external) error = %v", err)
 		}
-		if err := os.Symlink(".env.internal-link", filepath.Join(repository, "internal-link.ts")); err != nil {
+		if err := os.Symlink(".env.internal-link", filepath.Join(repository, "internal-link.js")); err != nil {
 			t.Fatalf("Symlink(internal) error = %v", err)
 		}
 		forbidden = append(
 			forbidden,
 			cliTaintSymlinkCanary,
 			".env.internal-link",
-			"external-link.py",
-			"internal-link.ts",
-			filepath.Join(outside, "outside.py"),
+			"external-link.jsx",
+			"internal-link.js",
+			filepath.Join(outside, "outside.jsx"),
 		)
 	}
 	return cliTaintFixture{repository: repository, forbidden: forbidden}
@@ -1328,13 +1337,15 @@ func expectedTaintVectorDigest(chunks []source.Chunk, semantic bool) string {
 }
 
 func expectedTaintVectorBlob(chunks []source.Chunk, chunkID string) ([]byte, bool) {
-	if len(chunks) != 2 {
+	if len(chunks) != 3 {
 		return nil, false
 	}
 	switch chunkID {
 	case chunks[0].ID:
 		return []byte{0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00}, true
 	case chunks[1].ID:
+		return []byte{0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00}, true
+	case chunks[2].ID:
 		return []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f}, true
 	default:
 		return nil, false
@@ -1354,17 +1365,18 @@ func writeTaintCanonicalInteger(writer hash.Hash, value int64) {
 
 func assertPermittedTaintChunks(t *testing.T, chunks []source.Chunk, forbidden []string) {
 	t.Helper()
-	if len(chunks) != 2 {
-		t.Fatalf("stored chunks = %d, want two permitted chunks", len(chunks))
+	if len(chunks) != 3 {
+		t.Fatalf("stored chunks = %d, want three permitted chunks", len(chunks))
 	}
 	assertNoCLITaintValue(t, "stored structured chunks", chunks, forbidden)
 	wantReferences := []source.Reference{
+		{Path: "safe/allowed.jsx", StartLine: 1, EndLine: 1},
 		{Path: "safe/allowed.py", StartLine: 1, EndLine: 2},
 		{Path: "safe/allowed.ts", StartLine: 1, EndLine: 3},
 	}
 	wantText := permittedTaintDocumentInputs()
-	wantLanguages := []source.Language{source.LanguagePython, source.LanguageTypeScript}
-	wantSymbols := []string{"permitted_python_lookup", "permittedTypeScriptLookup"}
+	wantLanguages := []source.Language{source.LanguageJavaScript, source.LanguagePython, source.LanguageTypeScript}
+	wantSymbols := []string{"safeJavaScriptEntry", "permitted_python_lookup", "permittedTypeScriptLookup"}
 	for index, chunk := range chunks {
 		if chunk.ID == "" || chunk.Text != wantText[index] || chunk.Language != wantLanguages[index] ||
 			chunk.SymbolName != wantSymbols[index] || chunk.Reference != wantReferences[index] || !chunk.Reference.Valid() {
@@ -1375,6 +1387,7 @@ func assertPermittedTaintChunks(t *testing.T, chunks []source.Chunk, forbidden [
 
 func permittedTaintDocumentInputs() []string {
 	return []string{
+		"export const safeJavaScriptEntry = () => \"SAFE_JAVASCRIPT_SEARCH_TOKEN\"",
 		"def permitted_python_lookup():\n    return \"SAFE_PYTHON_SEARCH_TOKEN\"",
 		"export function permittedTypeScriptLookup() {\n  return \"SAFE_TYPESCRIPT_SEARCH_TOKEN\"\n}",
 	}
@@ -1388,6 +1401,7 @@ func assertPermittedTaintHits(
 	forbidden []string,
 ) {
 	t.Helper()
+	canonical = permittedNonJavaScriptChunks(canonical)
 	if len(hits) != len(canonical) || len(wantScores) != len(canonical) {
 		t.Fatalf("structured search hits/scores = %d/%d, want %d exact permitted results", len(hits), len(wantScores), len(canonical))
 	}
@@ -1399,6 +1413,39 @@ func assertPermittedTaintHits(
 	if !reflect.DeepEqual(hits, want) {
 		t.Fatalf("structured search hits = %#v, want every field exact %#v", hits, want)
 	}
+}
+
+func permittedNonJavaScriptChunks(chunks []source.Chunk) []source.Chunk {
+	filtered := make([]source.Chunk, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk.Language != source.LanguageJavaScript {
+			filtered = append(filtered, chunk)
+		}
+	}
+	return filtered
+}
+
+func assertPermittedJavaScriptSearch(
+	t *testing.T,
+	code int,
+	stdout, stderr string,
+	hits []searchdomain.Hit,
+	canonical []source.Chunk,
+	forbidden []string,
+) {
+	t.Helper()
+	if len(canonical) != 3 {
+		t.Fatalf("canonical chunks = %d, want JavaScript plus prior languages", len(canonical))
+	}
+	wantOutput := "0.600 safe/allowed.jsx:1-1 safeJavaScriptEntry\n" + canonical[0].Text + "\n"
+	if code != 0 || stdout != wantOutput || stderr != "" {
+		t.Fatalf("JavaScript search = code %d stdout %q stderr %q, want exact safe hit", code, stdout, stderr)
+	}
+	want := []searchdomain.Hit{{Chunk: canonical[0], Score: 0.6}}
+	if !reflect.DeepEqual(hits, want) {
+		t.Fatalf("JavaScript structured hits = %#v, want exact %#v", hits, want)
+	}
+	assertNoCLITaintValue(t, "JavaScript structured search hits", hits, forbidden)
 }
 
 func permittedTaintLexicalScores() []float64 {
@@ -1418,7 +1465,7 @@ func assertExactTaintHTTPRequests(
 	}
 	forbidden := appendCopy(
 		fixture.forbidden,
-		fixture.repository, canonicalPath(t, fixture.repository), "safe/allowed.py", "safe/allowed.ts",
+		fixture.repository, canonicalPath(t, fixture.repository), "safe/allowed.jsx", "safe/allowed.py", "safe/allowed.ts",
 	)
 	metadataForbidden := appendCopy(forbidden, cliTaintQueryCanary)
 	for index, request := range requests {

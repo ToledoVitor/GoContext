@@ -16,6 +16,8 @@ import (
 func TestScannerIncludesSupportedFilesWithRepositoryRelativeReferences(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "app.py", "def main():\n    return 1\n")
+	writeFile(t, root, "src/component.JSX", "export const View = () => <main />\n")
+	writeFile(t, root, "src/helpers.Js", "export function loadData() {}\n")
 	writeFile(t, root, "src/app.ts", "export function main() {\n  return 1\n}\n")
 	writeFile(t, root, "src/view.tsx", "export const View = () => <div />\n")
 
@@ -26,11 +28,13 @@ func TestScannerIncludesSupportedFilesWithRepositoryRelativeReferences(t *testin
 	if result.PolicyVersion != ingest.ScanPolicyVersion {
 		t.Errorf("PolicyVersion = %q, want %q", result.PolicyVersion, ingest.ScanPolicyVersion)
 	}
-	if result.Report.EligibleFiles != 3 || result.Report.IncludedFiles != 3 {
-		t.Errorf("file counts = eligible %d, included %d; want 3 and 3", result.Report.EligibleFiles, result.Report.IncludedFiles)
+	if result.Report.EligibleFiles != 5 || result.Report.IncludedFiles != 5 {
+		t.Errorf("file counts = eligible %d, included %d; want 5 and 5", result.Report.EligibleFiles, result.Report.IncludedFiles)
 	}
-	if result.Report.IncludedByLanguage[source.LanguagePython] != 1 || result.Report.IncludedByLanguage[source.LanguageTypeScript] != 2 {
-		t.Errorf("IncludedByLanguage = %#v, want one Python and two TypeScript", result.Report.IncludedByLanguage)
+	if result.Report.IncludedByLanguage[source.LanguagePython] != 1 ||
+		result.Report.IncludedByLanguage[source.LanguageJavaScript] != 2 ||
+		result.Report.IncludedByLanguage[source.LanguageTypeScript] != 2 {
+		t.Errorf("IncludedByLanguage = %#v, want one Python, two JavaScript and two TypeScript", result.Report.IncludedByLanguage)
 	}
 
 	want := []struct {
@@ -40,6 +44,8 @@ func TestScannerIncludesSupportedFilesWithRepositoryRelativeReferences(t *testin
 	}{
 		{path: "app.py", language: source.LanguagePython, endLine: 2},
 		{path: "src/app.ts", language: source.LanguageTypeScript, endLine: 3},
+		{path: "src/component.JSX", language: source.LanguageJavaScript, endLine: 1},
+		{path: "src/helpers.Js", language: source.LanguageJavaScript, endLine: 1},
 		{path: "src/view.tsx", language: source.LanguageTypeScript, endLine: 1},
 	}
 	if len(result.Files) != len(want) {

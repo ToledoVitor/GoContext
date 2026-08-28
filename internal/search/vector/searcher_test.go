@@ -237,7 +237,7 @@ func TestSearcherEmbedsOneQueryAndReturnsCanonicalNormalizedHits(t *testing.T) {
 	query.Limit = 3
 	query.Filter = search.Filter{
 		PathPrefixes: []string{"pkg", "internal"},
-		Languages:    []source.Language{source.LanguagePython, source.LanguageTypeScript},
+		Languages:    []source.Language{source.LanguageJavaScript, source.LanguagePython, source.LanguageTypeScript},
 	}
 	chunks := []source.Chunk{
 		testChunk("negative", "pkg/negative.py", 7, 8, "NEGATIVE_SOURCE"),

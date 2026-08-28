@@ -89,12 +89,14 @@ func TestSearcherFiltersByPathPrefixBeforeLimit(t *testing.T) {
 func TestSearcherFiltersLanguagesWithinPathPrefixes(t *testing.T) {
 	store := newStore(t)
 	pythonInternal := chunk("python-internal", "internal/python/search.py", 1, "Search", "search token")
+	javaScriptInternal := chunk("javascript-internal", "internal/javascript/search.js", 1, "Search", "search token")
+	javaScriptInternal.Language = source.LanguageJavaScript
 	typeScriptInternal := chunk("typescript-internal", "internal/typescript/search.ts", 1, "Search", "search token")
 	typeScriptInternal.Language = source.LanguageTypeScript
 	unknownInternal := chunk("unknown-internal", "internal/unknown/search.txt", 1, "Search", "search token")
 	unknownInternal.Language = source.LanguageUnknown
 	pythonPackage := chunk("python-package", "pkg/search.py", 1, "Search", "search token")
-	chunks := []source.Chunk{pythonInternal, typeScriptInternal, unknownInternal, pythonPackage}
+	chunks := []source.Chunk{pythonInternal, javaScriptInternal, typeScriptInternal, unknownInternal, pythonPackage}
 	if err := store.Replace(context.Background(), "repo", mustLexicalCorpus(t, chunks)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
@@ -109,14 +111,14 @@ func TestSearcherFiltersLanguagesWithinPathPrefixes(t *testing.T) {
 		Limit:        10,
 		Filter: search.Filter{
 			PathPrefixes: []string{"internal/"},
-			Languages:    []source.Language{source.LanguagePython, source.LanguageTypeScript},
+			Languages:    []source.Language{source.LanguageJavaScript, source.LanguagePython, source.LanguageTypeScript},
 		},
 	})
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
-	if got := hitIDs(hits); len(got) != 2 || got[0] != "python-internal" || got[1] != "typescript-internal" {
-		t.Fatalf("Search() IDs = %v, want [python-internal typescript-internal]", got)
+	if got := hitIDs(hits); len(got) != 3 || got[0] != "javascript-internal" || got[1] != "python-internal" || got[2] != "typescript-internal" {
+		t.Fatalf("Search() IDs = %v, want [javascript-internal python-internal typescript-internal]", got)
 	}
 }
 

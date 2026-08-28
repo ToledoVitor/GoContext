@@ -11,7 +11,7 @@ MVP precisa indexar repositórios pequenos, combinar busca lexical e semântica,
 
 - **Núcleo:** Go 1.24+, em monólito modular e um binário.
 - **CLI inicial:** biblioteca padrão `flag`; framework de comandos só entra quando comandos aninhados justificarem dependência.
-- **Parsing:** Tree-sitter para Python e TypeScript, após spike do binding Go e distribuição com ou sem CGO.
+- **Parsing estrutural futuro:** Tree-sitter para JavaScript/JSX, Python e TypeScript, após spike do binding Go e distribuição com ou sem CGO. O line parser JavaScript atual é apenas um tracer bullet conservador, não substitui essa decisão.
 - **Persistência:** SQLite local como direção para metadados e busca lexical; opção vetorial será validada por spike.
 - **Busca híbrida:** candidatos lexicais e vetoriais combinados por Reciprocal Rank Fusion.
 - **Embeddings e LLM:** portas internas com adapters substituíveis; nenhuma chamada de rede implícita.

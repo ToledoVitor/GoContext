@@ -7,7 +7,7 @@ GoContext começa como aplicação local, de processo único e orientada a CLI. 
 ## Fluxo de dados
 
 1. **Scanner** percorre somente uma raiz autorizada, aplica regras de exclusão, rejeita binários e mantém caminhos relativos.
-2. **Line parser preliminar** descobre declarações top-level de Python e TypeScript com intervalos de linhas; parser estrutural permanece pendente.
+2. **Line parser preliminar** descobre um subconjunto conservador de declarações top-level de JavaScript/JSX, Python e TypeScript com intervalos de linhas; parser estrutural permanece pendente.
 3. **Chunker atual** recorta por limites dessas declarações; divisão de símbolos grandes com sobreposição permanece futura.
 4. **Store** grava chunks e metadados em snapshot consistente.
 5. **Busca lexical** favorece nomes exatos, identificadores e mensagens de erro.
@@ -79,9 +79,9 @@ O reader SQLite faz cosseno exato O(n × dimensão), sem ANN implícito e sem al
 
 ## Parsing e chunking
 
-Python e TypeScript exigem parser estrutural. Tree-sitter é a direção preferida; binding Go e impacto de CGO precisam ser validados no marco de ingestão.
+JavaScript/JSX, Python e TypeScript exigem parser estrutural. Tree-sitter é a direção preferida; binding Go e impacto de CGO precisam ser validados no marco de ingestão.
 
-`internal/ingest/lineparser` oferece descoberta preliminar enquanto esse spike não ocorre. Reconhece declarações top-level comuns de Python (`def`, `async def`, `class`) e TypeScript (`function`, `class`, `interface`, `type`, `enum`) e registra linha declaratória. Não interpreta AST, bodies, métodos, símbolos aninhados, arrow functions ou declarações multilinha. Essas limitações impedem uso do parser atual para chunking final.
+`internal/ingest/lineparser` oferece descoberta preliminar enquanto esse spike não ocorre. Reconhece declarações top-level comuns de Python (`def`, `async def`, `class`) e TypeScript (`function`, `class`, `interface`, `type`, `enum`). Para JavaScript/JSX reconhece somente funções nomeadas, inclusive `async` e geradoras, classes nomeadas e uma variável top-level `const`/`let`/`var` atribuída diretamente a arrow function ou function expression, com `export`/`async` apenas nas formas previstas pelo contrato. Preserva a linha declaratória exata e não inventa nome para default anônimo. Não interpreta AST, bodies, métodos, símbolos aninhados/indentados, declarações multilinha, destructuring ou toda a gramática ECMAScript; arrow functions TypeScript continuam fora desse recorte. Essas limitações impedem apresentar o parser atual como estrutural ou completo.
 
 Política inicial de chunking:
 
@@ -97,7 +97,7 @@ Política inicial de chunking:
 
 `internal/ingest/filesystem` implementa `ingest.Scanner` usando `os.Root`, disponível no Go 1.24, para manter leituras confinadas à raiz autorizada. Scanner:
 
-- inclui `.py`, `.ts` e `.tsx`;
+- inclui `.js`, `.jsx`, `.py`, `.ts` e `.tsx`, com extensão case-insensitive;
 - retorna caminhos relativos normalizados e intervalos de linhas;
 - não segue symlinks;
 - exclui diretórios de VCS, dependências, ambientes virtuais, caches, cobertura e builds;
@@ -105,6 +105,8 @@ Política inicial de chunking:
 - respeita cancelamento de contexto.
 
 O scanner já aplica policy default-deny auditável antes de qualquer avaliação profissional. Paths reconhecidamente sensíveis são recusados antes de `Open`: `.env`, `.env.*`, `.git/**`, `.github/**`, metadata/automação, credenciais/chaves/certificados, nested repos, symlinks, dependências e caches. Arquivos de nome permitido são lidos com limite para classificar binário, UTF-8, gerado, tamanho e padrões conservadores de segredo; itens detectados não viram `source.File` nem atravessam parser/rede/store. Report expõe somente contagens por categoria.
+
+`scanner-v6` representa a ampliação de elegibilidade JavaScript/JSX. Snapshot ou geração SQLite `scanner-v5` falha com a categoria sanitizada de reindexação e nunca recebe migração in-place. JSON continua fora da allowlist e não existe fallback cru para arquivo não suportado.
 
 M2 deliberadamente não lê `.gitignore`: arquivo controlado pelo próprio repositório não pode relaxar hard deny, e leitura ampla de metadata aumenta superfície. Futuro suporte será deny-only e exigirá decisão explícita. Exclusão integral de `.github/**` perde contexto potencialmente útil, trade-off aceito por segurança.
 
@@ -130,7 +132,7 @@ Erros carregam etapa, caminho relativo quando seguro e causa original. Arquivo i
 ## Estratégia de testes
 
 - testes unitários para invariantes de origem, filtros, chunking, fusão e citações;
-- fixtures pequenas de Python e TypeScript;
+- fixtures pequenas de JavaScript/JSX, Python e TypeScript;
 - testes de integração para `repositório → índice → busca` sem rede;
 - teste end-to-end da CLI com provider fake antes de qualquer LLM real;
 - testes explícitos de symlink escape, arquivos secretos e prompt injection.

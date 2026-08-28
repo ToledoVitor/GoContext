@@ -86,7 +86,7 @@ func OpenRoot(root string) (*OpenedRoot, error) {
 	return &OpenedRoot{repository: repository, identity: rootInfo}, nil
 }
 
-// Scan discovers safe Python and TypeScript files below an authorized root.
+// Scan discovers safe JavaScript, Python, and TypeScript files below an authorized root.
 func (s *Scanner) Scan(ctx context.Context, root string) (ingest.ScanResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ingest.ScanResult{}, err
@@ -377,6 +377,8 @@ func readLimited(reader io.Reader) ([]byte, bool, error) {
 
 func languageForPath(filePath string) (source.Language, bool) {
 	switch strings.ToLower(path.Ext(filePath)) {
+	case ".js", ".jsx":
+		return source.LanguageJavaScript, true
 	case ".py":
 		return source.LanguagePython, true
 	case ".ts", ".tsx":

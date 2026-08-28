@@ -15,13 +15,13 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 - scanner default-deny com decisão antes de leitura, exclusões auditáveis e fail-closed;
 - testes de segredos, `.git/**`, `.github/**`, symlink, traversal, nested repo, binário, gerado e arquivo grande;
 - spike e escolha do binding Tree-sitter;
-- parsing de Python e TypeScript;
+- line parsing conservador de JavaScript/JSX, Python e TypeScript;
 - chunks por símbolo;
 - comando `gocontext inspect <repo>` que mostra metadados, sem embeddings.
 
 **Pronto quando:** fixtures retornam símbolos, linhas e chunks determinísticos; escapes por symlink falham; bytes hard-denied não chegam a nenhum estágio ou log.
 
-Scanner, relatório, snapshots seguros, chunking preliminar e prova taint ponta a ponta estão entregues. Parser estrutural continua pendente; o line parser atual não é apresentado como parser final.
+Scanner `scanner-v6`, relatório, snapshots seguros, tracer bullet JavaScript/JSX, chunking preliminar e prova taint ponta a ponta estão entregues. `scanner-v5` exige reindex explícito, sem migração in-place. Parser estrutural continua pendente; o line parser atual não é apresentado como parser final.
 
 ## M2 — Índice e busca local (núcleo entregue; validação ampla pendente)
 
@@ -62,4 +62,4 @@ Esses comportamentos do núcleo estão entregues com `source.Reference` canônic
 
 React/TypeScript para navegação e histórico, atualização incremental, ANN, reranker, banco vetorial externo, mais linguagens, métricas de recuperação e adapters adicionais. Só entram após uso real indicar prioridade.
 
-Primeiro ciclo de uso real em três repositórios profissionais autorizados passou os gates da Task 14 e concluiu inventário/baseline lexical aggregate-only, sem rede. Resultado sanitizado separado prioriza JavaScript/JSX e gold set humano local; categorias não exact-symbol continuam `not-evaluated`. Híbrido via Ollama loopback permanece futuro e condicionado ao gate local. Código, paths e queries profissionais não entram em relatórios nem providers externos.
+Primeiro ciclo de uso real em três repositórios profissionais autorizados passou os gates da Task 14 e concluiu inventário/baseline lexical aggregate-only sob `scanner-v5`, sem rede. O tracer bullet JavaScript/JSX posterior usa somente fixtures sintéticas: não atualiza aquele baseline nem sustenta delta de qualidade profissional. Nova medição exige reindex `scanner-v6` e repetição dos gates de taint, no-egress e go/no-go. Categorias não exact-symbol continuam `not-evaluated`; híbrido via Ollama loopback permanece futuro e condicionado ao gate local. Código, paths e queries profissionais não entram em relatórios nem providers externos.

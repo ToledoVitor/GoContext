@@ -203,6 +203,8 @@ Cada resultado do scanner carrega `ScanPolicyVersion`; composition root a transf
 
 `scanner-v5` adiciona deny case-insensitive, antes de metadata/open, para raízes de dependências/build/cache de alta confiança: `Pods`, `.gradle`, `.dart_tool`, `.pub-cache`, `DerivedData`, `Carthage`, `.cxx`, `.expo`, `.turbo`, `.nx`, `.parcel-cache`, `.vite` e `.bundle`. Nomes ambíguos como `packages` não são negados. A mesma versão amplia apenas buckets agregados sanitizados para famílias source/build, assets, imagens/fontes, archives e binários comuns; labels continuam extensões lowercase centralmente permitidas, com `<none>`/`<other>` para o restante. Nenhuma extensão nova se torna ingestível. Snapshot/corpus `scanner-v4` ou anterior exige reindex completo, sem migração in-place.
 
+`scanner-v6` adiciona `.js` e `.jsx`, case-insensitive, à allowlist somente depois de todos os gates de path, tipo, tamanho e conteúdo já definidos. O line parser JavaScript é deliberadamente conservador: funções/classes precisam ser nomeadas; variáveis top-level só viram símbolo quando atribuídas diretamente a arrow/function expression; default anônimo, declaração indentada/nested e formas multilinha não recebem nomes inventados. Não existe alegação de AST ou completude estrutural. JSON e demais extensões permanecem unsupported e não geram fallback cru. Snapshot ou corpus `scanner-v5` exige reindex completo pela categoria existente, sem migração in-place. A mudança foi validada apenas com fixtures sintéticas e taint renovado; qualquer delta de qualidade profissional depende de novo gate e nova execução local agregada.
+
 Reader SQLite é ligado a um `GenerationID` e read transaction imutáveis por consulta, com `Close`: corpus lexical, vetores e hidratação usam mesma geração mesmo se manifest mudar concorrentemente. Cleanup pode apagar linhas logicamente, mas checkpoint/truncate espera readers fecharem.
 
 ### Filtros
@@ -216,7 +218,7 @@ type Filter struct {
 }
 ```
 
-Categorias são combinadas por AND; valores de mesma categoria, por OR. Prefixos são caminhos relativos normalizados. Busca lexical e vetorial aplicam mesmos filtros antes de limitar candidatos. Mapas arbitrários e expressões específicas de SQL/provider não entram no contrato.
+Categorias são combinadas por AND; valores de mesma categoria, por OR. Prefixos são caminhos relativos normalizados. As linguagens aceitas são `javascript`, `python` e `typescript`. Busca lexical e vetorial aplicam mesmos filtros antes de limitar candidatos. Mapas arbitrários e expressões específicas de SQL/provider não entram no contrato.
 
 ### Busca vetorial e hidratação
 

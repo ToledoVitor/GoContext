@@ -12,6 +12,7 @@ type Language string
 
 const (
 	LanguageUnknown    Language = "unknown"
+	LanguageJavaScript Language = "javascript"
 	LanguagePython     Language = "python"
 	LanguageTypeScript Language = "typescript"
 )
