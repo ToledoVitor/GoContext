@@ -2,17 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
-	"github.com/ToledoVitor/GoContext/internal/ingest/filesystem"
-	"github.com/ToledoVitor/GoContext/internal/ingest/lineparser"
+	indexdomain "github.com/ToledoVitor/GoContext/internal/index"
+	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
-	"github.com/ToledoVitor/GoContext/internal/ingest/symbolchunker"
-	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
 type indexStats struct {
@@ -20,6 +19,13 @@ type indexStats struct {
 	symbols int
 	chunks  int
 }
+
+var (
+	errSQLiteIndexFailure        = errors.New("falha na indexação SQLite")
+	errSQLiteIndexMaintenance    = errors.New("índice SQLite publicado; manutenção incompleta")
+	errSQLiteIndexClose          = errors.New("falha ao fechar índice SQLite")
+	errRollbackCompanionNotReady = errors.New("índice SQLite publicado; rollback não está pronto")
+)
 
 func runIndex(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("index", flag.ContinueOnError)
@@ -44,73 +50,115 @@ func runIndex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintf(stderr, "configurar indexação: %v\n", err)
 		return 2
 	}
-	if resolvedEmbedding.backend != indexBackendSnapshot {
-		fmt.Fprintln(stderr, "indexar repositório: selected index backend is not wired yet")
-		return 1
-	}
-
 	storeDirectory, err := storeDirectory(*storeFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "indexar repositório: %v\n", err)
 		return 1
 	}
-	stats, err := indexRepository(ctx, flags.Arg(0), storeDirectory)
+	ingested, err := ingestRepository(ctx, flags.Arg(0))
 	if err != nil {
 		fmt.Fprintf(stderr, "indexar repositório: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprintf(
-		stdout,
-		"indexado: %d arquivos, %d símbolos, %d chunks\n",
-		stats.files,
-		stats.symbols,
-		stats.chunks,
-	)
+	var report indexdomain.Report
+	var published bool
+	switch resolvedEmbedding.backend {
+	case indexBackendSnapshot:
+		err = publishSnapshot(ctx, storeDirectory, ingested)
+		published = err == nil
+	case indexBackendSQLite:
+		report, published, err = publishSQLiteIndex(ctx, storeDirectory, ingested, resolvedEmbedding, stderr)
+	default:
+		err = errSQLiteIndexFailure
+	}
+	if published {
+		printIndexReport(stdout, ingested.stats, resolvedEmbedding.mode, report)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "indexar repositório: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
-func indexRepository(ctx context.Context, repositoryPath, storeDirectory string) (indexStats, error) {
-	repositoryID, err := canonicalRepositoryPath(repositoryPath)
-	if err != nil {
-		return indexStats{}, err
+func printIndexReport(stdout io.Writer, stats indexStats, mode semanticMode, report indexdomain.Report) {
+	fmt.Fprintf(
+		stdout,
+		"indexado: %d arquivos, %d símbolos, %d chunks\n",
+		stats.files, stats.symbols, stats.chunks,
+	)
+	if mode != semanticModeOff {
+		fmt.Fprintf(stdout, "semântica: status=%s vetores=%d requests=%d tokens=%d\n",
+			report.Semantic, report.Vectors, report.Requests, report.UsageTokens)
 	}
+}
 
-	scanResult, err := filesystem.NewScanner().Scan(ctx, repositoryID)
-	if err != nil {
-		return indexStats{}, err
-	}
-
-	parser := lineparser.NewParser()
-	chunker := symbolchunker.NewChunker()
-	chunks := make([]source.Chunk, 0)
-	stats := indexStats{files: len(scanResult.Files)}
-	for _, file := range scanResult.Files {
-		symbols, err := parser.Parse(ctx, file)
-		if err != nil {
-			return indexStats{}, fmt.Errorf("parse %q: %w", file.Reference.Path, err)
-		}
-		fileChunks, err := chunker.Chunk(ctx, file, symbols)
-		if err != nil {
-			return indexStats{}, err
-		}
-		stats.symbols += len(symbols)
-		stats.chunks += len(fileChunks)
-		chunks = append(chunks, fileChunks...)
-	}
-	corpus, err := source.NewCorpus(scanResult.PolicyVersion, chunks)
-	if err != nil {
-		return indexStats{}, err
-	}
-
+func publishSnapshot(ctx context.Context, storeDirectory string, ingested repositoryIngest) error {
 	store, err := localstore.NewStore(storeDirectory)
 	if err != nil {
-		return indexStats{}, err
+		return err
 	}
-	if err := store.Replace(ctx, repositoryID, corpus); err != nil {
-		return indexStats{}, err
+	if err := store.Replace(ctx, ingested.repositoryID, ingested.corpus); err != nil {
+		return err
 	}
-	return stats, nil
+	_ = removeRollbackMarker(storeDirectory, ingested.repositoryID)
+	return nil
+}
+
+func publishSQLiteIndex(
+	ctx context.Context,
+	storeDirectory string,
+	ingested repositoryIngest,
+	config resolvedEmbeddingConfig,
+	stderr io.Writer,
+) (indexdomain.Report, bool, error) {
+	store, err := indexsqlite.NewStore(storeDirectory)
+	if err != nil {
+		return indexdomain.Report{}, false, errSQLiteIndexFailure
+	}
+	builder, err := indexdomain.NewBuilder(store, config.client, indexdomain.BuilderConfig{Mode: indexSemanticMode(config.mode)})
+	if err != nil {
+		var operationErr error = errSQLiteIndexFailure
+		if closeErr := store.Close(); closeErr != nil {
+			operationErr = errors.Join(operationErr, errSQLiteIndexClose)
+		}
+		return indexdomain.Report{}, false, operationErr
+	}
+	if config.mode != semanticModeOff && config.egress == dataEgressExternal {
+		_, _ = fmt.Fprint(stderr, externalIndexEgressWarning)
+	}
+	report, buildErr := builder.Replace(ctx, ingested.repositoryID, ingested.corpus)
+	var committed *indexdomain.CommittedCleanupError
+	published := buildErr == nil || (report.GenerationID != "" && errors.As(buildErr, &committed))
+	var operationErr error
+	if !published {
+		operationErr = errSQLiteIndexFailure
+	} else {
+		if report.Semantic == indexdomain.SemanticStatusDegraded {
+			_, _ = fmt.Fprint(stderr, semanticDegradedWarning)
+		}
+		if err := writeRollbackCompanion(ctx, storeDirectory, ingested, report.GenerationID, store); err != nil {
+			operationErr = errRollbackCompanionNotReady
+		} else if buildErr != nil {
+			operationErr = errSQLiteIndexMaintenance
+		}
+	}
+	if closeErr := store.Close(); closeErr != nil {
+		operationErr = errors.Join(operationErr, errSQLiteIndexClose)
+	}
+	return report, published, operationErr
+}
+
+func indexSemanticMode(mode semanticMode) indexdomain.SemanticMode {
+	switch mode {
+	case semanticModePreferred:
+		return indexdomain.SemanticPreferred
+	case semanticModeRequired:
+		return indexdomain.SemanticRequired
+	default:
+		return indexdomain.SemanticOff
+	}
 }
 
 func canonicalRepositoryPath(repositoryPath string) (string, error) {

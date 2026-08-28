@@ -42,5 +42,5 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "uso: gocontext <comando> [opções]")
 	fmt.Fprintln(writer, "comandos:")
 	fmt.Fprintln(writer, "  index    indexa repositório local")
-	fmt.Fprintln(writer, "  search   consulta snapshot local")
+	fmt.Fprintln(writer, "  search   consulta índice local")
 }

@@ -153,6 +153,57 @@ func NewStore(directory string) (*Store, error) {
 	return store, nil
 }
 
+// OpenExisting opens a previously initialized SQLite store without creating or
+// changing the requested directory or database when either is absent.
+func OpenExisting(directory string) (*Store, error) {
+	if strings.TrimSpace(directory) == "" {
+		return nil, fmt.Errorf("open existing sqlite index store: directory is empty")
+	}
+	abs, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: resolve directory: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("open existing sqlite index store: %w", index.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: inspect directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("open existing sqlite index store: path is not a directory")
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: resolve directory: %w", err)
+	}
+	databasePath := filepath.Join(canonical, databaseName)
+	if _, err := os.Stat(databasePath); errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("open existing sqlite index store: %w", index.ErrNotFound)
+	} else if err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: inspect database: %w", err)
+	}
+	if err := inspectDatabase(databasePath); err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: %w", err)
+	}
+
+	db, err := sql.Open("sqlite", readOnlyDataSourceName(databasePath))
+	if err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: open database: %w", err)
+	}
+	store := &Store{
+		db:         db,
+		writeToken: make(chan struct{}, 1),
+		readers:    make(map[*BoundReader]struct{}),
+	}
+	store.writeToken <- struct{}{}
+	if err := db.PingContext(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open existing sqlite index store: open operational database: %w", err)
+	}
+	return store, nil
+}
+
 func createPrivateDatabaseFile(path string) (bool, error) {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {
@@ -174,6 +225,16 @@ func dataSourceName(path string) string {
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", "journal_mode(WAL)")
 	query.Add("_pragma", "secure_delete(ON)")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
+}
+
+func readOnlyDataSourceName(path string) string {
+	dsn := &url.URL{Scheme: "file", Path: path}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(1)")
 	dsn.RawQuery = query.Encode()
 	return dsn.String()
 }

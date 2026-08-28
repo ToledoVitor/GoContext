@@ -1385,6 +1385,71 @@ func TestNewStoreRejectsEmptyPathAndExistingFile(t *testing.T) {
 	}
 }
 
+func TestOpenExistingNeverCreatesMissingStore(t *testing.T) {
+	root := t.TempDir()
+	missingDirectory := filepath.Join(root, "missing")
+	if _, err := indexsqlite.OpenExisting(missingDirectory); !errors.Is(err, index.ErrNotFound) {
+		t.Fatalf("OpenExisting(missing directory) error = %v, want ErrNotFound", err)
+	}
+	if _, err := os.Stat(missingDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(missing directory) error = %v, want not exist", err)
+	}
+
+	emptyDirectory := t.TempDir()
+	if _, err := indexsqlite.OpenExisting(emptyDirectory); !errors.Is(err, index.ErrNotFound) {
+		t.Fatalf("OpenExisting(empty directory) error = %v, want ErrNotFound", err)
+	}
+	if entries := directoryEntryNames(t, emptyDirectory); len(entries) != 0 {
+		t.Fatalf("OpenExisting(empty directory) created entries %v", entries)
+	}
+}
+
+func TestOpenExistingLoadsPersistedStore(t *testing.T) {
+	directory := t.TempDir()
+	created := openStore(t, directory)
+	generation := generationFromCorpus(t, "repository", "generation", "", []source.Chunk{
+		sampleChunk("chunk", "persisted.py", "VALUE = 1"),
+	})
+	if err := created.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatalf("Close(created) error = %v", err)
+	}
+	databasePath := filepath.Join(directory, "index-v2.sqlite3")
+	beforeInfo, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatalf("Stat(database before OpenExisting) error = %v", err)
+	}
+
+	reopened, err := indexsqlite.OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close(reopened) error = %v", err)
+		}
+	})
+	loaded, err := reopened.Load(context.Background(), generation.RepositoryID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !reflect.DeepEqual(loaded, generation.Chunks) {
+		t.Fatalf("Load() = %#v, want %#v", loaded, generation.Chunks)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close(reopened) error = %v", err)
+	}
+	afterInfo, err := os.Stat(databasePath)
+	if err != nil {
+		t.Fatalf("Stat(database after OpenExisting) error = %v", err)
+	}
+	if afterInfo.Size() != beforeInfo.Size() || !afterInfo.ModTime().Equal(beforeInfo.ModTime()) || afterInfo.Mode() != beforeInfo.Mode() {
+		t.Fatalf("OpenExisting changed database metadata: before=%v after=%v", beforeInfo, afterInfo)
+	}
+}
+
 func TestStoreKeepsRepositoriesIsolated(t *testing.T) {
 	store := newStore(t)
 	first := generationFromCorpus(t, "repository-one", "generation", "", []source.Chunk{sampleChunk("one", "one.py", "ONE = 1")})
