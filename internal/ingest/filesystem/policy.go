@@ -146,34 +146,68 @@ func containsSecret(content []byte) bool {
 }
 
 func containsLiteralSecretAssignment(line string) bool {
-	delimiter := literalAssignmentDelimiter(line)
-	if delimiter < 0 {
-		return false
+	for _, candidate := range literalAssignmentCandidates(line) {
+		left := strings.ToLower(line[candidate.statementStart:candidate.delimiter])
+		if !strings.Contains(left, "token") && !strings.Contains(left, "password") &&
+			!strings.Contains(left, "secret") && !strings.Contains(left, "api_key") && !strings.Contains(left, "apikey") {
+			continue
+		}
+		right := strings.TrimSpace(line[candidate.delimiter+1:])
+		if len(right) >= 2 && (right[0] == '\'' || right[0] == '"' || right[0] == '`') &&
+			strings.ContainsRune(right[1:], rune(right[0])) {
+			return true
+		}
 	}
-	left := strings.ToLower(line[:delimiter])
-	if !strings.Contains(left, "token") && !strings.Contains(left, "password") &&
-		!strings.Contains(left, "secret") && !strings.Contains(left, "api_key") && !strings.Contains(left, "apikey") {
-		return false
-	}
-	right := strings.TrimSpace(line[delimiter+1:])
-	if len(right) < 2 || (right[0] != '\'' && right[0] != '"' && right[0] != '`') {
-		return false
-	}
-	return strings.ContainsRune(right[1:], rune(right[0]))
+	return false
 }
 
-func literalAssignmentDelimiter(line string) int {
+type literalAssignmentCandidate struct {
+	statementStart int
+	delimiter      int
+}
+
+func literalAssignmentCandidates(line string) []literalAssignmentCandidate {
+	candidates := make([]literalAssignmentCandidate, 0, 2)
+	statementStart := 0
+	colonCandidate := literalAssignmentCandidate{delimiter: -1}
+	var quote byte
+	escaped := false
 	for index := 0; index < len(line); index++ {
-		if line[index] != '=' {
+		character := line[index]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if character == '\\' {
+				escaped = true
+				continue
+			}
+			if character == quote {
+				quote = 0
+			}
 			continue
 		}
-		if index > 0 && strings.ContainsRune("=!<>", rune(line[index-1])) {
+		if character == '\'' || character == '"' || character == '`' {
+			quote = character
 			continue
 		}
-		if index+1 < len(line) && (line[index+1] == '=' || line[index+1] == '>') {
+		if character == ';' {
+			statementStart = index + 1
 			continue
 		}
-		return index
+		if character == ':' && colonCandidate.delimiter < 0 {
+			colonCandidate = literalAssignmentCandidate{statementStart: statementStart, delimiter: index}
+			continue
+		}
+		if character != '=' || index > 0 && strings.ContainsRune("=!<>", rune(line[index-1])) ||
+			index+1 < len(line) && (line[index+1] == '=' || line[index+1] == '>') {
+			continue
+		}
+		candidates = append(candidates, literalAssignmentCandidate{statementStart: statementStart, delimiter: index})
 	}
-	return strings.IndexByte(line, ':')
+	if len(candidates) == 0 && colonCandidate.delimiter >= 0 {
+		return []literalAssignmentCandidate{colonCandidate}
+	}
+	return candidates
 }

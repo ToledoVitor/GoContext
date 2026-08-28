@@ -134,6 +134,48 @@ func TestScannerExcludesLiteralSecretsAfterTypeAnnotations(t *testing.T) {
 	}
 }
 
+func TestScannerFindsLiteralSecretsInLaterSameLineStatementsWithoutFlaggingOperators(t *testing.T) {
+	tests := []struct {
+		name          string
+		extension     string
+		secretSource  string
+		allowedSource string
+	}{
+		{
+			name:          "python",
+			extension:     ".py",
+			secretSource:  "safe = \"x\"; password: str = \"python-prod-canary\"\n",
+			allowedSource: "password = lookup(); safe = \"x\"; matches = password == \"prod\"\n",
+		},
+		{
+			name:          "typescript",
+			extension:     ".ts",
+			secretSource:  "const safe = \"x\"; const password: string = \"typescript-prod-canary\"\n",
+			allowedSource: "const password = lookup(); const safe = \"x\"; const matches = password === \"prod\"; const render = () => \"prod\";\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			allowedPath := "allowed" + tt.extension
+			writeFile(t, root, allowedPath, tt.allowedSource)
+			writeFile(t, root, "unsafe"+tt.extension, tt.secretSource)
+
+			result, err := filesystem.NewScanner().Scan(context.Background(), root)
+			if err != nil {
+				t.Fatalf("Scan() error = %v", err)
+			}
+			if got := filePaths(result.Files); len(got) != 1 || got[0] != allowedPath {
+				t.Fatalf("Scan() paths = %v, want [%s]", got, allowedPath)
+			}
+			if got := result.Report.Excluded[ingest.ExclusionSecret]; got != 1 {
+				t.Fatalf("secret exclusions = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestScanReportBucketsUnrecognizedExtensionsWithoutLeakingNameFragment(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "keep.py", "print('safe')\n")
