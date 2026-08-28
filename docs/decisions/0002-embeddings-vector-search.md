@@ -1,11 +1,11 @@
 # ADR 0002: embeddings e busca vetorial provider-agnostic
 
-- **Status:** aceito para implementação do M2; revisão humana pendente
+- **Status:** aceito; núcleo M2 implementado, Tasks 13/14 e revisão humana pendentes
 - **Data:** 2026-08-27
 
 ## Contexto
 
-GoContext já possui chunks determinísticos com `source.Reference`, snapshot JSON local, busca lexical e comandos CLI de indexação e consulta. M2 precisa adicionar recuperação semântica sem tornar provider, protocolo HTTP ou mecanismo vetorial parte dos contratos centrais.
+GoContext possui chunks determinísticos com `source.Reference`, snapshot JSON local e busca lexical. O núcleo M2 adiciona recuperação semântica opt-in sem tornar provider, protocolo HTTP ou mecanismo vetorial parte dos contratos centrais.
 
 Busca lexical continua obrigatória: identificadores, caminhos e mensagens de erro frequentemente são melhor recuperados por correspondência exata. Busca vetorial é capacidade adicional. Falha ou ausência semântica não pode inutilizar consulta lexical nem produzir citação reconstruída a partir do índice vetorial.
 
@@ -14,8 +14,7 @@ Busca lexical continua obrigatória: identificadores, caminhos e mensagens de er
 - nenhuma chamada de rede ocorre sem configuração explícita de embeddings;
 - primeiro adapter usa protocolo HTTP compatível com `POST /v1/embeddings` da OpenAI;
 - mesmo adapter cobre OpenAI e Ollama por `base URL`, modelo e credencial configuráveis;
-- Anthropic não oferece modelo nativo de embeddings; futuro adapter Anthropic pertence ao seam de geração em `internal/answer`;
-- Voyage AI pode ser considerado futuramente como provider de embeddings separado, nunca rotulado como Anthropic;
+- Anthropic aparece apenas como possível provider futuro de geração no seam `internal/answer`;
 - repositórios do MVP são pequenos; busca vetorial exata por cosseno é preferível a ANN até medição justificar complexidade;
 - `source.Chunk` permanece fonte canônica de texto e `source.Reference`.
 
@@ -75,7 +74,7 @@ Regras de dependência:
 
 ### Seam de embeddings
 
-Interface proposta:
+Interface entregue:
 
 ```go
 package embedding
@@ -119,7 +118,7 @@ type Embedder interface {
 ```go
 type Builder struct { /* dependencies and policy hidden */ }
 
-func NewBuilder(config Config, embedder embedding.Embedder, store Store) (*Builder, error)
+func NewBuilder(store Store, embedder embedding.Embedder, config BuilderConfig) (*Builder, error)
 func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus source.Corpus) (Report, error)
 ```
 
@@ -149,7 +148,7 @@ Erros degradáveis em `preferred`: timeout interno, conexão indisponível, HTTP
 
 ### Persistência e compatibilidade
 
-Primeiro store persistente será SQLite local, usando driver Go sem CGO após teste de compatibilidade com Go 1.24. SQLite guarda:
+O store SQLite local usa driver Go sem CGO após teste de compatibilidade com Go 1.24. SQLite guarda:
 
 O gate executado em 2026-08-28 resolveu a release corrente `modernc.org/sqlite v1.57.0` (tag `v1.57.0`, commit `6e86ac4a89e3f36359d1947e36355c469b18430c`, fonte `https://gitlab.com/cznic/sqlite`) via tooling de módulos Go. A licença da distribuição é BSD-3-Clause, permissiva. Essa release declara `go 1.25.0` e foi rejeitada porque o projeto exige compatibilidade com Go 1.24; `v1.46.2` também já declara Go 1.25.
 
@@ -163,11 +162,40 @@ A decisão de compatibilidade fixa explicitamente `modernc.org/sqlite v1.46.1`, 
 
 Busca vetorial inicial faz scan exato e cosseno em Go. WAL permite readers concorrentes; publicações são transações curtas e writers são serializados por banco. ANN, extensão SQLite vetorial e banco externo ficam fora do M2.
 
+O CLI emite um aviso operacional fixo quando a geração SQLite fixada possui mais de 20.000 chunks. Exatamente 20.000 permanece silencioso. A geração canônica é carregada e validada uma vez antes da busca e a mesma carga alimenta o caminho lexical; não há segunda carga apenas para contar. O aviso aparece no máximo uma vez por operação, não altera ranking e não escolhe ANN automaticamente. Snapshot padrão permanece silencioso.
+
+#### Evidência manual de busca exata
+
+O benchmark `BenchmarkExactSearch10000x1536` constrói corpus e vetores sintéticos determinísticos fora do timer, usa somente o reader de cosseno exato, valida o primeiro hit estável, reporta alocações e não acessa rede. Cleanup também fica fora do timer. Ele não roda com testes normais nem constitui gate de CI.
+
+Observação host-specific, não SLA: em 2026-08-28, macOS 26.5.2, darwin/arm64, Apple M4 Pro, Go 1.24.0 e `CGO_ENABLED=0`, o comando abaixo mediu uma iteração:
+
+```bash
+GOTOOLCHAIN=go1.24.0 CGO_ENABLED=0 go test ./internal/index/sqlite \
+  -run '^$' -bench '^BenchmarkExactSearch10000x1536$' -benchtime=1x -count=1 -benchmem
+```
+
+```text
+BenchmarkExactSearch10000x1536-12  1  127543583 ns/op  203488336 B/op  390335 allocs/op
+```
+
+Esse número inclui leitura/decoding/validação canônica e ranking do caminho exato no host descrito. O aviso conservador acima de 20.000 chunks é política operacional, não limite universal derivado desta única medição. ANN, reranker e store vetorial externo permanecem futuros.
+
 Mudança de modelo, fingerprint ou dimensão cria nova geração. Vetores incompatíveis nunca são truncados, preenchidos ou comparados. Geração anterior fica disponível apenas durante publicação; depois de commit bem-sucedido, store remove corpus/vetores antigos e executa checkpoint/truncate do WAL. Rollback de produto usa snapshot atual reindexado pela mesma `ScanPolicyVersion`, nunca geração histórica contendo fonte.
 
 Reindexação M2 sempre reconstrói geração completa. Schema preserva `Chunk.ID`, `CorpusRevision` e fingerprint para evolução futura: reuso incremental só será válido quando chunk ID e fingerprint forem idênticos. Mudança de perfil invalida todo reuso. Nenhuma otimização incremental entra sem teste provando que resultado equivale a rebuild completo.
 
 Snapshot JSON atual permanece disponível durante rollout, mas snapshots anteriores à policy segura são incompatíveis e exigem reindex. SQLite entra como opt-in; `index` e `search` continuam usando snapshot por default. `auto` é escolha explícita até promoção em ADR futura, evitando que uma geração SQLite antiga se torne autoritativa depois de uma indexação snapshot comum.
+
+### Rollout e rollback explícito
+
+Sem flags/env, `index` e `search` permanecem byte-compatíveis com snapshot/semantic-off e não abrem SQLite ou rede. `search --index-backend auto` nunca cria store: usa snapshot validado quando banco/store/repositório está ausente e a geração SQLite ativa quando presente. SQLite, `auto` e semântica continuam opt-in.
+
+Indexação SQLite bem-sucedida publica snapshot companheiro do mesmo corpus e marker privado ligado ao hash do repositório, `ScanPolicyVersion`, revisão do corpus e geração ativa. Publicação SQLite que falha preserva o par anterior; falha de snapshot/marker depois do commit deixa rollback indisponível e produz resultado explícito. Falha de manutenção pós-commit também é reportada, sem disfarçar a geração já publicada.
+
+`search --index-backend snapshot` fornecido explicitamente é solicitação de rollback; ausência da flag continua sendo caminho de compatibilidade. Sem banco SQLite, ou sem geração ativa para o repositório pedido, o snapshot atual validado pode ser lido. Com geração ativa, um reader fixa a geração enquanto o CLI lê de forma limitada, no-follow e read-only um marker regular privado, rejeita campos desconhecidos/trailing data e compara schema, hash, policy, revisão do snapshot, revisão SQLite e geração fixada. Ausência, permissões amplas, symlink, tipo não regular, corrupção, tamanho excessivo ou qualquer divergência falha com uma única categoria sanitizada de reindexação. SQLite existente corrupto, desconhecido ou inacessível também falha fechado; busca não cria, conserta nem mascara o store com cache antigo.
+
+Recuperação é por reindexação completa. Em store saudável, `index --index-backend sqlite --semantic off` recria geração, snapshot e marker coerentes antes do rollback. Em store SQLite corrupto, reindexação snapshot restaura somente o default implícito; rollback explícito permanece bloqueado até recuperação administrativa separada. Uma indexação snapshot padrão posterior remove a prontidão de rollback, e a busca padrão lê esse snapshot novo mesmo que uma geração SQLite antiga exista. Promoção de SQLite/`auto` a default é decisão futura.
 
 Cada resultado do scanner carrega `ScanPolicyVersion`; composition root a transfere explicitamente para snapshot/corpus e stores nunca a inferem. Loader rejeita versão ausente, antiga ou diferente. Mudança em hard/built-in deny, precedência, detector de segredo/binário/UTF-8/gerado, regra de symlink/nested repo ou decisão pré-open exige nova versão e teste de rejeição da anterior.
 
@@ -261,11 +289,11 @@ Flags vencem env para valores não secretos. Endpoint não aceita userinfo, quer
 - timeout/degradação produz aviso claro: busca ou índice lexical continua disponível;
 - `source.Reference` é carregado somente do chunk canônico persistido.
 
-### Validação em repositórios profissionais
+### Validação em repositórios profissionais — pendente Tasks 13/14
 
-Taba App, Tivita Backend e Tivita Web App serão avaliados somente depois dos gates de scanner e não vazamento. Inventário descobre linguagens, extensões, tamanhos e padrões reais; nenhuma stack é presumida. Resultados versionados contêm somente agregados e IDs opacos.
+Nenhum repositório profissional foi acessado durante esta entrega. A validação ocorrerá somente depois da prova taint da Task 13 e com autorização da Task 14. Inventário descobrirá linguagens, extensões, tamanhos e padrões reais; nenhuma stack é presumida. Resultados versionados conterão somente agregados e IDs opacos.
 
-Para esses três repositórios, código permanece local: baseline lexical/offline e semântica opcional via Ollama loopback. Embeddings externos ficam proibidos mesmo que configuração genérica do produto aceite opt-in. Queries, gold sets, paths, símbolos e trechos não entram em documentação. Novo parser/chunker nasce de gap medido e usa fixture sintética ou suficientemente minimizada.
+Nesse trabalho futuro, código permanece local: baseline lexical/offline e semântica opcional via Ollama loopback. Embeddings externos ficam proibidos mesmo que a configuração genérica aceite opt-in. Queries, gold sets, paths, símbolos e trechos não entram em documentação. Parser estrutural e novos chunkers permanecem pendentes; só nascerão de gap medido e usarão fixture sintética ou suficientemente minimizada.
 
 Excluir `.github/**` sacrifica contexto útil de workflows e configuração, mas é trade-off aceito por requisito explícito. Checklist go/no-go e matriz completa: [plano de validação Tivita](../plans/2026-08-27-tivita-professional-repository-validation.md).
 
@@ -291,7 +319,7 @@ Excluir `.github/**` sacrifica contexto útil de workflows e configuração, mas
 
 ## Não objetivos
 
-- criar adapter de embeddings Anthropic;
+- criar adapters de embeddings específicos de vendor além do protocolo OpenAI-compatible;
 - escolher modelo default ou enviar código automaticamente;
 - oferecer vector database externo, ANN, reranker ou busca multi-repositório;
 - atualizar embeddings incrementalmente no M2; reindexação completa é default;
@@ -302,6 +330,5 @@ Excluir `.github/**` sacrifica contexto útil de workflows e configuração, mas
 
 - OpenAI, endpoint de embeddings: <https://developers.openai.com/api/reference/resources/embeddings>
 - Ollama, compatibilidade OpenAI e `/v1/embeddings`: <https://docs.ollama.com/api/openai-compatibility>
-- Anthropic, ausência de modelo próprio de embeddings e indicação de provider externo: <https://platform.claude.com/docs/en/build-with-claude/embeddings>
 
 Referências consultadas em 2026-08-27. Capacidade de provider deve ser reverificada quando adapter futuro entrar no roadmap.

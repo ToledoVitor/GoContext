@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -862,6 +863,50 @@ func TestEmbeddingFlagsDoNotExposeAPIKeyMechanism(t *testing.T) {
 	flags.PrintDefaults()
 	if strings.Contains(strings.ToLower(usage.String()), "api-key") {
 		t.Fatalf("flag usage exposes API key mechanism: %q", usage.String())
+	}
+}
+
+func TestIndexBackendFlagTracksExplicitSupplyAndRejectsBlank(t *testing.T) {
+	implicitOptions, implicitBackend := parseEmbeddingFlags(t)
+	implicit, err := resolveEmbeddingConfig(
+		implicitOptions,
+		implicitBackend,
+		commandRoleSearch,
+		mapLookup(nil),
+		func(openaicompat.Config) (embedding.Embedder, error) { return stubEmbedder{}, nil },
+	)
+	if err != nil {
+		t.Fatalf("resolveEmbeddingConfig(implicit) error = %v", err)
+	}
+	if implicit.backend != indexBackendSnapshot || implicit.backendExplicit {
+		t.Fatalf("implicit backend = %q explicit=%t, want snapshot false", implicit.backend, implicit.backendExplicit)
+	}
+
+	explicitOptions, explicitBackend := parseEmbeddingFlags(t, "--index-backend=snapshot")
+	explicit, err := resolveEmbeddingConfig(
+		explicitOptions,
+		explicitBackend,
+		commandRoleSearch,
+		mapLookup(nil),
+		func(openaicompat.Config) (embedding.Embedder, error) { return stubEmbedder{}, nil },
+	)
+	if err != nil {
+		t.Fatalf("resolveEmbeddingConfig(explicit) error = %v", err)
+	}
+	if explicit.backend != indexBackendSnapshot || !explicit.backendExplicit {
+		t.Fatalf("explicit backend = %q explicit=%t, want snapshot true", explicit.backend, explicit.backendExplicit)
+	}
+
+	blankOptions, blankBackend := parseEmbeddingFlags(t, "--index-backend=")
+	_, err = resolveEmbeddingConfig(
+		blankOptions,
+		blankBackend,
+		commandRoleSearch,
+		mapLookup(nil),
+		func(openaicompat.Config) (embedding.Embedder, error) { return stubEmbedder{}, nil },
+	)
+	if !errors.Is(err, errInvalidIndexBackend) {
+		t.Fatalf("resolveEmbeddingConfig(blank backend) error = %v, want fixed invalid backend", err)
 	}
 }
 

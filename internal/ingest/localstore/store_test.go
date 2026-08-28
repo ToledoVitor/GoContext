@@ -46,6 +46,37 @@ func TestStoreAtomicallyReplacesAndLoadsSnapshot(t *testing.T) {
 	}
 }
 
+func TestOpenExistingNeverCreatesMissingSnapshotDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-store")
+	store, err := localstore.OpenExisting(missing)
+	if !errors.Is(err, localstore.ErrNotFound) || store != nil {
+		t.Fatalf("OpenExisting(missing) = %#v, %v; want nil ErrNotFound", store, err)
+	}
+	if _, statErr := os.Stat(missing); !os.IsNotExist(statErr) {
+		t.Fatalf("Stat(missing after OpenExisting) error = %v, want absent", statErr)
+	}
+}
+
+func TestOpenExistingLoadsCurrentSnapshotReadOnly(t *testing.T) {
+	directory := t.TempDir()
+	writer, err := localstore.NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	corpus := mustCorpus(t, []source.Chunk{sampleChunk("existing", "existing.py", "EXISTING = 1")})
+	if err := writer.Replace(context.Background(), "repository", corpus); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	reader, err := localstore.OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting() error = %v", err)
+	}
+	chunks, err := reader.Load(context.Background(), "repository")
+	if err != nil || !reflect.DeepEqual(chunks, corpus.Chunks) {
+		t.Fatalf("Load(OpenExisting) = %#v, %v; want %#v", chunks, err, corpus.Chunks)
+	}
+}
+
 func TestStoreKeepsRepositoriesIsolated(t *testing.T) {
 	store, err := localstore.NewStore(t.TempDir())
 	if err != nil {

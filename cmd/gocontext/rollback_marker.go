@@ -10,14 +10,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
-const rollbackMarkerSchemaVersion = 1
+const (
+	rollbackMarkerSchemaVersion = 1
+	maxRollbackMarkerSize       = 1024
+)
+
+var errInvalidRollbackMarker = errors.New("invalid rollback marker")
 
 type rollbackMarker struct {
 	Version          int    `json:"version"`
@@ -71,6 +78,137 @@ func writeRollbackCompanion(
 
 func rollbackMarkerPath(storeDirectory, repositoryID string) string {
 	return filepath.Join(storeDirectory, repositoryHash(repositoryID)+".rollback-ready.json")
+}
+
+func readRollbackMarker(ctx context.Context, storeDirectory, repositoryID string) (rollbackMarker, error) {
+	if err := ctx.Err(); err != nil {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	canonicalDirectory, err := canonicalMarkerDirectory(storeDirectory)
+	if err != nil {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	path := filepath.Join(canonicalDirectory, repositoryHash(repositoryID)+".rollback-ready.json")
+	before, err := os.Lstat(path)
+	if err != nil || validatePrivateRollbackMarker(before) != nil {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	file, err := openRollbackMarkerNoFollow(path)
+	if err != nil {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || validatePrivateRollbackMarker(opened) != nil || !os.SameFile(before, opened) {
+		_ = file.Close()
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	payload, readErr := readRollbackMarkerPayload(ctx, file)
+	after, pathErr := os.Lstat(path)
+	closeErr := file.Close()
+	if readErr != nil || pathErr != nil || closeErr != nil ||
+		validatePrivateRollbackMarker(after) != nil || !os.SameFile(before, after) || !os.SameFile(opened, after) {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	if err := ctx.Err(); err != nil {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	if !hasExactRollbackMarkerFields(payload) {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var marker rollbackMarker
+	if err := decoder.Decode(&marker); err != nil {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	if marker.Version != rollbackMarkerSchemaVersion ||
+		!validSHA256Hex(marker.RepositoryHash) ||
+		strings.TrimSpace(marker.ScanPolicy) == "" ||
+		!validSHA256Hex(marker.CorpusRevision) ||
+		!validSHA256Hex(marker.ActiveGeneration) {
+		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	return marker, nil
+}
+
+func hasExactRollbackMarkerFields(payload []byte) bool {
+	expected := map[string]struct{}{
+		"version":             {},
+		"repository_hash":     {},
+		"scan_policy_version": {},
+		"corpus_revision":     {},
+		"active_generation":   {},
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]struct{}, len(expected))
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		key, isString := keyToken.(string)
+		if err != nil || !isString {
+			return false
+		}
+		if _, allowed := expected[key]; !allowed {
+			return false
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return false
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return false
+		}
+	}
+	token, err = decoder.Token()
+	return err == nil && token == json.Delim('}') && len(seen) == len(expected)
+}
+
+func readRollbackMarkerPayload(ctx context.Context, reader io.Reader) ([]byte, error) {
+	payload := make([]byte, 0, maxRollbackMarkerSize)
+	buffer := make([]byte, 256)
+	for len(payload) <= maxRollbackMarkerSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		read, err := reader.Read(buffer)
+		payload = append(payload, buffer[:read]...)
+		if len(payload) > maxRollbackMarkerSize {
+			return nil, errInvalidRollbackMarker
+		}
+		if errors.Is(err, io.EOF) {
+			return payload, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if read == 0 {
+			return nil, io.ErrNoProgress
+		}
+	}
+	return nil, errInvalidRollbackMarker
+}
+
+func validatePrivateRollbackMarker(info fs.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return errInvalidRollbackMarker
+	}
+	return nil
+}
+
+func validSHA256Hex(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func repositoryHash(repositoryID string) string {

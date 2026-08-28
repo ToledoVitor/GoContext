@@ -2,7 +2,7 @@
 
 Cada marco deve terminar compilável, testado e utilizável sem depender do seguinte.
 
-## M0 — Fundação (agora)
+## M0 — Fundação (entregue)
 
 - módulo Go, CLI mínima e contratos centrais;
 - modelo de proveniência e citações;
@@ -10,7 +10,7 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 
 **Pronto quando:** `go test ./...`, `go vet ./...` e build da CLI passam sem dependências externas.
 
-## M1 — Ingestão observável
+## M1 — Ingestão observável (parcial)
 
 - scanner default-deny com decisão antes de leitura, exclusões auditáveis e fail-closed;
 - testes de segredos, `.git/**`, `.github/**`, symlink, traversal, nested repo, binário, gerado e arquivo grande;
@@ -21,7 +21,9 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 
 **Pronto quando:** fixtures retornam símbolos, linhas e chunks determinísticos; escapes por symlink falham; bytes hard-denied não chegam a nenhum estágio ou log.
 
-## M2 — Índice e busca local
+Scanner, relatório, snapshots seguros e chunking preliminar estão entregues. Parser estrutural e prova taint completa continuam pendentes; o line parser atual não é apresentado como parser final.
+
+## M2 — Índice e busca local (núcleo entregue; gates finais pendentes)
 
 - gate de compatibilidade do driver SQLite puro Go;
 - gerações SQLite atômicas por repositório e reindexação completa;
@@ -29,12 +31,17 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 - busca lexical primeira classe, busca vetorial exata e fusão RRF;
 - modos semânticos `off`, `preferred` e `required`, com fallback lexical observável;
 - comando `gocontext search` com hits citados.
+- snapshot/semantic-off permanece default offline; SQLite, `auto` e semântica são opt-in;
+- rollback explícito de snapshot exige par atual validado ou reindex-first recovery;
+- cosseno exato em Go avisa acima de 20.000 chunks sem trocar ranking ou backend.
 
 **Pronto quando:** consultas exatas e conceituais encontram fixtures sem serviço de índice externo; modo default não abre rede; falha temporária semântica preserva busca lexical e referências canônicas.
 
+Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. A promoção do marco aguarda Task 13 (prova taint) e Task 14 (validação profissional local e gaps reais de parser). Nenhuma validação profissional foi executada ou reivindicada nesta etapa.
+
 ## M3 — Perguntas fundamentadas
 
-- adapter LLM explícito e provider fake para testes; Anthropic pode ser adapter futuro de geração, não embeddings;
+- adapter LLM explícito e provider fake para testes; Anthropic pode ser adapter futuro de geração;
 - montagem de contexto com orçamento;
 - validação determinística de citações;
 - recusa por evidência insuficiente;
@@ -52,6 +59,6 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 
 ## Depois do MVP
 
-React/TypeScript para navegação e histórico, atualização incremental, mais linguagens, métricas de recuperação e adapters adicionais. Só entram após uso real indicar prioridade.
+React/TypeScript para navegação e histórico, atualização incremental, ANN, reranker, banco vetorial externo, mais linguagens, métricas de recuperação e adapters adicionais. Só entram após uso real indicar prioridade.
 
-Primeiro ciclo de uso real avalia Taba App, Tivita Backend e Tivita Web App localmente, após gates de segurança. Inventário descobre stacks e gaps; benchmark compara lexical/offline com híbrido via Ollama loopback. Código, paths e queries profissionais não entram em relatórios nem providers externos. Suporte novo nasce de gaps priorizados e fixtures não proprietárias.
+O primeiro ciclo de uso real em repositórios profissionais autorizados permanece Task 14 e só ocorre após os gates de segurança. Inventário descobre stacks e gaps; benchmark compara lexical/offline com híbrido via Ollama loopback. Código, paths e queries profissionais não entram em relatórios nem providers externos. Suporte novo nasce de gaps priorizados e fixtures sintéticas ou suficientemente minimizadas.

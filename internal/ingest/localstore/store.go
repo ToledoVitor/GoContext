@@ -74,6 +74,32 @@ func NewStore(directory string) (*Store, error) {
 	return &Store{directory: canonicalDirectory}, nil
 }
 
+// OpenExisting opens a snapshot directory without creating or repairing state.
+func OpenExisting(directory string) (*Store, error) {
+	if strings.TrimSpace(directory) == "" {
+		return nil, fmt.Errorf("open local store: directory is empty")
+	}
+	absoluteDirectory, err := filepath.Abs(directory)
+	if err != nil {
+		return nil, fmt.Errorf("open local store: resolve directory: %w", err)
+	}
+	info, err := os.Stat(absoluteDirectory)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("open local store: %w", ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open local store: inspect directory: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("open local store: path is not a directory")
+	}
+	canonicalDirectory, err := filepath.EvalSymlinks(absoluteDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("open local store: resolve directory: %w", err)
+	}
+	return &Store{directory: canonicalDirectory}, nil
+}
+
 // Replace atomically replaces chunks belonging to one repository snapshot.
 func (s *Store) Replace(ctx context.Context, repositoryID string, corpus source.Corpus) error {
 	if err := ctx.Err(); err != nil {

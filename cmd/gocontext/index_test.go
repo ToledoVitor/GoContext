@@ -279,6 +279,14 @@ func TestRunIndexSnapshotAfterSQLiteInvalidatesRollbackAndKeepsDefaultAuthoritat
 
 	stdout.Reset()
 	stderr.Reset()
+	code := run([]string{
+		"search", "--store", storeDirectory, "--index-backend", "snapshot",
+		repository, "new", "value",
+	}, &stdout, &stderr)
+	assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(), repository, "old_value", "new_value")
+
+	stdout.Reset()
+	stderr.Reset()
 	if code := run([]string{"search", "--store", storeDirectory, "--index-backend", "auto", repository, "old", "value"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("run(search auto stale SQLite) code = %d; stderr = %q", code, stderr.String())
 	}

@@ -2,7 +2,7 @@
 
 GoContext é um copiloto local de inteligência para repositórios. A proposta é transformar código-fonte em contexto pesquisável, responder perguntas com evidências verificáveis e expor esse contexto por uma interface MCP somente leitura.
 
-Este repositório está na transição de **M1 para M2**. Fundação, scanner local, descoberta inicial de declarações, chunking por símbolo, snapshots JSON e busca lexical local estão implementados. Parsing estrutural, índice invertido, embeddings, busca vetorial, LLM, MCP e frontend ainda não estão implementados.
+O núcleo de recuperação do **M2** está implementado: snapshot JSON e busca lexical continuam sendo o caminho padrão offline; SQLite, embeddings OpenAI-compatible, busca vetorial exata e fusão híbrida são capacidades opt-in. Parsing estrutural, prova taint ponta a ponta e validação em repositórios profissionais continuam pendentes nas Tasks 13/14. LLM, MCP, frontend, ANN, reranker e reuso incremental também permanecem futuros.
 
 ## Objetivo do MVP
 
@@ -37,8 +37,13 @@ internal/ingest        contratos para scanner, parser, chunker e armazenamento
   └─ lineparser        descoberta top-level preliminar, sem AST
   └─ symbolchunker     chunks por limites de declarações top-level
   └─ localstore        snapshots JSON locais e atômicos por repositório
-internal/search        contratos para busca e resultados ranqueados
-  └─ lexical           ranking lexical determinístico sobre snapshots
+internal/embedding     contratos provider-agnostic e adapter HTTP OpenAI-compatible
+internal/index         builder de gerações completas e store SQLite local
+  └─ sqlite            gerações atômicas, chunks canônicos e cosseno exato
+internal/search        contratos e resultados com source.Reference preservado
+  ├─ lexical           ranking lexical determinístico de primeira classe
+  ├─ vector            recuperação vetorial canônica
+  └─ hybrid            fusão RRF e fallback lexical observável
 internal/answer        contratos para geração fundamentada e guardrails
 docs/architecture.md   arquitetura, fluxo de dados e limites de segurança
 docs/decisions/        decisões técnicas registradas
@@ -49,11 +54,12 @@ Interfaces ficam próximas do fluxo consumidor, em vez de formar um pacote gené
 
 ## Como verificar
 
-Requer Go 1.24 ou superior.
+Requer Go 1.24 ou superior. O gate suportado também prova o driver SQLite puro Go com CGO desabilitado.
 
 ```bash
 go test ./...
 go vet ./...
+CGO_ENABLED=0 go test ./...
 go run ./cmd/gocontext --version
 ```
 
@@ -69,11 +75,52 @@ gocontext dev
 go run ./cmd/gocontext index /caminho/do/repositório
 ```
 
-Comando percorre fontes Python/TypeScript, descobre declarações, cria chunks e substitui snapshot local. Store padrão fica no diretório de cache do sistema, fora do repositório. Para escolher outro local:
+Sem flags, o comando percorre fontes Python/TypeScript, descobre declarações, cria chunks e substitui somente o snapshot local; não abre SQLite nem rede. O store padrão fica no diretório de cache do sistema, fora do repositório. Para escolher outro local:
 
 ```bash
 go run ./cmd/gocontext index --store /caminho/do/cache /caminho/do/repositório
 ```
+
+### Opt-in SQLite sem embeddings
+
+A migração suportada é uma reindexação completa explícita. Ela publica a geração SQLite e um snapshot companheiro do mesmo corpus, sem rede:
+
+```bash
+go run ./cmd/gocontext index --store /caminho/do/cache --index-backend sqlite --semantic off /caminho/do/repositório
+go run ./cmd/gocontext search --store /caminho/do/cache --index-backend auto /caminho/do/repositório "carregar usuário"
+```
+
+`auto` também é opt-in: usa a geração SQLite ativa quando ela existe e, quando o banco/store/repositório está ausente, usa o snapshot validado. Busca nunca cria ou repara SQLite.
+
+### Opt-in semântico local via Ollama
+
+O mesmo adapter OpenAI-compatible aceita um endpoint de IP loopback, normalmente sem chave. Modelo não possui default:
+
+```bash
+go run ./cmd/gocontext index --store /caminho/do/cache --index-backend sqlite \
+  --semantic preferred --embedding-base-url http://127.0.0.1:11434/v1 \
+  --embedding-model '<modelo-local-escolhido>' /caminho/do/repositório
+
+go run ./cmd/gocontext search --store /caminho/do/cache --index-backend auto \
+  --semantic preferred --embedding-base-url http://127.0.0.1:11434/v1 \
+  --embedding-model '<modelo-local-escolhido>' /caminho/do/repositório "carregar usuário"
+```
+
+### Opt-in semântico com endpoint externo
+
+> **Aviso de egress:** indexar pode enviar fonte permitida e buscar pode enviar a consulta para fora da máquina. Use somente com autorização explícita para o repositório e o endpoint.
+
+A chave é aceita somente por `GOCONTEXT_EMBEDDING_API_KEY`; não existe flag ou arquivo de credencial. O endpoint abaixo é deliberadamente não operacional e o modelo é placeholder:
+
+```bash
+export GOCONTEXT_EMBEDDING_API_KEY='<chave-fornecida-pelo-operador>'
+
+go run ./cmd/gocontext index --store /caminho/do/cache --index-backend sqlite \
+  --semantic required --embedding-base-url https://embeddings.example.invalid/v1 \
+  --embedding-model '<modelo-escolhido>' /caminho/do/repositório
+```
+
+Configurar endpoint/modelo sem `preferred|required` não ativa rede. O CLI emite aviso fixo antes do primeiro possível egress externo.
 
 ## Consultar snapshot
 
@@ -89,7 +136,27 @@ Cada resultado mostra score, citação `arquivo:linha-inicial-linha-final`, sím
 go run ./cmd/gocontext search --limit 5 --store /caminho/do/cache /caminho/do/repositório carregar usuário
 ```
 
-## Arquitetura proposta
+Busca lexical continua primeira classe e fallback obrigatório em `preferred`. Tanto snapshot quanto SQLite preservam o `source.Reference` canônico; a camada vetorial não reconstrói citações.
+
+## Rollback explícito para snapshot
+
+O snapshot implícito permanece a compatibilidade padrão. Já `--index-backend snapshot` fornecido explicitamente é uma solicitação de rollback:
+
+```bash
+go run ./cmd/gocontext search --store /caminho/do/cache --index-backend snapshot /caminho/do/repositório "carregar usuário"
+```
+
+Sem banco SQLite, ou sem geração ativa para esse repositório, basta existir snapshot atual validado. Com geração ativa, o comando exige snapshot companheiro, marker privado `rollback_ready`, policy atual, mesma revisão de corpus e mesma geração SQLite ativa. Marker ausente, legado, permissivo, malformado ou divergente — e SQLite corrupto/inacessível — falham fechados com uma categoria sanitizada de reindexação.
+
+Para recuperar um par saudável, reindexe primeiro com `--index-backend sqlite --semantic off` e só então solicite o rollback explícito. Se SQLite estiver corrupto, uma reindexação snapshot padrão restaura o caminho implícito atual, mas não torna o rollback explícito pronto; o store SQLite precisa de recuperação administrativa separada. Não exclua SQLite apenas para contornar o guard.
+
+Uma reindexação snapshot padrão depois de SQLite grava o snapshot novo, invalida `rollback_ready` e continua autoritativa para a busca padrão. Promover SQLite/`auto` a default exige uma decisão futura.
+
+## Escala da busca exata
+
+A busca vetorial SQLite faz cosseno exato em Go. Acima de 20.000 chunks, cada busca SQLite emite no máximo um aviso fixo; 20.000 não avisa e 20.001 avisa. O aviso não muda ranking, não seleciona ANN e não afeta o caminho snapshot padrão. O benchmark manual reproduzível fica em `internal/index/sqlite/benchmark_test.go`; resultados são evidência local não bloqueante, não um SLA.
+
+## Arquitetura atual e futura
 
 ```text
 repositório local

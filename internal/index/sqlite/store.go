@@ -1697,6 +1697,34 @@ func validStoredVectorMetadata(fingerprint, model string, dimensions int) bool {
 	return strings.TrimSpace(fingerprint) != "" && strings.TrimSpace(model) != "" && dimensions > 0
 }
 
+// CorpusMetadata describes the immutable corpus pinned by a bound reader.
+// It performs no additional database scan.
+type CorpusMetadata struct {
+	GenerationID      string
+	CorpusRevision    string
+	ScanPolicyVersion string
+}
+
+// CorpusMetadata returns validated metadata for the reader's pinned corpus.
+func (r *BoundReader) CorpusMetadata(ctx context.Context) (CorpusMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return CorpusMetadata{}, fmt.Errorf("describe bound sqlite corpus: %w", err)
+	}
+	if r == nil {
+		return CorpusMetadata{}, index.ErrReindexRequired
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return CorpusMetadata{}, index.ErrReindexRequired
+	}
+	return CorpusMetadata{
+		GenerationID:      r.generationID,
+		CorpusRevision:    r.corpusRevision,
+		ScanPolicyVersion: r.scanPolicyVersion,
+	}, nil
+}
+
 // GenerationID returns the generation pinned by the reader.
 func (r *BoundReader) GenerationID() string {
 	if r == nil {

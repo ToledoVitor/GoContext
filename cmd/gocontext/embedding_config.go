@@ -101,10 +101,11 @@ func (value *trackedStringValue) GoString() string {
 }
 
 type embeddingOptions struct {
-	mode       trackedStringValue
-	baseURL    trackedStringValue
-	model      trackedStringValue
-	dimensions trackedStringValue
+	mode            trackedStringValue
+	baseURL         trackedStringValue
+	model           trackedStringValue
+	dimensions      trackedStringValue
+	backendExplicit bool
 }
 
 func (embeddingOptions) String() string {
@@ -121,6 +122,7 @@ func addEmbeddingFlags(flags *flag.FlagSet, options *embeddingOptions, backend *
 	flags.Var(&options.model, "embedding-model", "modelo de embeddings")
 	flags.Var(&options.dimensions, "embedding-dimensions", "dimensões do embedding")
 	flags.Func("index-backend", "backend do índice; valores dependem do comando (default snapshot)", func(raw string) error {
+		options.backendExplicit = true
 		*backend = indexBackend(raw)
 		return nil
 	})
@@ -129,10 +131,11 @@ func addEmbeddingFlags(flags *flag.FlagSet, options *embeddingOptions, backend *
 type embeddingClientFactory func(openaicompat.Config) (embedding.Embedder, error)
 
 type resolvedEmbeddingConfig struct {
-	mode    semanticMode
-	backend indexBackend
-	client  embedding.Embedder
-	egress  dataEgressClass
+	mode            semanticMode
+	backend         indexBackend
+	backendExplicit bool
+	client          embedding.Embedder
+	egress          dataEgressClass
 }
 
 func (config resolvedEmbeddingConfig) String() string {
@@ -151,7 +154,9 @@ func resolveEmbeddingConfig(
 	newClient embeddingClientFactory,
 ) (resolvedEmbeddingConfig, error) {
 	mode := semanticMode(resolveOption(options.mode, semanticModeEnv, string(semanticModeOff), lookup))
-	resolved := resolvedEmbeddingConfig{mode: mode, backend: backend, egress: dataEgressNone}
+	resolved := resolvedEmbeddingConfig{
+		mode: mode, backend: backend, backendExplicit: options.backendExplicit, egress: dataEgressNone,
+	}
 	switch mode {
 	case semanticModeOff, semanticModePreferred, semanticModeRequired:
 	default:

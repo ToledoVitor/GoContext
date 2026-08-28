@@ -11,21 +11,34 @@ import (
 
 	"github.com/ToledoVitor/GoContext/internal/index"
 	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
+	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
 	searchdomain "github.com/ToledoVitor/GoContext/internal/search"
 	"github.com/ToledoVitor/GoContext/internal/search/hybrid"
 	"github.com/ToledoVitor/GoContext/internal/search/lexical"
 	vectorsearch "github.com/ToledoVitor/GoContext/internal/search/vector"
+	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
 const defaultSearchLimit = 10
 
 var (
-	errSQLiteIndexUnavailable = errors.New("índice SQLite indisponível")
-	errSQLiteIndexInvalid     = errors.New("índice SQLite inválido; reindexe o repositório")
-	errSQLiteSearchFailure    = errors.New("falha na busca SQLite")
-	errSQLiteSearchClose      = errors.New("falha ao fechar busca SQLite")
+	errSQLiteIndexUnavailable        = errors.New("índice SQLite indisponível")
+	errSQLiteIndexInvalid            = errors.New("índice SQLite inválido; reindexe o repositório")
+	errSQLiteSearchFailure           = errors.New("falha na busca SQLite")
+	errSQLiteSearchClose             = errors.New("falha ao fechar busca SQLite")
+	errSnapshotRollbackReindex error = snapshotRollbackReindexError{}
 )
+
+type snapshotRollbackReindexError struct{}
+
+func (snapshotRollbackReindexError) Error() string {
+	return "rollback de snapshot exige reindexação"
+}
+
+func (snapshotRollbackReindexError) Unwrap() error {
+	return index.ErrReindexRequired
+}
 
 func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("search", flag.ContinueOnError)
@@ -81,7 +94,11 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	var hits []searchdomain.Hit
 	if resolvedEmbedding.backend == indexBackendSnapshot {
-		hits, err = searchSnapshot(ctx, storePath, query)
+		if resolvedEmbedding.backendExplicit {
+			hits, err = searchExplicitSnapshotRollback(ctx, storePath, query)
+		} else {
+			hits, err = searchSnapshot(ctx, storePath, query)
+		}
 	} else {
 		hits, err = searchSQLite(ctx, storePath, query, resolvedEmbedding, stderr)
 	}
@@ -116,8 +133,96 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	return 0
 }
 
+type fixedSnapshotLoader struct {
+	repositoryID string
+	chunks       []source.Chunk
+}
+
+func (loader fixedSnapshotLoader) Load(ctx context.Context, repositoryID string) ([]source.Chunk, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if repositoryID != loader.repositoryID {
+		return nil, errSnapshotRollbackReindex
+	}
+	return append([]source.Chunk(nil), loader.chunks...), nil
+}
+
+func searchExplicitSnapshotRollback(
+	ctx context.Context,
+	storePath string,
+	query searchdomain.Query,
+) ([]searchdomain.Hit, error) {
+	store, err := indexsqlite.OpenExistingContext(ctx, storePath)
+	if err != nil {
+		if errors.Is(err, index.ErrNotFound) {
+			return searchExistingSnapshot(ctx, storePath, query)
+		}
+		return nil, errSnapshotRollbackReindex
+	}
+	reader, err := store.BindActive(ctx, query.RepositoryID)
+	if err != nil {
+		closeErr := store.Close()
+		if errors.Is(err, index.ErrNotFound) && closeErr == nil {
+			return searchExistingSnapshot(ctx, storePath, query)
+		}
+		return nil, errSnapshotRollbackReindex
+	}
+
+	metadata, metadataErr := reader.CorpusMetadata(ctx)
+	marker, markerErr := readRollbackMarker(ctx, storePath, query.RepositoryID)
+	snapshotStore, snapshotStoreErr := localstore.OpenExisting(storePath)
+	var chunks []source.Chunk
+	var snapshotErr error
+	if snapshotStoreErr == nil {
+		chunks, snapshotErr = snapshotStore.Load(ctx, query.RepositoryID)
+	}
+	var corpus source.Corpus
+	if snapshotErr == nil && snapshotStoreErr == nil {
+		corpus, snapshotErr = source.NewCorpusContext(ctx, ingest.ScanPolicyVersion, chunks)
+	}
+	valid := metadataErr == nil && markerErr == nil && snapshotStoreErr == nil && snapshotErr == nil &&
+		metadata.ScanPolicyVersion == ingest.ScanPolicyVersion &&
+		marker.RepositoryHash == repositoryHash(query.RepositoryID) &&
+		marker.ScanPolicy == ingest.ScanPolicyVersion &&
+		marker.CorpusRevision == corpus.Revision &&
+		marker.CorpusRevision == metadata.CorpusRevision &&
+		marker.ActiveGeneration == metadata.GenerationID
+	if !valid {
+		_ = reader.Close()
+		_ = store.Close()
+		return nil, errSnapshotRollbackReindex
+	}
+
+	searcher, err := lexical.NewSearcher(fixedSnapshotLoader{repositoryID: query.RepositoryID, chunks: chunks})
+	if err == nil {
+		chunks = nil
+		var hits []searchdomain.Hit
+		hits, err = searcher.Search(ctx, query)
+		if closeErr := closeSQLiteSearch(reader, store, err); closeErr != nil {
+			return nil, errSnapshotRollbackReindex
+		}
+		return hits, nil
+	}
+	_ = reader.Close()
+	_ = store.Close()
+	return nil, errSnapshotRollbackReindex
+}
+
 func searchSnapshot(ctx context.Context, storePath string, query searchdomain.Query) ([]searchdomain.Hit, error) {
 	store, err := localstore.NewStore(storePath)
+	if err != nil {
+		return nil, err
+	}
+	searcher, err := lexical.NewSearcher(store)
+	if err != nil {
+		return nil, err
+	}
+	return searcher.Search(ctx, query)
+}
+
+func searchExistingSnapshot(ctx context.Context, storePath string, query searchdomain.Query) ([]searchdomain.Hit, error) {
+	store, err := localstore.OpenExisting(storePath)
 	if err != nil {
 		return nil, err
 	}
@@ -157,8 +262,15 @@ func searchSQLite(
 		}
 		return nil, errSQLiteIndexInvalid
 	}
+	chunks, err := reader.Load(ctx, query.RepositoryID)
+	if err != nil {
+		return nil, closeSQLiteSearch(reader, store, errSQLiteIndexInvalid)
+	}
+	if len(chunks) > exactSearchWarningThreshold {
+		_, _ = fmt.Fprint(stderr, exactSearchScaleWarning)
+	}
 
-	lexicalSearcher, err := lexical.NewSearcher(reader)
+	lexicalSearcher, err := lexical.NewSearcher(fixedSnapshotLoader{repositoryID: query.RepositoryID, chunks: chunks})
 	if err != nil {
 		return nil, closeSQLiteSearch(reader, store, errSQLiteSearchFailure)
 	}
@@ -212,7 +324,7 @@ func searchMissingSQLite(
 	if config.mode == semanticModePreferred {
 		_, _ = fmt.Fprint(stderr, semanticDegradedWarning)
 	}
-	return searchSnapshot(ctx, storePath, query)
+	return searchExistingSnapshot(ctx, storePath, query)
 }
 
 func hybridSemanticMode(mode semanticMode) hybrid.SemanticMode {

@@ -3,14 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	indexdomain "github.com/ToledoVitor/GoContext/internal/index"
+	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
 	"github.com/ToledoVitor/GoContext/internal/source"
@@ -331,6 +337,23 @@ func TestRunSearchRejectsUnavailableBackendsWithoutSnapshotFallback(t *testing.T
 	}
 }
 
+func TestRunSearchAutoNeverCreatesMissingStore(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	missingStore := filepath.Join(t.TempDir(), "missing-store")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{
+		"search", "--store", missingStore, "--index-backend", "auto",
+		t.TempDir(), "query",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run(search auto missing store) code = %d, want 1; stderr = %q", code, stderr.String())
+	}
+	if _, err := os.Stat(missingStore); !os.IsNotExist(err) {
+		t.Fatalf("Stat(missing store after search) error = %v, want no created state", err)
+	}
+}
+
 func TestRunSearchMissingSQLiteBackendModeMatrix(t *testing.T) {
 	clearEmbeddingEnvironment(t)
 	var requests atomic.Int64
@@ -455,6 +478,462 @@ func TestRunSearchAutoOffUsesPersistedSQLiteGeneration(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("run(search auto off) stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunSearchExactSQLiteScaleWarningBoundaryAndDefaultSnapshotSilence(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	repository := t.TempDir()
+	repositoryID := canonicalPath(t, repository)
+	storeDirectory := t.TempDir()
+	store, err := indexsqlite.NewStore(storeDirectory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	defer store.Close()
+
+	var active string
+	for _, count := range []int{20_000, 20_001} {
+		chunks := makeScaleWarningChunks(count)
+		corpus := mustCLICorpus(t, chunks)
+		generationID := fmt.Sprintf("scale-generation-%d", count)
+		if err := store.Replace(context.Background(), indexdomain.Generation{
+			RepositoryID: repositoryID, ID: generationID, BaseGeneration: active,
+			CorpusRevision: corpus.Revision, ScanPolicyVersion: corpus.PolicyVersion,
+			Chunks: corpus.Chunks, Metric: indexdomain.VectorMetricCosine,
+		}); err != nil {
+			t.Fatalf("Replace(%d chunks) error = %v", count, err)
+		}
+		active = generationID
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := run([]string{
+			"search", "--store", storeDirectory, "--index-backend", "sqlite",
+			repository, "scale", "needle",
+		}, &stdout, &stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "scale_needle") {
+			t.Fatalf("run(search %d chunks) code = %d stdout = %q stderr = %q", count, code, stdout.String(), stderr.String())
+		}
+		wantWarnings := 0
+		if count > 20_000 {
+			wantWarnings = 1
+		}
+		if got := strings.Count(stderr.String(), exactSearchScaleWarning); got != wantWarnings {
+			t.Fatalf("run(search %d chunks) warning count = %d, want %d; stderr = %q", count, got, wantWarnings, stderr.String())
+		}
+	}
+
+	snapshotStore, err := localstore.NewStore(storeDirectory)
+	if err != nil {
+		t.Fatalf("NewStore(snapshot) error = %v", err)
+	}
+	largeSnapshot := makeScaleWarningChunks(20_001)
+	if err := snapshotStore.Replace(context.Background(), repositoryID, mustCLICorpus(t, largeSnapshot)); err != nil {
+		t.Fatalf("Replace(snapshot) error = %v", err)
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{"search", "--store", storeDirectory, repository, "scale", "needle"}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "scale_needle") || stderr.Len() != 0 {
+		t.Fatalf("run(default snapshot 20001) code = %d stdout = %q stderr = %q, want silent snapshot", code, stdout.String(), stderr.String())
+	}
+}
+
+func makeScaleWarningChunks(count int) []source.Chunk {
+	chunks := make([]source.Chunk, count)
+	for position := range chunks {
+		text := "def filler_value():\n    return 1"
+		if position == 0 {
+			text = "def scale_needle():\n    return 1"
+		}
+		chunks[position] = source.Chunk{
+			ID: fmt.Sprintf("scale-%05d", position), Text: text,
+			Language: source.LanguagePython,
+			Reference: source.Reference{
+				Path: fmt.Sprintf("src/scale-%05d.py", position), StartLine: 1, EndLine: 2,
+			},
+		}
+	}
+	return chunks
+}
+
+func TestRunSearchExplicitSnapshotRequiresCurrentRollbackMarkerWhenSQLiteActive(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	repository, storeDirectory, marker := prepareCLIRollbackFixture(t)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{
+		"search", "--store", storeDirectory, "--index-backend", "snapshot",
+		repository, "rollback", "value",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(search current rollback) code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "rollback_value") || stderr.Len() != 0 {
+		t.Fatalf("run(search current rollback) stdout = %q stderr = %q, want current snapshot", stdout.String(), stderr.String())
+	}
+
+	markerPath := rollbackMarkerPath(storeDirectory, canonicalPath(t, repository))
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("Remove(rollback marker) error = %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"search", "--store", storeDirectory, repository, "rollback", "value"}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "rollback_value") || stderr.Len() != 0 {
+		t.Fatalf("run(search implicit snapshot without marker) code = %d stdout = %q stderr = %q, want compatibility snapshot", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{
+		"search", "--store", storeDirectory, "--index-backend", "snapshot",
+		repository, "rollback", "value",
+	}, &stdout, &stderr)
+	assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(), repository, marker.ActiveGeneration)
+}
+
+func TestSnapshotRollbackFailureCarriesReindexCategoryWithoutChangingText(t *testing.T) {
+	if !errors.Is(errSnapshotRollbackReindex, indexdomain.ErrReindexRequired) {
+		t.Fatal("snapshot rollback error does not unwrap to ErrReindexRequired")
+	}
+	if got, want := errSnapshotRollbackReindex.Error(), "rollback de snapshot exige reindexação"; got != want {
+		t.Fatalf("snapshot rollback error = %q, want fixed %q", got, want)
+	}
+}
+
+func TestRunSearchExplicitSnapshotRejectsInvalidRollbackMarkerMatrix(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string, rollbackMarker)
+	}{
+		{
+			name: "malformed",
+			mutate: func(t *testing.T, path string, _ rollbackMarker) {
+				writeRollbackTestPayload(t, path, []byte(`{"version":`))
+			},
+		},
+		{
+			name: "extra field",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				payload, err := json.Marshal(struct {
+					rollbackMarker
+					Canary string `json:"EXTRA_MARKER_CANARY"`
+				}{rollbackMarker: marker, Canary: "EXTRA_MARKER_CANARY"})
+				if err != nil {
+					t.Fatalf("Marshal(extra marker) error = %v", err)
+				}
+				writeRollbackTestPayload(t, path, payload)
+			},
+		},
+		{
+			name: "duplicate field",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				payload, err := json.Marshal(marker)
+				if err != nil {
+					t.Fatalf("Marshal(marker) error = %v", err)
+				}
+				payload = append(payload[:len(payload)-1], []byte(`,"version":1}`)...)
+				writeRollbackTestPayload(t, path, payload)
+			},
+		},
+		{
+			name: "oversize",
+			mutate: func(t *testing.T, path string, _ rollbackMarker) {
+				writeRollbackTestPayload(t, path, bytes.Repeat([]byte("OVERSIZE_MARKER_CANARY"), 256))
+			},
+		},
+		{
+			name: "permissive",
+			mutate: func(t *testing.T, path string, _ rollbackMarker) {
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatalf("Chmod(marker) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "inaccessible",
+			mutate: func(t *testing.T, path string, _ rollbackMarker) {
+				if err := os.Chmod(path, 0o000); err != nil {
+					t.Fatalf("Chmod(marker inaccessible) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "non regular",
+			mutate: func(t *testing.T, path string, _ rollbackMarker) {
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(marker) error = %v", err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("Mkdir(marker path) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(marker) error = %v", err)
+				}
+				target := filepath.Join(filepath.Dir(path), "SYMLINK_MARKER_CANARY.json")
+				payload, err := json.Marshal(marker)
+				if err != nil {
+					t.Fatalf("Marshal(marker) error = %v", err)
+				}
+				if err := os.WriteFile(target, payload, 0o600); err != nil {
+					t.Fatalf("WriteFile(symlink target) error = %v", err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("Symlink() unavailable: %v", err)
+					}
+					t.Fatalf("Symlink(marker) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "repository mismatch",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				marker.RepositoryHash = strings.Repeat("a", 64)
+				writeRollbackTestMarker(t, path, marker)
+			},
+		},
+		{
+			name: "policy mismatch",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				marker.ScanPolicy = "POLICY_MARKER_CANARY"
+				writeRollbackTestMarker(t, path, marker)
+			},
+		},
+		{
+			name: "revision mismatch",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				marker.CorpusRevision = strings.Repeat("b", 64)
+				writeRollbackTestMarker(t, path, marker)
+			},
+		},
+		{
+			name: "generation mismatch",
+			mutate: func(t *testing.T, path string, marker rollbackMarker) {
+				marker.ActiveGeneration = strings.Repeat("c", 64)
+				writeRollbackTestMarker(t, path, marker)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repository, storeDirectory, marker := prepareCLIRollbackFixture(t)
+			markerPath := rollbackMarkerPath(storeDirectory, canonicalPath(t, repository))
+			test.mutate(t, markerPath, marker)
+
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			code := run([]string{
+				"search", "--store", storeDirectory, "--index-backend", "snapshot",
+				repository, "rollback", "value",
+			}, &stdout, &stderr)
+			assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
+				repository, marker.ActiveGeneration, "MARKER_CANARY")
+		})
+	}
+}
+
+func TestRunSearchExplicitSnapshotRejectsStaleSnapshotAndSwappedActiveGeneration(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	t.Run("stale snapshot", func(t *testing.T) {
+		repository, storeDirectory, marker := prepareCLIRollbackFixture(t)
+		repositoryID := canonicalPath(t, repository)
+		staleChunk := source.Chunk{
+			ID: "stale-snapshot", Text: "def stale_snapshot_value():\n    return 2",
+			Language:  source.LanguagePython,
+			Reference: source.Reference{Path: "stale.py", StartLine: 1, EndLine: 2},
+		}
+		snapshotStore, err := localstore.NewStore(storeDirectory)
+		if err != nil {
+			t.Fatalf("NewStore(snapshot) error = %v", err)
+		}
+		if err := snapshotStore.Replace(context.Background(), repositoryID, mustCLICorpus(t, []source.Chunk{staleChunk})); err != nil {
+			t.Fatalf("Replace(stale snapshot) error = %v", err)
+		}
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := run([]string{
+			"search", "--store", storeDirectory, "--index-backend", "snapshot",
+			repository, "stale", "snapshot",
+		}, &stdout, &stderr)
+		assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
+			repository, marker.ActiveGeneration, "stale_snapshot_value")
+	})
+
+	t.Run("swapped active generation", func(t *testing.T) {
+		repository, storeDirectory, marker := prepareCLIRollbackFixture(t)
+		repositoryID := canonicalPath(t, repository)
+		store, err := indexsqlite.NewStore(storeDirectory)
+		if err != nil {
+			t.Fatalf("NewStore(SQLite) error = %v", err)
+		}
+		active, err := store.ActiveGeneration(context.Background(), repositoryID)
+		if err != nil {
+			_ = store.Close()
+			t.Fatalf("ActiveGeneration() error = %v", err)
+		}
+		newChunk := source.Chunk{
+			ID: "swapped-generation", Text: "def swapped_generation_value():\n    return 3",
+			Language:  source.LanguagePython,
+			Reference: source.Reference{Path: "swapped.py", StartLine: 1, EndLine: 2},
+		}
+		corpus := mustCLICorpus(t, []source.Chunk{newChunk})
+		if err := store.Replace(context.Background(), indexdomain.Generation{
+			RepositoryID: repositoryID, ID: strings.Repeat("d", 64), BaseGeneration: active,
+			CorpusRevision: corpus.Revision, ScanPolicyVersion: corpus.PolicyVersion,
+			Chunks: corpus.Chunks, Metric: indexdomain.VectorMetricCosine,
+		}); err != nil {
+			_ = store.Close()
+			t.Fatalf("Replace(swapped generation) error = %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close(SQLite) error = %v", err)
+		}
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		code := run([]string{
+			"search", "--store", storeDirectory, "--index-backend", "snapshot",
+			repository, "rollback", "value",
+		}, &stdout, &stderr)
+		assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
+			repository, marker.ActiveGeneration, strings.Repeat("d", 64))
+	})
+}
+
+func TestRunSearchExplicitSnapshotAllowsAbsentSQLiteRepositoryButRejectsCorruptSQLite(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	requestedRepository := t.TempDir()
+	otherRepository := t.TempDir()
+	storeDirectory := t.TempDir()
+	writeCLIFile(t, requestedRepository, "requested.py", "def requested_value():\n    return 1\n")
+	writeCLIFile(t, otherRepository, "other.py", "def other_value():\n    return 2\n")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run([]string{"index", "--store", storeDirectory, requestedRepository}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(index requested snapshot) code = %d; stderr = %q", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"index", "--store", storeDirectory, "--index-backend", "sqlite", otherRepository}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(index other SQLite) code = %d; stderr = %q", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := run([]string{
+		"search", "--store", storeDirectory, "--index-backend", "snapshot",
+		requestedRepository, "requested", "value",
+	}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "requested_value") || stderr.Len() != 0 {
+		t.Fatalf("run(search snapshot with other SQLite repository) code = %d stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	corruptStore := t.TempDir()
+	corruptSnapshot, err := localstore.NewStore(corruptStore)
+	if err != nil {
+		t.Fatalf("NewStore(corrupt fixture) error = %v", err)
+	}
+	chunk := source.Chunk{
+		ID: "corrupt-snapshot", Text: "CORRUPT_SNAPSHOT_CANARY",
+		Language:  source.LanguagePython,
+		Reference: source.Reference{Path: "corrupt.py", StartLine: 1, EndLine: 1},
+	}
+	if err := corruptSnapshot.Replace(context.Background(), canonicalPath(t, requestedRepository), mustCLICorpus(t, []source.Chunk{chunk})); err != nil {
+		t.Fatalf("Replace(corrupt fixture snapshot) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptStore, "index-v2.sqlite3"), []byte("CORRUPT_SQLITE_CANARY"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt SQLite) error = %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{
+		"search", "--store", corruptStore,
+		requestedRepository, "corrupt", "snapshot",
+	}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "CORRUPT_SNAPSHOT_CANARY") || stderr.Len() != 0 {
+		t.Fatalf("run(implicit snapshot beside corrupt SQLite) code = %d stdout = %q stderr = %q", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{
+		"search", "--store", corruptStore, "--index-backend", "snapshot",
+		requestedRepository, "corrupt", "snapshot",
+	}, &stdout, &stderr)
+	assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
+		requestedRepository, "CORRUPT_SQLITE_CANARY", "CORRUPT_SNAPSHOT_CANARY")
+}
+
+func prepareCLIRollbackFixture(t *testing.T) (string, string, rollbackMarker) {
+	t.Helper()
+	repository := t.TempDir()
+	storeDirectory := t.TempDir()
+	writeCLIFile(t, repository, "rollback.py", "def rollback_value():\n    return 1\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run([]string{"index", "--store", storeDirectory, "--index-backend", "sqlite", repository}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(index rollback fixture) code = %d; stderr = %q", code, stderr.String())
+	}
+	payload, err := os.ReadFile(rollbackMarkerPath(storeDirectory, canonicalPath(t, repository)))
+	if err != nil {
+		t.Fatalf("ReadFile(rollback marker) error = %v", err)
+	}
+	var marker rollbackMarker
+	if err := json.Unmarshal(payload, &marker); err != nil {
+		t.Fatalf("Unmarshal(rollback marker) error = %v", err)
+	}
+	return repository, storeDirectory, marker
+}
+
+func writeRollbackTestMarker(t *testing.T, path string, marker rollbackMarker) {
+	t.Helper()
+	payload, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatalf("Marshal(marker) error = %v", err)
+	}
+	writeRollbackTestPayload(t, path, payload)
+}
+
+func writeRollbackTestPayload(t *testing.T, path string, payload []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatalf("WriteFile(marker) error = %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("Chmod(marker) error = %v", err)
+	}
+}
+
+func assertRollbackReindexFailure(t *testing.T, code int, stdout, stderr string, canaries ...string) {
+	t.Helper()
+	if code != 1 {
+		t.Fatalf("run(search invalid rollback) code = %d, want 1; stderr = %q", code, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("run(search invalid rollback) stdout = %q, want empty", stdout)
+	}
+	const want = "consultar repositório: rollback de snapshot exige reindexação\n"
+	if stderr != want {
+		t.Fatalf("run(search invalid rollback) stderr = %q, want fixed %q", stderr, want)
+	}
+	for _, canary := range canaries {
+		if canary != "" && strings.Contains(stderr, canary) {
+			t.Fatalf("run(search invalid rollback) stderr exposes %q: %q", canary, stderr)
+		}
 	}
 }
 

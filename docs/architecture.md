@@ -7,27 +7,29 @@ GoContext começa como aplicação local, de processo único e orientada a CLI. 
 ## Fluxo de dados
 
 1. **Scanner** percorre somente uma raiz autorizada, aplica regras de exclusão, rejeita binários e mantém caminhos relativos.
-2. **Parser** extrai símbolos de Python e TypeScript com intervalos de linhas.
-3. **Chunker** prefere um símbolo por chunk; símbolos grandes podem ser divididos com pequena sobreposição e mesma origem.
+2. **Line parser preliminar** descobre declarações top-level de Python e TypeScript com intervalos de linhas; parser estrutural permanece pendente.
+3. **Chunker atual** recorta por limites dessas declarações; divisão de símbolos grandes com sobreposição permanece futura.
 4. **Store** grava chunks e metadados em snapshot consistente.
 5. **Busca lexical** favorece nomes exatos, identificadores e mensagens de erro.
 6. **Busca vetorial** opt-in usa embeddings provider-agnostic e recupera conceitos expressos com vocabulário diferente.
 7. **Fusão híbrida** combina rankings, inicialmente por Reciprocal Rank Fusion, evitando calibrar escalas incompatíveis.
-8. **Gerador** recebe somente melhores chunks e pergunta do usuário.
-9. **Guardrail** rejeita citações inexistentes ou fora da evidência recuperada.
-10. **CLI ou MCP** apresenta resposta e referências `caminho:linha-inicial-linha-final`.
+8. **Gerador futuro** receberá somente melhores chunks e pergunta do usuário.
+9. **Guardrail futuro** rejeitará citações inexistentes ou fora da evidência recuperada.
+10. **CLI atual / MCP futuro** apresenta ou apresentará referências `caminho:linha-inicial-linha-final`.
 
 Cada etapa preserva `source.Reference`. Citação não é reconstruída a partir de texto gerado.
 
 ## Módulos Go
 
-| Módulo | Responsabilidade agora | Implementação futura |
+| Módulo | Responsabilidade entregue | Implementação futura |
 | --- | --- | --- |
-| `cmd/gocontext` | entrada do processo e versão | comandos `index`, `search` e `ask` |
-| `internal/source` | fatos e proveniência do código | IDs estáveis e hashes de conteúdo |
-| `internal/ingest` | contratos do pipeline | filesystem scanner, parsers e chunker |
-| `internal/search` | consulta e resultado ranqueado | lexical, vetorial e fusão |
-| `internal/answer` | geração e validação | adapter LLM e guardrails determinísticos |
+| `cmd/gocontext` | composition root dos comandos `index` e `search`, configuração e avisos | `ask` e MCP |
+| `internal/source` | fatos, IDs, revisão de corpus e `source.Reference` canônico | novas linguagens sem mudar proveniência |
+| `internal/ingest` | scanner default-deny, line parser preliminar e chunker | parser estrutural guiado pela Task 14 |
+| `internal/embedding` | seam provider-agnostic e adapter HTTP OpenAI-compatible | adapters adicionais somente quando medidos |
+| `internal/index` | builder de geração completa e publicação SQLite | reuso incremental equivalente a rebuild |
+| `internal/search` | lexical, vetor exato e híbrido RRF com fallback | ANN e reranker após medição |
+| `internal/answer` | contratos para geração e validação | adapters LLM e guardrails determinísticos no M3 |
 
 Após a fundação M0, novos pacotes devem nascer junto de comportamento executável. Não haverá pastas vazias para `mcp`, `storage`, `embeddings` ou `web`.
 
@@ -36,30 +38,44 @@ Após a fundação M0, novos pacotes devem nascer junto de comportamento execut�
 - `source` não depende de outros pacotes internos.
 - `ingest` e `search` dependem de `source`.
 - `answer` depende de `search` e `source`.
-- `cmd/gocontext` será o composition root; implementações concretas não devem ser importadas pelos tipos centrais.
+- `cmd/gocontext` é o composition root; implementações concretas não são importadas pelos tipos centrais.
 - Interfaces descrevem necessidades do consumidor. Adapters de SQLite, parser, embedding e LLM ficam nas bordas.
 
 ## Persistência e busca
 
-MVP usará armazenamento local único. M2 introduzirá SQLite versionado para gerações atômicas de chunks e vetores. Primeiro mecanismo vetorial fará scan exato e cosseno em Go; extensão vetorial e ANN só entram após medição. O ranking híbrido recebe candidatos independentes e combina posições por RRF, não scores crus.
+O snapshot JSON permanece backend padrão e SQLite versionado é opt-in. SQLite publica gerações atômicas de chunks e vetores; o primeiro mecanismo vetorial entregue faz scan exato e cosseno em Go. Extensão vetorial, ANN e banco vetorial externo só entram após medição. O ranking híbrido recebe candidatos independentes e combina posições por RRF, não scores crus.
 
 Nenhum índice externo é necessário. Reindexação completa de repositórios pequenos é aceitável antes de otimizar atualizações incrementais.
 
-`internal/ingest/localstore` oferece persistência inicial antes do índice SQLite. Cada repositório recebe snapshot JSON versionado, identificado no disco pelo SHA-256 do repository ID. Escrita usa arquivo temporário, `fsync` e rename atômico; arquivos usam permissão `0600`. Leitura valida versão, repository ID, chunks duplicados, referências e limite de 64 MiB. Esse adapter não oferece busca e será substituído ou absorvido pelo armazenamento do M2.
+`internal/ingest/localstore` oferece o caminho de compatibilidade offline. Cada repositório recebe snapshot JSON versionado, identificado no disco pelo SHA-256 do repository ID. Escrita usa arquivo temporário, `fsync` e rename atômico; arquivos usam permissão `0600`. Leitura valida versão, policy, revisão, repository ID, chunks duplicados, referências e limite de 64 MiB. Esse adapter não oferece busca; `internal/search/lexical` consome seu seam mínimo de loader.
 
-`internal/search/lexical` implementa recuperação lexical inicial diretamente sobre snapshots. Consulta e campos de chunk são tokenizados em Unicode, com separação de `camelCase`, `snake_case` e pontuação. Score normalizado combina presença do termo em texto (`0.6`), símbolo (`0.3`) e caminho (`0.1`); empates usam caminho, linha e chunk ID. Snapshot é carregado a cada consulta. Não há índice invertido, frequência de termos ou BM25 nesta fase. Migração para SQLite preservará esse comportamento antes de qualquer mudança de algoritmo.
+`internal/search/lexical` implementa recuperação lexical de primeira classe tanto sobre snapshot quanto sobre reader SQLite fixado a uma geração. Consulta e campos de chunk são tokenizados em Unicode, com separação de `camelCase`, `snake_case` e pontuação. Score normalizado combina presença do termo em texto (`0.6`), símbolo (`0.3`) e caminho (`0.1`); empates usam caminho, linha e chunk ID. Não há índice invertido, frequência de termos ou BM25 nesta fase.
 
-## Embeddings e recuperação híbrida planejados
+## Embeddings e recuperação híbrida entregues no M2
 
 - `internal/embedding` define profile, purpose, vector e seam mínimo `Embedder`.
-- `internal/embedding/openaicompat` será primeiro adapter concreto; OpenAI e Ollama diferem por configuração, não por contrato.
-- `internal/index` esconderá batching, revisão de corpus e publicação atômica de geração.
-- `internal/index/sqlite` guardará chunks canônicos, referências, vetores e manifest ativo.
-- `internal/search/vector` criará embedding de query e retornará somente chunks da geração canônica.
-- `internal/search/hybrid` combinará lexical e vector por RRF com fallback lexical.
-- `cmd/gocontext` continuará sendo único composition root de adapters, configuração e credenciais.
+- `internal/embedding/openaicompat` é o adapter concreto; OpenAI-compatible remoto e Ollama diferem por configuração, não por contrato.
+- `internal/index` esconde batching, revisão de corpus e publicação atômica de geração completa.
+- `internal/index/sqlite` guarda chunks canônicos, referências, vetores e manifest ativo.
+- `internal/search/vector` cria embedding de query e retorna somente chunks da geração canônica fixada.
+- `internal/search/hybrid` combina lexical e vector por RRF com fallback lexical observável.
+- `cmd/gocontext` é o único composition root de adapters, configuração, credenciais e disclosure de egress.
 
-Sem modo `preferred|required` explícito, nenhuma chamada de rede ocorre, mesmo se endpoint/modelo estiverem no ambiente. Modo `preferred` degrada somente erros temporários tipados para lexical e emite aviso sanitizado; corrupção, configuração inválida e cancelamento continuam erros. Modelo, dimensão ou fingerprint diferente exige rebuild completo. Detalhes: [ADR 0002](decisions/0002-embeddings-vector-search.md).
+Sem modo `preferred|required` explícito, nenhuma chamada de rede ocorre, mesmo se endpoint/modelo estiverem no ambiente. Modo `preferred` degrada somente erros temporários tipados para lexical e emite aviso sanitizado; corrupção, configuração inválida e cancelamento continuam erros. Modelo, dimensão ou fingerprint diferente exige rebuild completo. `source.Reference` sempre vem do chunk canônico, nunca do vetor. Detalhes: [ADR 0002](decisions/0002-embeddings-vector-search.md).
+
+### Seleção, rollout e rollback
+
+- Sem flags/env, `index` e `search` usam snapshot/semantic-off e não abrem SQLite ou rede.
+- `--index-backend sqlite` e `auto` são opt-in. `auto` lê SQLite ativo quando presente e snapshot validado quando banco/store/repositório está ausente; busca não cria store.
+- Uma indexação SQLite bem-sucedida publica snapshot companheiro e marker privado ligados à mesma policy, revisão e geração ativa.
+- `--index-backend snapshot` explícito é rollback. Com geração SQLite ativa, valida marker limitado, no-follow, privado e schema estrito enquanto um reader fixa a geração. Qualquer divergência ou SQLite desconhecido/corrupto falha com categoria sanitizada de reindexação.
+- Uma indexação snapshot padrão posterior remove a prontidão de rollback. A busca padrão lê o snapshot novo; `auto` continua sendo a escolha explícita que pode ler a geração SQLite anterior.
+
+Recuperação é reindex-first: um store SQLite saudável recebe nova indexação completa para recriar o par; SQLite corrupto não é mascarado por cache antigo. O operador pode reindexar snapshot para restaurar o caminho padrão, mas rollback explícito continua bloqueado até recuperação administrativa do store. Promoção de SQLite a default exige ADR futura.
+
+### Escala exata
+
+O reader SQLite faz cosseno exato O(n × dimensão), sem ANN implícito e sem alterar ranking. O CLI carrega e valida a geração canônica uma vez antes da busca, usa essa mesma carga no caminho lexical e emite, no máximo uma vez por operação, aviso fixo quando há mais de 20.000 chunks; exatamente 20.000 permanece silencioso. Não há segunda carga apenas para contar, e o backend snapshot padrão não emite esse diagnóstico. Benchmark manual e evidência host-specific ficam no [ADR 0002](decisions/0002-embeddings-vector-search.md).
 
 ## Parsing e chunking
 
@@ -88,7 +104,7 @@ Política inicial de chunking:
 - ignora arquivos não regulares, binários com byte NUL e fontes acima de 1 MiB;
 - respeita cancelamento de contexto.
 
-Antes de qualquer avaliação profissional, scanner receberá policy default-deny auditável. Paths reconhecidamente sensíveis são recusados antes de `Open`: `.env`, `.env.*`, `.git/**`, `.github/**`, metadata/automação, credenciais/chaves/certificados, nested repos, symlinks, dependências e caches. Arquivos de nome permitido são lidos com limite pelo scanner para classificar binário, UTF-8, gerado, tamanho e padrões conservadores de segredo; itens detectados não viram `source.File` nem atravessam parser/rede/store. Report expõe somente contagens por categoria.
+O scanner já aplica policy default-deny auditável antes de qualquer avaliação profissional. Paths reconhecidamente sensíveis são recusados antes de `Open`: `.env`, `.env.*`, `.git/**`, `.github/**`, metadata/automação, credenciais/chaves/certificados, nested repos, symlinks, dependências e caches. Arquivos de nome permitido são lidos com limite para classificar binário, UTF-8, gerado, tamanho e padrões conservadores de segredo; itens detectados não viram `source.File` nem atravessam parser/rede/store. Report expõe somente contagens por categoria.
 
 M2 deliberadamente não lê `.gitignore`: arquivo controlado pelo próprio repositório não pode relaxar hard deny, e leitura ampla de metadata aumenta superfície. Futuro suporte será deny-only e exigirá decisão explícita. Exclusão integral de `.github/**` perde contexto potencialmente útil, trade-off aceito por segurança.
 
@@ -120,8 +136,8 @@ Erros carregam etapa, caminho relativo quando seguro e causa original. Arquivo i
 - testes explícitos de symlink escape, arquivos secretos e prompt injection.
 - teste taint instrumenta parser, chunker, embedder, transporte, store e logs; bytes excluídos devem aparecer em zero sinks.
 
-Validação profissional usa primeiro inventário e benchmark lexical offline. Taba App, Tivita Backend e Tivita Web App não enviam código a provider externo; Ollama loopback é único modo semântico permitido. Relatórios guardam agregados sanitizados. Ver [plano de validação](plans/2026-08-27-tivita-professional-repository-validation.md).
+Prova taint ponta a ponta e validação profissional permanecem pendentes nas Tasks 13/14. Quando autorizada, a validação começa por inventário e benchmark lexical offline; código profissional não vai a provider externo e Ollama loopback é o único modo semântico permitido. Relatórios guardarão somente agregados sanitizados. Ver [plano de validação](plans/2026-08-27-tivita-professional-repository-validation.md).
 
 ## Não decisões desta etapa
 
-Modelo de embeddings, adapter além do protocolo OpenAI-compatible, provider LLM, binding Tree-sitter, extensão vetorial, protocolo HTTP local e biblioteca MCP serão escolhidos somente no marco que os utilizar. Anthropic não é provider de embeddings; poderá aparecer futuramente como adapter de geração em `internal/answer`. Adiar escolhas restantes mantém fundação compilável e reversível.
+Não há modelo de embeddings default. Adapter além do protocolo OpenAI-compatible, provider LLM, binding Tree-sitter, extensão vetorial, protocolo HTTP local e biblioteca MCP serão escolhidos somente no marco que os utilizar. Anthropic aparece apenas como possível adapter futuro de geração em `internal/answer`. Adiar escolhas restantes mantém a arquitetura reversível.
