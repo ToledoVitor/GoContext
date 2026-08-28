@@ -31,6 +31,7 @@ type evalOutputOperations struct {
 	syncFile      func(*os.File) error
 	beforePublish func() error
 	publish       func(*evalOutput, string) error
+	afterPublish  func() error
 	unlink        func(*evalOutput, string) error
 	syncDir       func(*os.File) error
 }
@@ -69,7 +70,7 @@ func (output *evalOutput) requireOutsideRoot(root *filesystem.OpenedRoot) error 
 	if output == nil || output.parent == nil || root == nil {
 		return errEvalOutput
 	}
-	inside, err := evalDirectoryInsideRoot(output.parent.file, root)
+	inside, err := output.parent.revalidate(root)
 	if err != nil || inside {
 		return errEvalOutput
 	}
@@ -133,12 +134,26 @@ func (output *evalOutput) writeWithOperations(payload []byte, maxBytes int64, op
 		return errEvalOutput
 	}
 	output.visible = true
+	if operations.afterPublish != nil {
+		if err := operations.afterPublish(); err != nil {
+			return errEvalOutputIndeterminate
+		}
+	}
+	if err := output.revalidate(); err != nil {
+		return errEvalOutputIndeterminate
+	}
 	if err := operations.unlink(output, temporary); err != nil {
 		cleanupTemporary = false
 		return errEvalOutputIndeterminate
 	}
 	cleanupTemporary = false
+	if err := output.revalidate(); err != nil {
+		return errEvalOutputIndeterminate
+	}
 	if err := operations.syncDir(output.parent.file); err != nil {
+		return errEvalOutputIndeterminate
+	}
+	if err := output.revalidate(); err != nil {
 		return errEvalOutputIndeterminate
 	}
 	return nil
@@ -203,17 +218,12 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 			return nil, errEvalChecklist
 		}
 	}
-	if err := parent.revalidate(); err != nil {
+	inside, err := parent.revalidate(operations.root)
+	if err != nil {
 		return nil, errEvalChecklist
 	}
-	if operations.root != nil {
-		inside, err := evalDirectoryInsideRoot(parent.file, operations.root)
-		if err != nil {
-			return nil, errEvalChecklist
-		}
-		if inside {
-			return nil, errEvalChecklistLocation
-		}
+	if inside {
+		return nil, errEvalChecklistLocation
 	}
 	descriptor, err := unix.Openat(int(parent.file.Fd()), filepath.Base(targetPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -234,17 +244,12 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 	if err != nil || int64(len(payload)) > maxBytes {
 		return nil, errEvalChecklist
 	}
-	if err := parent.revalidate(); err != nil {
+	inside, err = parent.revalidate(operations.root)
+	if err != nil {
 		return nil, errEvalChecklist
 	}
-	if operations.root != nil {
-		inside, err := evalDirectoryInsideRoot(parent.file, operations.root)
-		if err != nil {
-			return nil, errEvalChecklist
-		}
-		if inside {
-			return nil, errEvalChecklistLocation
-		}
+	if inside {
+		return nil, errEvalChecklistLocation
 	}
 	return payload, nil
 }
@@ -265,16 +270,16 @@ func openPrivateEvalDirectory(path string) (*evalDirectory, error) {
 		return nil, errEvalOutput
 	}
 	directory.identity = info
-	if err := directory.revalidate(); err != nil {
+	if _, err := directory.revalidate(nil); err != nil {
 		_ = directory.Close()
 		return nil, errEvalOutput
 	}
 	return directory, nil
 }
 
-func (directory *evalDirectory) revalidate() error {
+func (directory *evalDirectory) revalidate(root *filesystem.OpenedRoot) (bool, error) {
 	if directory == nil || directory.file == nil || directory.identity == nil {
-		return errEvalOutput
+		return false, errEvalOutput
 	}
 	canonical, err := filepath.EvalSymlinks(directory.path)
 	pathInfo, pathErr := os.Lstat(directory.path)
@@ -282,9 +287,9 @@ func (directory *evalDirectory) revalidate() error {
 	if err != nil || canonical != directory.path || pathErr != nil || statErr != nil ||
 		!info.IsDir() || !pathInfo.IsDir() || info.Mode().Perm() != 0o700 ||
 		!ownedByEffectiveUser(directory.file) || !os.SameFile(directory.identity, info) || !os.SameFile(info, pathInfo) {
-		return errEvalOutput
+		return false, errEvalOutput
 	}
-	return nil
+	return validateEvalDirectoryAncestry(directory.file, root)
 }
 
 func (directory *evalDirectory) Close() error {
@@ -297,21 +302,15 @@ func (directory *evalDirectory) Close() error {
 }
 
 func (output *evalOutput) revalidate() error {
-	if err := output.parent.revalidate(); err != nil {
-		return err
-	}
-	if output.root == nil {
-		return nil
-	}
-	inside, err := evalDirectoryInsideRoot(output.parent.file, output.root)
+	inside, err := output.parent.revalidate(output.root)
 	if err != nil || inside {
 		return errEvalOutput
 	}
 	return nil
 }
 
-func evalDirectoryInsideRoot(directory *os.File, root *filesystem.OpenedRoot) (bool, error) {
-	if directory == nil || root == nil {
+func validateEvalDirectoryAncestry(directory *os.File, root *filesystem.OpenedRoot) (bool, error) {
+	if directory == nil {
 		return false, errEvalOutput
 	}
 	descriptor, err := unix.Openat(int(directory.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -319,19 +318,26 @@ func evalDirectoryInsideRoot(directory *os.File, root *filesystem.OpenedRoot) (b
 		return false, err
 	}
 	current := os.NewFile(uintptr(descriptor), ".")
+	insideRoot := false
 	for depth := 0; depth < 1024; depth++ {
 		currentInfo, statErr := current.Stat()
 		if statErr != nil {
 			_ = current.Close()
 			return false, statErr
 		}
-		sameRoot, compareErr := root.CompareIdentity(currentInfo)
-		if compareErr != nil {
+		if err := validateEvalDirectoryOwnerAndMode(current, depth == 0); err != nil {
 			_ = current.Close()
-			return false, compareErr
+			return false, err
 		}
-		if sameRoot {
-			return true, current.Close()
+		if root != nil {
+			sameRoot, compareErr := root.CompareIdentity(currentInfo)
+			if compareErr != nil {
+				_ = current.Close()
+				return false, compareErr
+			}
+			if sameRoot {
+				insideRoot = true
+			}
 		}
 		parentDescriptor, openErr := unix.Openat(int(current.Fd()), "..", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if openErr != nil {
@@ -351,12 +357,35 @@ func evalDirectoryInsideRoot(directory *os.File, root *filesystem.OpenedRoot) (b
 			return false, closeErr
 		}
 		if atFilesystemRoot {
-			return false, parent.Close()
+			return insideRoot, parent.Close()
 		}
 		current = parent
 	}
 	_ = current.Close()
 	return false, errEvalOutput
+}
+
+func validateEvalDirectoryOwnerAndMode(directory *os.File, leaf bool) error {
+	var stat unix.Stat_t
+	if unix.Fstat(int(directory.Fd()), &stat) != nil {
+		return errEvalOutput
+	}
+	mode := uint32(stat.Mode)
+	if leaf {
+		if stat.Uid != uint32(os.Geteuid()) || mode&0o777 != 0o700 {
+			return errEvalOutput
+		}
+		return nil
+	}
+	if stat.Uid != 0 && stat.Uid != uint32(os.Geteuid()) {
+		return errEvalOutput
+	}
+	// Ancestors may be readable/traversable, but rename-capable ancestry is
+	// limited to root-owned sticky system directories such as /tmp.
+	if mode&0o022 != 0 && (stat.Uid != 0 || mode&unix.S_ISVTX == 0) {
+		return errEvalOutput
+	}
+	return nil
 }
 
 func ownedByEffectiveUser(file *os.File) bool {

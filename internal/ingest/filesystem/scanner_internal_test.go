@@ -123,19 +123,6 @@ func TestScannerRejectsFileSwappedToSymlinkBeforeOpen(t *testing.T) {
 	}
 }
 
-func TestScannerRejectsRepositoryRootSymlink(t *testing.T) {
-	realRoot := t.TempDir()
-	writeInternalFile(t, realRoot, "safe.py", "print('safe')\n")
-	alias := filepath.Join(t.TempDir(), "root-alias")
-	if err := os.Symlink(realRoot, alias); err != nil {
-		t.Fatal(err)
-	}
-	_, err := NewScanner().Scan(context.Background(), alias)
-	if err == nil || !strings.Contains(err.Error(), "open root failed") {
-		t.Fatalf("Scan() error = %v, want sanitized no-follow root failure", err)
-	}
-}
-
 func TestScanOpenedUsesRetainedRootWhenPathIsReplaced(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "root")

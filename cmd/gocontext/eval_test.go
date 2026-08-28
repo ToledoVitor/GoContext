@@ -14,6 +14,7 @@ import (
 
 	evaluation "github.com/ToledoVitor/GoContext/internal/eval"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
+	"github.com/ToledoVitor/GoContext/internal/ingest/filesystem"
 	"github.com/ToledoVitor/GoContext/internal/search"
 	"github.com/ToledoVitor/GoContext/internal/source"
 	"github.com/ToledoVitor/GoContext/internal/testsupport/taintcheck"
@@ -242,6 +243,27 @@ func TestRunEvalInventoryTrustFailuresDoNotWriteUnsafeOutput(t *testing.T) {
 			t.Fatalf("output exists/error = %v", err)
 		}
 	})
+
+	t.Run("writable output ancestor", func(t *testing.T) {
+		fixture := newEvalCLIFixture(t)
+		unsafeAncestor := filepath.Join(filepath.Dir(fixture.root), "unsafe-output")
+		privateParent := filepath.Join(unsafeAncestor, "private")
+		if err := os.MkdirAll(privateParent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(unsafeAncestor, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		fixture.output = filepath.Join(privateParent, "report.json")
+		var stdout, stderr bytes.Buffer
+		exitCode := run(evalCLIArgs(fixture), &stdout, &stderr)
+		if exitCode != 1 || stdout.String() != "evaluation: no-go\n" || stderr.String() != "evaluation error: output\n" {
+			t.Fatalf("exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+		}
+		if _, err := os.Lstat(fixture.output); !os.IsNotExist(err) {
+			t.Fatalf("output exists/error = %v", err)
+		}
+	})
 }
 
 func TestRunEvalInventoryRootAndChecklistPathFailuresWriteSanitizedNoGo(t *testing.T) {
@@ -270,6 +292,21 @@ func TestRunEvalInventoryRootAndChecklistPathFailuresWriteSanitizedNoGo(t *testi
 		if err := os.Chmod(filepath.Dir(fixture.checklist), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		assertEvalCLINoGo(t, fixture, "checklist", evaluation.BlockerChecklist)
+	})
+
+	t.Run("writable checklist ancestor", func(t *testing.T) {
+		fixture := newEvalCLIFixture(t)
+		unsafeAncestor := filepath.Join(filepath.Dir(fixture.root), "unsafe-checklist")
+		privateParent := filepath.Join(unsafeAncestor, "private")
+		if err := os.MkdirAll(privateParent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(unsafeAncestor, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		fixture.checklist = filepath.Join(privateParent, "gate.json")
+		writeEvalChecklist(t, fixture.checklist, validEvalChecklist())
 		assertEvalCLINoGo(t, fixture, "checklist", evaluation.BlockerChecklist)
 	})
 }
@@ -364,6 +401,69 @@ func TestRunEvalInventoryScansRetainedApprovedRootAfterPathReplacement(t *testin
 	if report.Inventory.IncludedFiles != 1 {
 		t.Fatalf("included files = %d, want retained tree's one file", report.Inventory.IncludedFiles)
 	}
+}
+
+type typedNilEvalParser struct{}
+
+func (*typedNilEvalParser) Parse(context.Context, source.File) ([]source.Symbol, error) {
+	return nil, nil
+}
+
+type typedNilEvalChunker struct{}
+
+func (*typedNilEvalChunker) Chunk(context.Context, source.File, []source.Symbol) ([]source.Chunk, error) {
+	return nil, nil
+}
+
+func TestRunEvalInventoryRejectsTypedNilDependenciesBeforeEvaluation(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*evalCLIComposition)
+	}{
+		{name: "scanner", configure: func(composition *evalCLIComposition) {
+			var scanner *filesystem.Scanner
+			composition.newScanner = func() ingest.Scanner { return scanner }
+		}},
+		{name: "parser", configure: func(composition *evalCLIComposition) {
+			var parser *typedNilEvalParser
+			composition.newParser = func() ingest.Parser { return parser }
+		}},
+		{name: "chunker", configure: func(composition *evalCLIComposition) {
+			var chunker *typedNilEvalChunker
+			composition.newChunker = func() ingest.Chunker { return chunker }
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newEvalCLIFixture(t)
+			composition := defaultEvalCLIComposition()
+			test.configure(&composition)
+			beforeDescriptors := evalOpenDescriptorCount(t)
+			var stdout, stderr bytes.Buffer
+			exitCode := runEvalWithComposition(context.Background(), evalCLIArgs(fixture)[1:], &stdout, &stderr, composition)
+			if exitCode != 1 || stdout.String() != "evaluation: no-go\n" || stderr.String() != "evaluation error: integrity\n" {
+				t.Fatalf("exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+			}
+			var report evaluation.Report
+			payload, err := os.ReadFile(fixture.output)
+			if err != nil || json.Unmarshal(payload, &report) != nil || report.Blockers[evaluation.BlockerIntegrity] != 1 {
+				t.Fatalf("report/error = %#v/%v", report, err)
+			}
+			afterDescriptors := evalOpenDescriptorCount(t)
+			if beforeDescriptors >= 0 && afterDescriptors != beforeDescriptors {
+				t.Fatalf("open descriptor count before/after = %d/%d", beforeDescriptors, afterDescriptors)
+			}
+		})
+	}
+}
+
+func evalOpenDescriptorCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		return -1
+	}
+	return len(entries)
 }
 
 type evalCLIFixture struct {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -56,7 +55,7 @@ func EvaluateMetrics(
 	if err := ctx.Err(); err != nil {
 		return MetricAggregate{}, err
 	}
-	if interfaceNil(searcher) || !opaqueRepositoryPattern.MatchString(repositoryID) {
+	if IsNilDependency(searcher) || !opaqueRepositoryPattern.MatchString(repositoryID) {
 		return MetricAggregate{}, ErrMetrics
 	}
 	canonical, err := canonicalChunkMap(corpus)
@@ -267,19 +266,6 @@ func validQueryCategory(category QueryCategory) bool {
 	case CategoryExactSymbol, CategoryConcept, CategoryCrossLayer, CategoryFramework,
 		CategoryErrorMessage, CategoryConfigurationPath, CategoryNegativeEvidence:
 		return true
-	default:
-		return false
-	}
-}
-
-func interfaceNil(value any) bool {
-	if value == nil {
-		return true
-	}
-	reflected := reflect.ValueOf(value)
-	switch reflected.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return reflected.IsNil()
 	default:
 		return false
 	}

@@ -47,8 +47,8 @@ func Evaluate(
 	if err := ctx.Err(); err != nil {
 		return failedReport(repositoryID, BlockerCanceled), err
 	}
-	if !opaqueRepositoryPattern.MatchString(repositoryID) || interfaceNil(dependencies.Scanner) ||
-		interfaceNil(dependencies.Parser) || interfaceNil(dependencies.Chunker) || dependencies.SearchFactory == nil {
+	if !opaqueRepositoryPattern.MatchString(repositoryID) || IsNilDependency(dependencies.Scanner) ||
+		IsNilDependency(dependencies.Parser) || IsNilDependency(dependencies.Chunker) || dependencies.SearchFactory == nil {
 		return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
 	}
 	if budgets.MaxEligibleFiles <= 0 || budgets.MaxEligibleBytes <= 0 || budgets.MaxAutoQueries <= 0 {
@@ -150,7 +150,7 @@ func Evaluate(
 		if err := ctx.Err(); err != nil {
 			return failedReport(repositoryID, BlockerCanceled), err
 		}
-		if factoryErr != nil || interfaceNil(searcher) {
+		if factoryErr != nil || IsNilDependency(searcher) {
 			return failedReport(repositoryID, BlockerRetrieval), ErrEvaluation
 		}
 		metrics, metricErr := EvaluateMetrics(ctx, searcher, repositoryID, corpus.Chunks, cases, MetricOptions{Now: now})

@@ -145,12 +145,18 @@ func runEvalWithComposition(ctx context.Context, args []string, stdout, stderr i
 		}
 	}
 	configuredScanner := composition.newScanner()
+	configuredParser := composition.newParser()
+	configuredChunker := composition.newChunker()
+	if evaluation.IsNilDependency(configuredScanner) || evaluation.IsNilDependency(configuredParser) ||
+		evaluation.IsNilDependency(configuredChunker) {
+		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerIntegrity, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "integrity")
+	}
 	openedScanner, ok := configuredScanner.(scanOpenedRoot)
-	if !ok || openedScanner == nil {
+	if !ok || evaluation.IsNilDependency(openedScanner) {
 		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerIntegrity, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "integrity")
 	}
 	report, evaluationErr := evaluation.Evaluate(evaluationContext, repositoryID.value, "retained-root", evaluation.Dependencies{
-		Scanner: retainedEvalScanner{root: openedRoot, scanner: openedScanner}, Parser: composition.newParser(), Chunker: composition.newChunker(),
+		Scanner: retainedEvalScanner{root: openedRoot, scanner: openedScanner}, Parser: configuredParser, Chunker: configuredChunker,
 		SearchFactory: composition.searchFactory,
 	}, checklist.EvaluationBudgets())
 	if evaluationErr != nil {

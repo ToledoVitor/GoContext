@@ -21,3 +21,14 @@ func TestOrdinaryScanPreservesLegacyRootOpenOnUnsupportedPlatform(t *testing.T) 
 		t.Fatal("source Scan() error = nil; descriptor-relative child open must remain fail-closed")
 	}
 }
+
+func TestOrdinaryScanPreservesLegacyRootSymlinkFollowOnUnsupportedPlatform(t *testing.T) {
+	realRoot := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "root-alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Skipf("root symlink unavailable: %v", err)
+	}
+	if _, err := NewScanner().Scan(context.Background(), alias); err != nil {
+		t.Fatalf("empty symlink-root Scan() error = %v", err)
+	}
+}
