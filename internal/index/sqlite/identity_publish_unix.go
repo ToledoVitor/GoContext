@@ -9,35 +9,41 @@ import (
 )
 
 func publishStoreIdentitySidecar(temporary, target, directory string) error {
-	_, err := publishStoreFileExclusive(temporary, target, directory, defaultStoreFileOperations())
+	_, err := publishStoreFileExclusive(temporary, target, directory, defaultStoreFileOperations(), nil)
 	return err
 }
 
 func publishStoreFileExclusive(
 	temporary, target, directory string,
 	operations storeFileOperations,
+	afterTargetVisible func(string) error,
 ) (storePublicationResult, error) {
 	if err := os.Link(temporary, target); err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return storePublicationResult{}, errStorePublicationCollision
+			return storePublicationResult{targetVisible: true}, errStorePublicationCollision
 		}
 		return storePublicationResult{}, err
 	}
-	result := storePublicationResult{published: true}
+	result := storePublicationResult{targetVisible: true, targetCreated: true}
+	var operationErrs []error
+	if afterTargetVisible != nil {
+		if err := afterTargetVisible(target); err != nil {
+			operationErrs = append(operationErrs, err)
+			result.cleanupErr = errors.Join(result.cleanupErr, err)
+		}
+	}
 	if err := operations.remove(temporary); err != nil {
-		result.cleanupErr = err
-		return result, err
+		result.cleanupErr = errors.Join(result.cleanupErr, err)
+		operationErrs = append(operationErrs, err)
+	} else {
+		result.temporaryRemoved = true
 	}
 	if err := operations.syncDirectory(directory); err != nil {
-		removeErr := operations.remove(target)
-		if errors.Is(removeErr, fs.ErrNotExist) {
-			removeErr = nil
-		}
-		retrySyncErr := operations.syncDirectory(directory)
-		result.cleanupErr = errors.Join(removeErr, retrySyncErr)
-		return result, err
+		operationErrs = append(operationErrs, err)
+	} else {
+		result.durable = true
 	}
-	return result, nil
+	return result, errors.Join(operationErrs...)
 }
 
 func syncStoreDirectory(directory string) error {

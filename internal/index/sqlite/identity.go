@@ -210,6 +210,7 @@ func validatePrivateRegularFile(info fs.FileInfo) error {
 func createStoreIdentitySidecar(
 	directory, identity string,
 	beforePublish func(string) error,
+	afterTargetVisible func(string) error,
 	operations storeFileOperations,
 ) (storePublicationResult, error) {
 	payload, err := json.Marshal(storeIdentityDocument{Version: storeIdentityVersion, StoreID: identity})
@@ -221,12 +222,17 @@ func createStoreIdentitySidecar(
 		return storePublicationResult{}, invalidStoreIdentity()
 	}
 	temporaryPath := temporary.Name()
+	temporaryInfo, statErr := temporary.Stat()
 	fail := func(operationErr error, cleanupErrs ...error) (storePublicationResult, error) {
-		cleanupErrs = append(cleanupErrs, removeTemporaryStoreFile(temporaryPath, directory, operations))
+		cleanupErrs = append(cleanupErrs, removeOwnedTemporaryStoreFile(temporaryPath, directory, temporaryInfo, operations))
 		return storePublicationResult{
 			cleanupErr:    errors.Join(cleanupErrs...),
+			temporaryInfo: temporaryInfo,
 			temporaryPath: temporaryPath,
 		}, operationErr
+	}
+	if statErr != nil {
+		return fail(invalidStoreIdentity(), temporary.Close())
 	}
 	if err := temporary.Chmod(0o600); err != nil {
 		return fail(invalidStoreIdentity(), temporary.Close())
@@ -237,8 +243,8 @@ func createStoreIdentitySidecar(
 	if err := temporary.Sync(); err != nil {
 		return fail(invalidStoreIdentity(), temporary.Close())
 	}
-	temporaryInfo, err := temporary.Stat()
-	if err != nil {
+	afterWriteInfo, err := temporary.Stat()
+	if err != nil || !os.SameFile(temporaryInfo, afterWriteInfo) {
 		return fail(invalidStoreIdentity(), temporary.Close())
 	}
 	if err := temporary.Close(); err != nil {
@@ -250,11 +256,20 @@ func createStoreIdentitySidecar(
 			return fail(invalidStoreIdentity())
 		}
 	}
-	result, err := publishStoreFileExclusive(temporaryPath, target, directory, operations)
-	result.fileInfo = temporaryInfo
+	result, err := publishStoreFileExclusive(
+		temporaryPath,
+		target,
+		directory,
+		operations,
+		afterTargetVisible,
+	)
+	result.temporaryInfo = temporaryInfo
 	result.temporaryPath = temporaryPath
 	if err != nil {
-		temporaryCleanupErr := removeTemporaryStoreFile(temporaryPath, directory, operations)
+		var temporaryCleanupErr error
+		if !result.temporaryRemoved {
+			temporaryCleanupErr = removeOwnedTemporaryStoreFile(temporaryPath, directory, temporaryInfo, operations)
+		}
 		result.cleanupErr = errors.Join(result.cleanupErr, temporaryCleanupErr)
 		return result, invalidStoreIdentity()
 	}

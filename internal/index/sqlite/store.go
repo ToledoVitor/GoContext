@@ -92,7 +92,9 @@ type BoundReader struct {
 	closed bool
 }
 
-// NewStore creates or opens a private SQLite corpus store.
+// NewStore creates or opens a private SQLite corpus store. It serializes the
+// pathname namespace through a stable private lock file that all GoContext
+// processes must honor; the lock file can remain after an interrupted creation.
 func NewStore(directory string) (*Store, error) {
 	return newStore(directory, storeOpenHooks{})
 }
@@ -130,15 +132,27 @@ func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 		return nil, fmt.Errorf("create sqlite index store: path is not a directory")
 	}
 	databasePath := filepath.Join(canonical, databaseName)
-	databaseInfo, statErr := os.Lstat(databasePath)
+	_, statErr := os.Lstat(databasePath)
 	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
 		return nil, fmt.Errorf("create sqlite index store: inspect database: %w", statErr)
 	}
-	if statErr == nil {
-		return openExistingWriterStore(canonical, databasePath, databaseInfo, hooks)
-	}
-	if err := os.Chmod(canonical, 0o700); err != nil {
-		return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
+	databaseInitiallyAbsent := errors.Is(statErr, fs.ErrNotExist)
+	if databaseInitiallyAbsent {
+		if err := os.Chmod(canonical, 0o700); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
+		}
+	} else {
+		databaseInfo, err := os.Lstat(databasePath)
+		if err != nil {
+			return nil, fmt.Errorf("create sqlite index store: inspect database: %w", err)
+		}
+		if err := validateDatabaseFile(databaseInfo, false); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: %w", err)
+		}
+		lockInfo, lockErr := os.Lstat(filepath.Join(canonical, storeNamespaceLockName))
+		if lockErr != nil || validateStoreNamespaceLockInfo(lockInfo) != nil {
+			return nil, formatStoreIdentityError("create sqlite index store")
+		}
 	}
 	canonicalInfo, err = os.Stat(canonical)
 	if err != nil {
@@ -147,7 +161,52 @@ func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 	if !canonicalInfo.IsDir() || validatePrivateMode(canonicalInfo) != nil {
 		return nil, errors.New("create sqlite index store: unsafe private directory")
 	}
-	return createFreshWriterStore(canonical, databasePath, hooks)
+	namespaceLock, err := acquireStoreNamespaceLock(canonical, databaseInitiallyAbsent)
+	if err != nil {
+		if databaseInitiallyAbsent {
+			return nil, fmt.Errorf("create sqlite index store: %w", storeCreationFailure())
+		}
+		return nil, formatStoreIdentityError("create sqlite index store")
+	}
+	databaseInfo, statErr := os.Lstat(databasePath)
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		return finishWriterOpenWithNamespaceLock(
+			nil,
+			fmt.Errorf("create sqlite index store: inspect database: %w", statErr),
+			namespaceLock,
+		)
+	}
+	if errors.Is(statErr, fs.ErrNotExist) {
+		return createFreshWriterStore(canonical, databasePath, namespaceLock, hooks)
+	}
+	store, openErr := openExistingWriterStore(canonical, databasePath, databaseInfo, hooks)
+	return finishWriterOpenWithNamespaceLock(store, openErr, namespaceLock)
+}
+
+func finishWriterOpenWithNamespaceLock(
+	store *Store,
+	operationErr error,
+	namespaceLock *storeNamespaceLock,
+) (*Store, error) {
+	releaseErr := namespaceLock.release()
+	if operationErr != nil {
+		if releaseErr != nil {
+			return nil, errors.Join(operationErr, errStoreNamespaceLockCleanup)
+		}
+		return nil, operationErr
+	}
+	if releaseErr == nil {
+		return store, nil
+	}
+	var closeErr error
+	if store != nil {
+		closeErr = store.Close()
+	}
+	categories := []error{errOpenWriterFailed, errStoreNamespaceLockCleanup}
+	if closeErr != nil {
+		categories = append(categories, errOpenWriterCleanup)
+	}
+	return nil, fmt.Errorf("create sqlite index store: %w", errors.Join(categories...))
 }
 
 func openExistingWriterStore(
@@ -192,19 +251,27 @@ func openExistingWriterStore(
 	return newWriterStore(db, storeIdentity), nil
 }
 
-func createFreshWriterStore(directory, databasePath string, hooks storeOpenHooks) (*Store, error) {
+func createFreshWriterStore(
+	directory, databasePath string,
+	namespaceLock *storeNamespaceLock,
+	hooks storeOpenHooks,
+) (*Store, error) {
 	operations := resolvedStoreFileOperations(hooks.fileOperations)
-	identity, err := newStoreIdentity()
-	if err != nil {
-		return nil, fmt.Errorf("create sqlite index store: %w", storeCreationFailure())
-	}
-	staging, stagingErr := createPrivateStagingDatabase(directory, hooks.createStagingFile)
-	artifacts := creatorArtifacts{stagingPath: staging.path}
+	artifacts := creatorArtifacts{}
 	fail := func(additionalCleanupErrs ...error) (*Store, error) {
-		cleanupErr := cleanupCreatorArtifacts(directory, artifacts, operations)
+		cleanupErr := cleanupCreatorArtifacts(directory, artifacts, operations, namespaceLock)
+		releaseErr := namespaceLock.release()
 		additionalCleanupErrs = append(additionalCleanupErrs, cleanupErr)
+		additionalCleanupErrs = append(additionalCleanupErrs, releaseErr)
 		return nil, fmt.Errorf("create sqlite index store: %w", storeCreationFailure(additionalCleanupErrs...))
 	}
+	identity, err := newStoreIdentity()
+	if err != nil {
+		return fail()
+	}
+	staging, stagingErr := createPrivateStagingDatabase(directory, hooks.createStagingFile)
+	artifacts.stagingPath = staging.path
+	artifacts.stagingInfo = staging.info
 	if stagingErr != nil || !staging.owned || staging.info == nil {
 		return fail(staging.cleanupErr)
 	}
@@ -227,7 +294,13 @@ func createFreshWriterStore(directory, databasePath string, hooks storeOpenHooks
 	if err := stagingWriter.Close(); err != nil {
 		return fail(err)
 	}
-	if cleanupErr := cleanupSQLiteSidecars(staging.path, directory, operations); cleanupErr != nil {
+	if cleanupErr := cleanupSQLiteSidecars(
+		staging.path,
+		directory,
+		staging.info,
+		operations,
+		namespaceLock,
+	); cleanupErr != nil {
 		return fail(cleanupErr)
 	}
 	afterInitializationInfo, err := secureDatabaseInfo(staging.path)
@@ -239,26 +312,41 @@ func createFreshWriterStore(directory, databasePath string, hooks storeOpenHooks
 			return fail()
 		}
 	}
-	publication, publicationErr := publishStoreFileExclusive(staging.path, databasePath, directory, operations)
+	publication, publicationErr := publishStoreFileExclusive(
+		staging.path,
+		databasePath,
+		directory,
+		operations,
+		nil,
+	)
 	if publicationErr != nil {
-		if publication.published {
+		if publication.targetCreated {
 			artifacts.databasePath = databasePath
 			artifacts.databaseInfo = staging.info
-			artifacts.databasePublished = true
+			artifacts.databaseTargetCreated = true
 		}
-		cleanupErr := cleanupCreatorArtifacts(directory, artifacts, operations)
+		cleanupErr := cleanupCreatorArtifacts(directory, artifacts, operations, namespaceLock)
 		if errors.Is(publicationErr, errStorePublicationCollision) && publication.cleanupErr == nil && cleanupErr == nil {
 			collisionInfo, err := os.Lstat(databasePath)
 			if err != nil {
-				return nil, fmt.Errorf("create sqlite index store: %w", storeCreationFailure())
+				releaseErr := namespaceLock.release()
+				return nil, fmt.Errorf("create sqlite index store: %w", storeCreationFailure(releaseErr))
 			}
-			return openExistingWriterStore(directory, databasePath, collisionInfo, hooks)
+			store, openErr := openExistingWriterStore(directory, databasePath, collisionInfo, hooks)
+			return finishWriterOpenWithNamespaceLock(store, openErr, namespaceLock)
 		}
-		return nil, fmt.Errorf("create sqlite index store: %w", storeCreationFailure(publication.cleanupErr, cleanupErr))
+		releaseErr := namespaceLock.release()
+		return nil, fmt.Errorf(
+			"create sqlite index store: %w",
+			storeCreationFailure(publication.cleanupErr, cleanupErr, releaseErr),
+		)
+	}
+	if !publication.targetVisible || !publication.targetCreated || !publication.durable {
+		return fail()
 	}
 	artifacts.databasePath = databasePath
 	artifacts.databaseInfo = staging.info
-	artifacts.databasePublished = true
+	artifacts.databaseTargetCreated = true
 	publishedInfo, err := secureDatabaseInfo(databasePath)
 	if err != nil || !os.SameFile(staging.info, publishedInfo) {
 		return fail()
@@ -275,14 +363,36 @@ func createFreshWriterStore(directory, databasePath string, hooks storeOpenHooks
 		directory,
 		identity,
 		hooks.beforeIdentitySidecarPublish,
+		func(string) error {
+			return namespaceLock.release()
+		},
 		operations,
 	)
 	if err != nil {
 		closeErr := db.Close()
-		artifacts.sidecarInfo = sidecarPublication.fileInfo
-		artifacts.sidecarPublished = sidecarPublication.published
 		artifacts.sidecarTemporary = sidecarPublication.temporaryPath
+		artifacts.sidecarTemporaryInfo = sidecarPublication.temporaryInfo
+		if sidecarPublication.targetVisible {
+			releaseErr := namespaceLock.release()
+			return nil, fmt.Errorf(
+				"create sqlite index store: %w",
+				storeReadinessFailure(
+					sidecarPublication.durable,
+					sidecarPublication.cleanupErr,
+					closeErr,
+					releaseErr,
+				),
+			)
+		}
 		return fail(sidecarPublication.cleanupErr, closeErr)
+	}
+	if namespaceLock.isHeld() {
+		closeErr := db.Close()
+		releaseErr := namespaceLock.release()
+		return nil, fmt.Errorf(
+			"create sqlite index store: %w",
+			storeReadinessFailure(true, closeErr, releaseErr),
+		)
 	}
 	return store, nil
 }
@@ -299,7 +409,9 @@ func newWriterStore(db *sql.DB, identity string) *Store {
 }
 
 // OpenExisting opens a previously initialized SQLite store without creating or
-// changing the requested directory or database when either is absent.
+// changing the requested directory or database when either is absent. Stores
+// without the stable namespace lock are rejected for reindexing rather than
+// silently admitted outside the cooperating-process serialization protocol.
 func OpenExisting(directory string) (*Store, error) {
 	return openExisting(directory, openExistingHooks{})
 }
@@ -309,7 +421,7 @@ type openExistingHooks struct {
 	afterOperationalConnection  func(string) error
 }
 
-func openExisting(directory string, hooks openExistingHooks) (*Store, error) {
+func openExisting(directory string, hooks openExistingHooks) (returnedStore *Store, returnedErr error) {
 	if strings.TrimSpace(directory) == "" {
 		return nil, fmt.Errorf("open existing sqlite index store: directory is empty")
 	}
@@ -344,6 +456,34 @@ func openExisting(directory string, hooks openExistingHooks) (*Store, error) {
 	}
 	if err := validateDatabaseFile(beforeInfo, true); err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: %w", err)
+	}
+	namespaceLock, err := acquireStoreNamespaceLock(canonical, false)
+	if err != nil {
+		return nil, formatStoreIdentityError("open existing sqlite index store")
+	}
+	defer func() {
+		if !namespaceLock.isHeld() {
+			return
+		}
+		if releaseErr := namespaceLock.release(); releaseErr != nil {
+			var closeErr error
+			if returnedStore != nil {
+				closeErr = returnedStore.Close()
+				returnedStore = nil
+			}
+			if returnedErr != nil {
+				returnedErr = errors.Join(returnedErr, errOpenExistingCleanup)
+				return
+			}
+			returnedErr = fmt.Errorf(
+				"open existing sqlite index store: %w",
+				openExistingFailure(nil, releaseErr, closeErr),
+			)
+		}
+	}()
+	beforeInfo, err = os.Lstat(databasePath)
+	if err != nil || validateDatabaseFile(beforeInfo, true) != nil {
+		return nil, formatStoreIdentityError("open existing sqlite index store")
 	}
 	storeIdentity, err := readStoreIdentitySidecar(canonical)
 	if err != nil {

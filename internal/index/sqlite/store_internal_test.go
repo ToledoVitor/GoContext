@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ToledoVitor/GoContext/internal/index"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
@@ -545,18 +546,20 @@ func TestMatchingIdentitySidecarPublicationCollisionNeverReportsReady(t *testing
 		_ = store.Close()
 		t.Fatal("newStore(matching sidecar collision) returned store, want nil")
 	}
-	if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreCreationFailed) {
-		t.Fatalf("newStore(matching sidecar collision) error = %v, want creation failure", err)
+	if errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreReadinessIndeterminate) {
+		t.Fatalf("newStore(matching sidecar collision) error = %v, want indeterminate readiness", err)
 	}
 	entries, readErr := internalDirectoryEntries(directory)
-	if readErr != nil || !reflect.DeepEqual(entries, []string{storeIdentitySidecar}) {
-		t.Fatalf("matching sidecar collision entries = %v, %v; want only pre-existing sidecar", entries, readErr)
+	wantEntries := []string{storeIdentitySidecar, databaseName}
+	if readErr != nil || !reflect.DeepEqual(entries, wantEntries) {
+		t.Fatalf("matching sidecar collision entries = %v, %v; want preserved pair %v", entries, readErr, wantEntries)
 	}
-	if _, statErr := os.Lstat(filepath.Join(directory, databaseName)); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("Lstat(database after sidecar collision) error = %v, want absent", statErr)
+	reopened, reopenErr := OpenExisting(directory)
+	if reopenErr != nil {
+		t.Fatalf("OpenExisting(matching sidecar collision) error = %v", reopenErr)
 	}
-	if err := os.Remove(filepath.Join(directory, storeIdentitySidecar)); err != nil {
-		t.Fatalf("Remove(pre-existing sidecar fixture) error = %v", err)
+	if closeErr := reopened.Close(); closeErr != nil {
+		t.Fatalf("Close(matching sidecar collision) error = %v", closeErr)
 	}
 }
 
@@ -659,6 +662,32 @@ type failingPrivateStagingFile struct {
 	closeErr error
 }
 
+type retargetingPrivateStagingFile struct {
+	*os.File
+	ownedPath         string
+	replacement       []byte
+	replacementSuffix []string
+}
+
+func (f *retargetingPrivateStagingFile) Close() error {
+	path := f.Name()
+	if err := f.File.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(path, f.ownedPath); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, f.replacement, 0o600); err != nil {
+		return err
+	}
+	for _, suffix := range f.replacementSuffix {
+		if err := os.WriteFile(path+suffix, f.replacement, 0o600); err != nil {
+			return err
+		}
+	}
+	return errors.New("PRIVATE_STAGING_RETARGET_CANARY")
+}
+
 func (f *failingPrivateStagingFile) Stat() (fs.FileInfo, error) {
 	if f.statErr != nil {
 		return nil, f.statErr
@@ -709,8 +738,8 @@ func TestFreshStagingStatAndCloseFailuresRetainCleanupOwnership(t *testing.T) {
 			if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreCreationFailed) {
 				t.Fatalf("newStore(staging failure) error = %v, want reindex creation failure", err)
 			}
-			if gotCleanup := errors.Is(err, errStoreCreationCleanup); gotCleanup != !test.statFails {
-				t.Fatalf("newStore(staging failure) cleanup category = %v, want %v", gotCleanup, !test.statFails)
+			if !errors.Is(err, errStoreCreationCleanup) {
+				t.Fatalf("newStore(staging failure) error = %v, want cleanup category without unproven pathname deletion", err)
 			}
 			if errorTreeContains(err, privateCanary.Error()) {
 				t.Fatalf("newStore(staging failure) error exposes %q", privateCanary)
@@ -719,10 +748,70 @@ func TestFreshStagingStatAndCloseFailuresRetainCleanupOwnership(t *testing.T) {
 				t.Fatal("staging factory did not create a path")
 			}
 			entries, readErr := internalDirectoryEntries(directory)
-			if readErr != nil || len(entries) != 0 {
-				t.Fatalf("staging failure entries = %v, %v; want empty", entries, readErr)
+			if readErr != nil {
+				t.Fatalf("ReadDir(staging failure) error = %v", readErr)
+			}
+			if test.statFails {
+				if !reflect.DeepEqual(entries, []string{filepath.Base(createdPath)}) {
+					t.Fatalf("staging stat failure entries = %v, want retained unproven staging path", entries)
+				}
+				if removeErr := os.Remove(createdPath); removeErr != nil {
+					t.Fatalf("Remove(retained staging fixture) error = %v", removeErr)
+				}
+			} else if len(entries) != 0 {
+				t.Fatalf("staging close failure entries = %v, want no data artifacts", entries)
 			}
 		})
+	}
+}
+
+func TestFreshStagingCleanupNeverRemovesRetargetedPathOrCompanions(t *testing.T) {
+	directory := t.TempDir()
+	ownedPath := filepath.Join(directory, ".owned-staging-fixture")
+	replacement := []byte("REPLACEMENT_STAGING_CANARY")
+	var stagingPath string
+	store, err := newStore(directory, storeOpenHooks{
+		createStagingFile: func(directory, pattern string) (privateStagingFile, error) {
+			file, err := os.CreateTemp(directory, pattern)
+			if err != nil {
+				return nil, err
+			}
+			stagingPath = file.Name()
+			return &retargetingPrivateStagingFile{
+				File:              file,
+				ownedPath:         ownedPath,
+				replacement:       replacement,
+				replacementSuffix: []string{"-wal", "-shm", "-journal"},
+			}, nil
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(retargeted staging) returned store, want nil")
+	}
+	if !errors.Is(err, errStoreCreationFailed) || !errors.Is(err, errStoreCreationCleanup) {
+		t.Fatalf("newStore(retargeted staging) error = %v, want creation and cleanup categories", err)
+	}
+	for _, path := range append([]string{stagingPath}, []string{
+		stagingPath + "-wal",
+		stagingPath + "-shm",
+		stagingPath + "-journal",
+	}...) {
+		payload, readErr := os.ReadFile(path)
+		if readErr != nil || !bytes.Equal(payload, replacement) {
+			t.Fatalf("ReadFile(retargeted %s) = %q, %v; want preserved replacement", filepath.Base(path), payload, readErr)
+		}
+	}
+	for _, path := range []string{
+		stagingPath,
+		stagingPath + "-wal",
+		stagingPath + "-shm",
+		stagingPath + "-journal",
+		ownedPath,
+	} {
+		if removeErr := os.Remove(path); removeErr != nil {
+			t.Fatalf("Remove(retargeted staging fixture %s) error = %v", filepath.Base(path), removeErr)
+		}
 	}
 }
 
@@ -866,6 +955,164 @@ func TestConcurrentNewStoreCreatesExactlyOneStoreIdentity(t *testing.T) {
 	}
 }
 
+func TestConcurrentNewStoreSerializesThePrivateStagingNamespace(t *testing.T) {
+	directory := t.TempDir()
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstStagingInfo fs.FileInfo
+	var firstStagingInfoErr error
+	firstResult := make(chan error, 1)
+	go func() {
+		store, err := newStore(directory, storeOpenHooks{
+			beforeFreshIdentityInsert: func(path string) error {
+				firstStagingInfo, firstStagingInfoErr = secureDatabaseInfo(path)
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			},
+		})
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		firstResult <- err
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		store, err := newStore(directory, storeOpenHooks{
+			beforeFreshIdentityInsert: func(string) error {
+				close(secondEntered)
+				<-releaseSecond
+				return nil
+			},
+		})
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		secondResult <- err
+	}()
+
+	select {
+	case <-secondEntered:
+		close(releaseSecond)
+		close(releaseFirst)
+		<-firstResult
+		<-secondResult
+		t.Fatal("second creator entered the private staging namespace while first creator was active")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first newStore() error = %v", err)
+	}
+	if firstStagingInfoErr != nil || firstStagingInfo == nil {
+		t.Fatalf("secureDatabaseInfo(first staging) = (%v, %v), want exact inode", firstStagingInfo, firstStagingInfoErr)
+	}
+	select {
+	case <-secondEntered:
+		close(releaseSecond)
+		t.Fatal("second creator initialized a staging database after the first store became ready")
+	case err := <-secondResult:
+		if err != nil {
+			t.Fatalf("second newStore() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second newStore() remained blocked after first creator completed")
+	}
+	finalInfo, err := secureDatabaseInfo(filepath.Join(directory, databaseName))
+	if err != nil || !os.SameFile(firstStagingInfo, finalInfo) {
+		t.Fatalf("final database info = (%v, %v), want originally initialized staging inode", finalInfo, err)
+	}
+}
+
+func TestStoreNamespaceLockIsStablePrivateSerializationArtifact(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	lockPath := filepath.Join(directory, storeNamespaceLockName)
+	beforeInfo, err := os.Lstat(lockPath)
+	if err != nil || validateStoreNamespaceLockInfo(beforeInfo) != nil {
+		t.Fatalf("Lstat(namespace lock) = (%v, %v), want private zero-length regular lock", beforeInfo, err)
+	}
+	reopened, err := OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting() error = %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close(reopened) error = %v", err)
+	}
+	afterInfo, err := os.Lstat(lockPath)
+	if err != nil || !os.SameFile(beforeInfo, afterInfo) {
+		t.Fatalf("namespace lock identity changed across reopen: before=%v after=%v error=%v", beforeInfo, afterInfo, err)
+	}
+}
+
+func TestReadyStoreWithoutStableNamespaceLockIsRejectedWithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore(fixture) error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(fixture) error = %v", err)
+	}
+	if err := os.Remove(filepath.Join(directory, storeNamespaceLockName)); err != nil {
+		t.Fatalf("Remove(namespace lock fixture) error = %v", err)
+	}
+	databasePath := filepath.Join(directory, databaseName)
+	sidecarPath := filepath.Join(directory, storeIdentitySidecar)
+	beforeDatabase, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(database before) error = %v", err)
+	}
+	beforeSidecar, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadFile(sidecar before) error = %v", err)
+	}
+	beforeEntries, err := internalDirectoryEntries(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(before) error = %v", err)
+	}
+	for name, open := range map[string]func() (*Store, error){
+		"OpenExisting": func() (*Store, error) { return OpenExisting(directory) },
+		"NewStore":     func() (*Store, error) { return NewStore(directory) },
+	} {
+		opened, openErr := open()
+		if opened != nil {
+			_ = opened.Close()
+			t.Fatalf("%s(missing namespace lock) returned store, want nil", name)
+		}
+		if !errors.Is(openErr, index.ErrReindexRequired) {
+			t.Fatalf("%s(missing namespace lock) error = %v, want ErrReindexRequired", name, openErr)
+		}
+	}
+	afterDatabase, databaseErr := os.ReadFile(databasePath)
+	afterSidecar, sidecarErr := os.ReadFile(sidecarPath)
+	afterEntries, entriesErr := internalDirectoryEntries(directory)
+	if databaseErr != nil || sidecarErr != nil || entriesErr != nil ||
+		!bytes.Equal(afterDatabase, beforeDatabase) || !bytes.Equal(afterSidecar, beforeSidecar) ||
+		!reflect.DeepEqual(afterEntries, beforeEntries) {
+		t.Fatalf(
+			"missing-lock rejection mutated store: database=%v sidecar=%v entries=%v wantEntries=%v errors=(%v,%v,%v)",
+			bytes.Equal(afterDatabase, beforeDatabase),
+			bytes.Equal(afterSidecar, beforeSidecar),
+			afterEntries,
+			beforeEntries,
+			databaseErr,
+			sidecarErr,
+			entriesErr,
+		)
+	}
+}
+
 func TestNewStoreRejectsMultipleReservedIdentitiesWithoutMutation(t *testing.T) {
 	directory := t.TempDir()
 	store, err := NewStore(directory)
@@ -926,9 +1173,12 @@ func internalDirectoryEntries(directory string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, len(entries))
-	for index, entry := range entries {
-		names[index] = entry.Name()
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Name() == storeNamespaceLockName {
+			continue
+		}
+		names = append(names, entry.Name())
 	}
 	return names, nil
 }

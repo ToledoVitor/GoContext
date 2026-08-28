@@ -10,9 +10,12 @@ import (
 )
 
 var (
-	errStoreCreationFailed       = errors.New("sqlite store creation failed")
-	errStoreCreationCleanup      = errors.New("sqlite store creation cleanup failed")
-	errStorePublicationCollision = errors.New("sqlite store publication collision")
+	errStoreCreationFailed         = errors.New("sqlite store creation failed")
+	errStoreCreationCleanup        = errors.New("sqlite store creation cleanup failed")
+	errStorePublicationCollision   = errors.New("sqlite store publication collision")
+	errStoreReadinessCommitted     = errors.New("sqlite store readiness was committed with maintenance failure")
+	errStoreReadinessIndeterminate = errors.New("sqlite store readiness durability is indeterminate")
+	errStoreReadinessCleanup       = errors.New("sqlite store readiness local cleanup failed")
 )
 
 type privateStagingFile interface {
@@ -88,23 +91,34 @@ func createPrivateStagingDatabase(
 }
 
 type storePublicationResult struct {
-	published     bool
-	cleanupErr    error
-	fileInfo      fs.FileInfo
-	temporaryPath string
+	targetVisible    bool
+	targetCreated    bool
+	durable          bool
+	temporaryRemoved bool
+	cleanupErr       error
+	temporaryInfo    fs.FileInfo
+	temporaryPath    string
 }
 
 type creatorArtifacts struct {
-	stagingPath       string
-	databasePath      string
-	databaseInfo      fs.FileInfo
-	databasePublished bool
-	sidecarInfo       fs.FileInfo
-	sidecarPublished  bool
-	sidecarTemporary  string
+	stagingPath           string
+	stagingInfo           fs.FileInfo
+	databasePath          string
+	databaseInfo          fs.FileInfo
+	databaseTargetCreated bool
+	sidecarTemporary      string
+	sidecarTemporaryInfo  fs.FileInfo
 }
 
-func cleanupCreatorArtifacts(directory string, artifacts creatorArtifacts, operations storeFileOperations) error {
+func cleanupCreatorArtifacts(
+	directory string,
+	artifacts creatorArtifacts,
+	operations storeFileOperations,
+	namespaceLock *storeNamespaceLock,
+) error {
+	if !namespaceLock.isHeld() {
+		return errStoreNamespaceLockCleanup
+	}
 	var cleanupErrs []error
 	remove := func(path string) {
 		if path == "" {
@@ -116,12 +130,21 @@ func cleanupCreatorArtifacts(directory string, artifacts creatorArtifacts, opera
 	}
 
 	if artifacts.stagingPath != "" {
-		remove(artifacts.stagingPath + "-wal")
-		remove(artifacts.stagingPath + "-shm")
-		remove(artifacts.stagingPath + "-journal")
-		remove(artifacts.stagingPath)
+		currentInfo, err := os.Lstat(artifacts.stagingPath)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			cleanupErrs = append(cleanupErrs, err)
+		case artifacts.stagingInfo == nil || !os.SameFile(artifacts.stagingInfo, currentInfo):
+			cleanupErrs = append(cleanupErrs, errors.New("staging database ownership changed"))
+		default:
+			remove(artifacts.stagingPath + "-wal")
+			remove(artifacts.stagingPath + "-shm")
+			remove(artifacts.stagingPath + "-journal")
+			remove(artifacts.stagingPath)
+		}
 	}
-	if artifacts.databasePublished {
+	if artifacts.databaseTargetCreated {
 		currentInfo, err := os.Lstat(artifacts.databasePath)
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
@@ -139,21 +162,17 @@ func cleanupCreatorArtifacts(directory string, artifacts creatorArtifacts, opera
 			remove(artifacts.databasePath)
 		}
 	}
-	if artifacts.sidecarPublished {
-		sidecarPath := filepath.Join(directory, storeIdentitySidecar)
-		currentInfo, err := os.Lstat(sidecarPath)
+	if artifacts.sidecarTemporary != "" {
+		currentInfo, err := os.Lstat(artifacts.sidecarTemporary)
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 		case err != nil:
 			cleanupErrs = append(cleanupErrs, err)
-		case artifacts.sidecarInfo == nil || !os.SameFile(artifacts.sidecarInfo, currentInfo):
-			cleanupErrs = append(cleanupErrs, errors.New("published sidecar ownership changed"))
+		case artifacts.sidecarTemporaryInfo == nil || !os.SameFile(artifacts.sidecarTemporaryInfo, currentInfo):
+			cleanupErrs = append(cleanupErrs, errors.New("identity temporary ownership changed"))
 		default:
-			remove(sidecarPath)
+			remove(artifacts.sidecarTemporary)
 		}
-	}
-	if artifacts.sidecarTemporary != "" {
-		remove(artifacts.sidecarTemporary)
 	}
 	if err := operations.syncDirectory(directory); err != nil {
 		cleanupErrs = append(cleanupErrs, err)
@@ -172,16 +191,58 @@ func storeCreationFailure(cleanupErrs ...error) error {
 	return errors.Join(categories...)
 }
 
-func removeTemporaryStoreFile(path, directory string, operations storeFileOperations) error {
-	removeErr := operations.remove(path)
-	if errors.Is(removeErr, fs.ErrNotExist) {
-		removeErr = nil
+func storeReadinessFailure(durable bool, cleanupErrs ...error) error {
+	var categories []error
+	if durable {
+		categories = append(categories, errStoreReadinessCommitted)
+	} else {
+		categories = append(categories, errStoreReadinessIndeterminate)
+	}
+	for _, cleanupErr := range cleanupErrs {
+		if cleanupErr != nil {
+			categories = append(categories, errStoreReadinessCleanup)
+			break
+		}
+	}
+	return errors.Join(categories...)
+}
+
+func removeOwnedTemporaryStoreFile(
+	path, directory string,
+	expectedInfo fs.FileInfo,
+	operations storeFileOperations,
+) error {
+	currentInfo, statErr := os.Lstat(path)
+	var removeErr error
+	switch {
+	case errors.Is(statErr, fs.ErrNotExist):
+	case statErr != nil:
+		removeErr = statErr
+	case expectedInfo == nil || !os.SameFile(expectedInfo, currentInfo):
+		removeErr = errors.New("temporary store file ownership changed")
+	default:
+		removeErr = operations.remove(path)
+		if errors.Is(removeErr, fs.ErrNotExist) {
+			removeErr = nil
+		}
 	}
 	syncErr := operations.syncDirectory(directory)
 	return errors.Join(removeErr, syncErr)
 }
 
-func cleanupSQLiteSidecars(databasePath, directory string, operations storeFileOperations) error {
+func cleanupSQLiteSidecars(
+	databasePath, directory string,
+	expectedInfo fs.FileInfo,
+	operations storeFileOperations,
+	namespaceLock *storeNamespaceLock,
+) error {
+	if !namespaceLock.isHeld() {
+		return errStoreNamespaceLockCleanup
+	}
+	currentInfo, err := os.Lstat(databasePath)
+	if err != nil || expectedInfo == nil || !os.SameFile(expectedInfo, currentInfo) {
+		return errors.New("sqlite sidecar ownership is unproven")
+	}
 	var cleanupErrs []error
 	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		if err := operations.remove(databasePath + suffix); err != nil && !errors.Is(err, fs.ErrNotExist) {

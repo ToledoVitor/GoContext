@@ -34,8 +34,9 @@ func TestStorePublicationMovesFileWithoutReplacingReadyTarget(t *testing.T) {
 		target,
 		directory,
 		defaultStoreFileOperations(),
+		nil,
 	)
-	if err != nil || !result.published {
+	if err != nil || !result.targetVisible || !result.targetCreated || !result.durable || !result.temporaryRemoved {
 		t.Fatalf("publishStoreFileExclusive(first) = (%+v, %v), want published", result, err)
 	}
 	if _, err := os.Lstat(firstTemporary); !errors.Is(err, os.ErrNotExist) {
@@ -51,9 +52,10 @@ func TestStorePublicationMovesFileWithoutReplacingReadyTarget(t *testing.T) {
 		target,
 		directory,
 		defaultStoreFileOperations(),
+		nil,
 	)
-	if !errors.Is(err, errStorePublicationCollision) || result.published {
-		t.Fatalf("publishStoreFileExclusive(second) = (%+v, %v), want unpublished collision", result, err)
+	if !errors.Is(err, errStorePublicationCollision) || !result.targetVisible || result.targetCreated || result.durable || result.temporaryRemoved {
+		t.Fatalf("publishStoreFileExclusive(second) = (%+v, %v), want visible uncreated collision", result, err)
 	}
 	if _, err := os.Lstat(secondTemporary); err != nil {
 		t.Fatalf("Lstat(second staging) error = %v, want retained for caller cleanup", err)
