@@ -104,7 +104,7 @@ pergunta → busca híbrida → contexto citado → guardrails → resposta
                                              CLI / MCP read-only
 ```
 
-Detalhes e decisões: [arquitetura](docs/architecture.md), [stack](docs/decisions/0001-stack.md) e [roadmap](docs/roadmap.md).
+Detalhes e decisões: [arquitetura](docs/architecture.md), [stack](docs/decisions/0001-stack.md), [embeddings e busca vetorial](docs/decisions/0002-embeddings-vector-search.md), [plano de implementação](docs/plans/2026-08-27-provider-agnostic-embeddings-vector-search.md), [validação profissional local](docs/plans/2026-08-27-tivita-professional-repository-validation.md) e [roadmap](docs/roadmap.md).
 
 ## Fora do escopo do MVP
 
