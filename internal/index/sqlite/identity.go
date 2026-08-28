@@ -65,7 +65,7 @@ func initializeFreshDatabaseIdentity(
 	connection *sql.Conn,
 	identity string,
 	beforeIdentityInsert func() error,
-) error {
+) (returnedErr error) {
 	if !validStoreIdentity(identity) {
 		return invalidStoreIdentity()
 	}
@@ -75,7 +75,9 @@ func initializeFreshDatabaseIdentity(
 	transactionOpen := true
 	defer func() {
 		if transactionOpen {
-			_, _ = connection.ExecContext(context.Background(), `ROLLBACK`)
+			if _, rollbackErr := connection.ExecContext(context.Background(), `ROLLBACK`); rollbackErr != nil {
+				returnedErr = errors.Join(returnedErr, errOpenWriterCleanup)
+			}
 		}
 	}()
 
@@ -205,52 +207,58 @@ func validatePrivateRegularFile(info fs.FileInfo) error {
 	return nil
 }
 
-func createStoreIdentitySidecar(directory, identity string, beforePublish func(string) error) error {
+func createStoreIdentitySidecar(
+	directory, identity string,
+	beforePublish func(string) error,
+	operations storeFileOperations,
+) (storePublicationResult, error) {
 	payload, err := json.Marshal(storeIdentityDocument{Version: storeIdentityVersion, StoreID: identity})
 	if err != nil {
-		return invalidStoreIdentity()
+		return storePublicationResult{}, invalidStoreIdentity()
 	}
 	temporary, err := os.CreateTemp(directory, ".index-v2.identity.*.tmp")
 	if err != nil {
-		return invalidStoreIdentity()
+		return storePublicationResult{}, invalidStoreIdentity()
 	}
 	temporaryPath := temporary.Name()
-	keepTemporary := true
-	defer func() {
-		if keepTemporary {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
+	fail := func(operationErr error, cleanupErrs ...error) (storePublicationResult, error) {
+		cleanupErrs = append(cleanupErrs, removeTemporaryStoreFile(temporaryPath, directory, operations))
+		return storePublicationResult{
+			cleanupErr:    errors.Join(cleanupErrs...),
+			temporaryPath: temporaryPath,
+		}, operationErr
+	}
 	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return invalidStoreIdentity()
+		return fail(invalidStoreIdentity(), temporary.Close())
 	}
 	if _, err := temporary.Write(payload); err != nil {
-		_ = temporary.Close()
-		return invalidStoreIdentity()
+		return fail(invalidStoreIdentity(), temporary.Close())
 	}
 	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return invalidStoreIdentity()
+		return fail(invalidStoreIdentity(), temporary.Close())
+	}
+	temporaryInfo, err := temporary.Stat()
+	if err != nil {
+		return fail(invalidStoreIdentity(), temporary.Close())
 	}
 	if err := temporary.Close(); err != nil {
-		return invalidStoreIdentity()
+		return fail(invalidStoreIdentity())
 	}
 	target := filepath.Join(directory, storeIdentitySidecar)
 	if beforePublish != nil {
 		if err := beforePublish(target); err != nil {
-			return invalidStoreIdentity()
+			return fail(invalidStoreIdentity())
 		}
 	}
-	if err := publishStoreIdentitySidecar(temporaryPath, target, directory); err != nil {
-		existing, readErr := readStoreIdentitySidecar(directory)
-		if readErr == nil && existing == identity {
-			return nil
-		}
-		return invalidStoreIdentity()
+	result, err := publishStoreFileExclusive(temporaryPath, target, directory, operations)
+	result.fileInfo = temporaryInfo
+	result.temporaryPath = temporaryPath
+	if err != nil {
+		temporaryCleanupErr := removeTemporaryStoreFile(temporaryPath, directory, operations)
+		result.cleanupErr = errors.Join(result.cleanupErr, temporaryCleanupErr)
+		return result, invalidStoreIdentity()
 	}
-	keepTemporary = false
-	return nil
+	return result, nil
 }
 
 func formatStoreIdentityError(operation string) error {

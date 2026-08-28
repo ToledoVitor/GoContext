@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,6 +35,17 @@ func initializeNewDatabase(path string) error {
 		return err
 	}
 	return database.Close()
+}
+
+func createPrivateDatabaseFile(path string) (bool, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, file.Close()
 }
 
 func TestPreExistingIdentityLessStoreRequiresReindexWithoutMutation(t *testing.T) {
@@ -356,6 +368,7 @@ func TestNewStoreValidatesExclusiveCreateCollisionBeforeMutableOpen(t *testing.T
 						return err
 					}
 					beforeEntries, err = internalDirectoryEntries(directory)
+					beforeEntries = removeInternalStagingEntries(beforeEntries)
 					return err
 				},
 			})
@@ -390,6 +403,53 @@ func TestNewStoreValidatesExclusiveCreateCollisionBeforeMutableOpen(t *testing.T
 	}
 }
 
+func TestNewStoreDiscardsStagingAndAdoptsOnlyFullyReadyCollision(t *testing.T) {
+	preparedDirectory, preparedDatabase := internalIdentityStore(t, "prepared-repository", "prepared-generation")
+	preparedSidecar := filepath.Join(preparedDirectory, storeIdentitySidecar)
+	directory := t.TempDir()
+	store, err := newStore(directory, storeOpenHooks{
+		beforeCreateDatabase: func(databasePath string) error {
+			if err := os.Rename(preparedDatabase, databasePath); err != nil {
+				return err
+			}
+			return os.Rename(preparedSidecar, filepath.Join(filepath.Dir(databasePath), storeIdentitySidecar))
+		},
+	})
+	if err != nil {
+		t.Fatalf("newStore(fully ready collision) error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(adopted collision) error = %v", err)
+	}
+	entries, err := internalDirectoryEntries(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(adopted collision) error = %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry, ".index-v2.sqlite3.") {
+			t.Fatalf("adopted collision retained staging artifact %q", entry)
+		}
+	}
+	reopened, err := OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting(adopted collision) error = %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close(reopened collision) error = %v", err)
+	}
+}
+
+func removeInternalStagingEntries(entries []string) []string {
+	filtered := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.HasPrefix(entry, ".index-v2.sqlite3.") && strings.HasSuffix(entry, ".staging") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 func TestFreshStoreIdentityPublicationFailureRemovesCreatedArtifacts(t *testing.T) {
 	directory := t.TempDir()
 	privateCanary := errors.New("PRIVATE_IDENTITY_PUBLICATION_CANARY")
@@ -417,11 +477,157 @@ func TestFreshStoreIdentityPublicationFailureRemovesCreatedArtifacts(t *testing.
 	}
 }
 
+func TestFreshStoreIdentityPublicationFailureRetriesTemporaryCleanup(t *testing.T) {
+	directory := t.TempDir()
+	privateOperationCanary := errors.New("PRIVATE_IDENTITY_PUBLICATION_CANARY")
+	privateCleanupCanary := errors.New("PRIVATE_IDENTITY_TEMP_CLEANUP_CANARY")
+	temporaryRemoveCalls := 0
+	store, err := newStore(directory, storeOpenHooks{
+		beforeIdentitySidecarPublish: func(string) error {
+			return privateOperationCanary
+		},
+		fileOperations: &storeFileOperations{
+			remove: func(path string) error {
+				base := filepath.Base(path)
+				if strings.HasPrefix(base, ".index-v2.identity.") && strings.HasSuffix(base, ".tmp") {
+					temporaryRemoveCalls++
+					if temporaryRemoveCalls == 1 {
+						return privateCleanupCanary
+					}
+				}
+				return os.Remove(path)
+			},
+			syncDirectory: syncStoreDirectory,
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(identity temp cleanup retry) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreCreationFailed) || !errors.Is(err, errStoreCreationCleanup) {
+		t.Fatalf("newStore(identity temp cleanup retry) error = %v, want reindex, creation, and cleanup categories", err)
+	}
+	for _, canary := range []string{privateOperationCanary.Error(), privateCleanupCanary.Error()} {
+		if errorTreeContains(err, canary) {
+			t.Fatalf("newStore(identity temp cleanup retry) error exposes %q", canary)
+		}
+	}
+	if temporaryRemoveCalls != 2 {
+		t.Fatalf("identity temporary remove calls = %d, want 2", temporaryRemoveCalls)
+	}
+	entries, readErr := internalDirectoryEntries(directory)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("identity temp cleanup retry entries = %v, %v; want empty", entries, readErr)
+	}
+}
+
+func TestMatchingIdentitySidecarPublicationCollisionNeverReportsReady(t *testing.T) {
+	directory := t.TempDir()
+	store, err := newStore(directory, storeOpenHooks{
+		beforeIdentitySidecarPublish: func(sidecarPath string) error {
+			database, err := sql.Open("sqlite", inspectionDataSourceName(filepath.Join(directory, databaseName)))
+			if err != nil {
+				return err
+			}
+			identities, identityErr := loadDatabaseIdentities(context.Background(), database)
+			closeErr := database.Close()
+			if identityErr != nil || closeErr != nil || len(identities) != 1 {
+				return errors.New("read published database identity")
+			}
+			payload, err := json.Marshal(storeIdentityDocument{Version: storeIdentityVersion, StoreID: identities[0]})
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(sidecarPath, payload, 0o600)
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(matching sidecar collision) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreCreationFailed) {
+		t.Fatalf("newStore(matching sidecar collision) error = %v, want creation failure", err)
+	}
+	entries, readErr := internalDirectoryEntries(directory)
+	if readErr != nil || !reflect.DeepEqual(entries, []string{storeIdentitySidecar}) {
+		t.Fatalf("matching sidecar collision entries = %v, %v; want only pre-existing sidecar", entries, readErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(directory, databaseName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("Lstat(database after sidecar collision) error = %v, want absent", statErr)
+	}
+	if err := os.Remove(filepath.Join(directory, storeIdentitySidecar)); err != nil {
+		t.Fatalf("Remove(pre-existing sidecar fixture) error = %v", err)
+	}
+}
+
+func TestFreshStorePublishesSidecarOnlyAfterFinalWriterIsReady(t *testing.T) {
+	directory := t.TempDir()
+	hookCalled := false
+	var readinessErr error
+	store, err := newStore(directory, storeOpenHooks{
+		beforeIdentitySidecarPublish: func(sidecarPath string) error {
+			check := func(err error) error {
+				readinessErr = err
+				return err
+			}
+			hookCalled = true
+			if _, err := os.Lstat(sidecarPath); !errors.Is(err, os.ErrNotExist) {
+				return check(errors.New("identity sidecar was visible before readiness publication"))
+			}
+			databasePath := filepath.Join(directory, databaseName)
+			info, err := secureDatabaseInfo(databasePath)
+			if err != nil || !info.Mode().IsRegular() {
+				return check(errors.New("final database was not privately published before sidecar"))
+			}
+			database, err := sql.Open("sqlite", writerDataSourceName(databasePath))
+			if err != nil {
+				return check(err)
+			}
+			defer database.Close()
+			if err := validateSchema(context.Background(), database); err != nil {
+				return check(err)
+			}
+			identities, err := loadDatabaseIdentities(context.Background(), database)
+			if err != nil || len(identities) != 1 {
+				return check(errors.New("final database identity was not ready"))
+			}
+			var journalMode string
+			if err := database.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+				return check(err)
+			}
+			if !strings.EqualFold(journalMode, "wal") {
+				return check(errors.New("final writer prerequisites were not ready"))
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("newStore() error = %v; readiness check = %v", err, readinessErr)
+	}
+	if !hookCalled {
+		t.Fatal("sidecar readiness hook was not called")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(directory, storeIdentitySidecar)); err != nil {
+		t.Fatalf("Lstat(final identity sidecar) error = %v", err)
+	}
+}
+
 func TestFreshStoreInitializationFailureRollsBackAndRemovesCreatedArtifacts(t *testing.T) {
 	directory := t.TempDir()
 	privateCanary := errors.New("PRIVATE_IDENTITY_INITIALIZATION_CANARY")
+	stagingPath := ""
 	store, err := newStore(directory, storeOpenHooks{
-		beforeFreshIdentityInsert: func(string) error {
+		beforeFreshIdentityInsert: func(path string) error {
+			stagingPath = path
+			if filepath.Base(path) == databaseName {
+				t.Fatal("fresh identity initialized at public database target, want private staging path")
+			}
+			if _, err := os.Lstat(filepath.Join(directory, databaseName)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("public database target exists during staging initialization: %v", err)
+			}
 			return privateCanary
 		},
 	})
@@ -441,6 +647,162 @@ func TestFreshStoreInitializationFailureRollsBackAndRemovesCreatedArtifacts(t *t
 	}
 	if len(entries) != 0 {
 		t.Fatalf("failed fresh initialization entries = %v, want no created artifacts", entries)
+	}
+	if stagingPath == "" {
+		t.Fatal("fresh initialization hook did not observe a staging path")
+	}
+}
+
+type failingPrivateStagingFile struct {
+	*os.File
+	statErr  error
+	closeErr error
+}
+
+func (f *failingPrivateStagingFile) Stat() (fs.FileInfo, error) {
+	if f.statErr != nil {
+		return nil, f.statErr
+	}
+	return f.File.Stat()
+}
+
+func (f *failingPrivateStagingFile) Close() error {
+	closeErr := f.File.Close()
+	if f.closeErr != nil {
+		return f.closeErr
+	}
+	return closeErr
+}
+
+func TestFreshStagingStatAndCloseFailuresRetainCleanupOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		statFails bool
+	}{
+		{name: "stat", statFails: true},
+		{name: "close"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			privateCanary := errors.New("PRIVATE_STAGING_" + strings.ToUpper(test.name) + "_CANARY")
+			createdPath := ""
+			store, err := newStore(directory, storeOpenHooks{
+				createStagingFile: func(directory, pattern string) (privateStagingFile, error) {
+					file, err := os.CreateTemp(directory, pattern)
+					if err != nil {
+						return nil, err
+					}
+					createdPath = file.Name()
+					wrapped := &failingPrivateStagingFile{File: file}
+					if test.statFails {
+						wrapped.statErr = privateCanary
+					} else {
+						wrapped.closeErr = privateCanary
+					}
+					return wrapped, nil
+				},
+			})
+			if store != nil {
+				_ = store.Close()
+				t.Fatal("newStore(staging failure) returned store, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreCreationFailed) {
+				t.Fatalf("newStore(staging failure) error = %v, want reindex creation failure", err)
+			}
+			if gotCleanup := errors.Is(err, errStoreCreationCleanup); gotCleanup != !test.statFails {
+				t.Fatalf("newStore(staging failure) cleanup category = %v, want %v", gotCleanup, !test.statFails)
+			}
+			if errorTreeContains(err, privateCanary.Error()) {
+				t.Fatalf("newStore(staging failure) error exposes %q", privateCanary)
+			}
+			if createdPath == "" {
+				t.Fatal("staging factory did not create a path")
+			}
+			entries, readErr := internalDirectoryEntries(directory)
+			if readErr != nil || len(entries) != 0 {
+				t.Fatalf("staging failure entries = %v, %v; want empty", entries, readErr)
+			}
+		})
+	}
+}
+
+func TestFreshStagingUsesCanonicalPrivateDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory symlink behavior is not portable on Windows")
+	}
+	root := t.TempDir()
+	realDirectory := filepath.Join(root, "real-store")
+	if err := os.Mkdir(realDirectory, 0o755); err != nil {
+		t.Fatalf("Mkdir(real store) error = %v", err)
+	}
+	linkedDirectory := filepath.Join(root, "linked-store")
+	if err := os.Symlink(realDirectory, linkedDirectory); err != nil {
+		t.Fatalf("Symlink(store) error = %v", err)
+	}
+	observedDirectory := ""
+	store, err := newStore(linkedDirectory, storeOpenHooks{
+		createStagingFile: func(directory, pattern string) (privateStagingFile, error) {
+			observedDirectory = directory
+			return os.CreateTemp(directory, pattern)
+		},
+	})
+	if err != nil {
+		t.Fatalf("newStore(canonical staging) error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(canonical staging) error = %v", err)
+	}
+	canonical, err := filepath.EvalSymlinks(linkedDirectory)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(linked store) error = %v", err)
+	}
+	if observedDirectory != canonical {
+		t.Fatalf("staging directory = %q, want canonical %q", observedDirectory, canonical)
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		t.Fatalf("Stat(canonical store) error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("canonical store mode = %#o, want 0700", got)
+	}
+}
+
+func TestFreshCreationCleanupFailureIsSanitizedAndJoined(t *testing.T) {
+	directory := t.TempDir()
+	privateOperationCanary := errors.New("PRIVATE_CREATION_OPERATION_CANARY")
+	privateCleanupCanary := errors.New("PRIVATE_CREATION_CLEANUP_CANARY")
+	store, err := newStore(directory, storeOpenHooks{
+		beforeFreshIdentityInsert: func(string) error {
+			return privateOperationCanary
+		},
+		fileOperations: &storeFileOperations{
+			remove: func(string) error { return privateCleanupCanary },
+			syncDirectory: func(string) error {
+				return nil
+			},
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(cleanup failure) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errStoreCreationFailed) || !errors.Is(err, errStoreCreationCleanup) {
+		t.Fatalf("newStore(cleanup failure) error = %v, want reindex, creation, and cleanup categories", err)
+	}
+	for _, canary := range []string{privateOperationCanary.Error(), privateCleanupCanary.Error()} {
+		if errorTreeContains(err, canary) {
+			t.Fatalf("newStore(cleanup failure) error exposes %q", canary)
+		}
+	}
+	entries, readErr := os.ReadDir(directory)
+	if readErr != nil {
+		t.Fatalf("ReadDir(cleanup failure) error = %v", readErr)
+	}
+	for _, entry := range entries {
+		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
+			t.Fatalf("Remove(test cleanup %s) error = %v", entry.Name(), err)
+		}
 	}
 }
 

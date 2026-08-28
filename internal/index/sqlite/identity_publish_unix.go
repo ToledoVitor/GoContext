@@ -2,22 +2,42 @@
 
 package sqlite
 
-import "os"
+import (
+	"errors"
+	"io/fs"
+	"os"
+)
 
 func publishStoreIdentitySidecar(temporary, target, directory string) error {
+	_, err := publishStoreFileExclusive(temporary, target, directory, defaultStoreFileOperations())
+	return err
+}
+
+func publishStoreFileExclusive(
+	temporary, target, directory string,
+	operations storeFileOperations,
+) (storePublicationResult, error) {
 	if err := os.Link(temporary, target); err != nil {
-		return err
+		if errors.Is(err, fs.ErrExist) {
+			return storePublicationResult{}, errStorePublicationCollision
+		}
+		return storePublicationResult{}, err
 	}
-	if err := os.Remove(temporary); err != nil {
-		_ = os.Remove(target)
-		return err
+	result := storePublicationResult{published: true}
+	if err := operations.remove(temporary); err != nil {
+		result.cleanupErr = err
+		return result, err
 	}
-	if err := syncStoreDirectory(directory); err != nil {
-		_ = os.Remove(target)
-		_ = syncStoreDirectory(directory)
-		return err
+	if err := operations.syncDirectory(directory); err != nil {
+		removeErr := operations.remove(target)
+		if errors.Is(removeErr, fs.ErrNotExist) {
+			removeErr = nil
+		}
+		retrySyncErr := operations.syncDirectory(directory)
+		result.cleanupErr = errors.Join(removeErr, retrySyncErr)
+		return result, err
 	}
-	return nil
+	return result, nil
 }
 
 func syncStoreDirectory(directory string) error {
