@@ -2,6 +2,7 @@ package localstore_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -187,6 +188,72 @@ func TestStoreRejectsCorpusWhosePolicyOrRevisionWasNotValidated(t *testing.T) {
 		if err := store.Replace(context.Background(), "repo", corpus); !errors.Is(err, localstore.ErrInvalidChunk) {
 			t.Errorf("Replace(%#v) error = %v, want ErrInvalidChunk", corpus, err)
 		}
+	}
+}
+
+func TestStoreLoadRejectsPersistedV2WithOldPolicyOrForgedRevision(t *testing.T) {
+	chunk := sampleChunk("persisted-canary", "persisted-canary.py", "PERSISTED_V2_CANARY = 1")
+	legacyCorpus, err := source.NewCorpus("scanner-v2", []source.Chunk{chunk})
+	if err != nil {
+		t.Fatalf("NewCorpus(old policy) error = %v", err)
+	}
+	currentCorpus := mustCorpus(t, []source.Chunk{chunk})
+	tests := []struct {
+		name          string
+		policyVersion string
+		revision      string
+	}{
+		{name: "old policy", policyVersion: legacyCorpus.PolicyVersion, revision: legacyCorpus.Revision},
+		{name: "forged revision", policyVersion: currentCorpus.PolicyVersion, revision: "forged-revision"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			store, err := localstore.NewStore(directory)
+			if err != nil {
+				t.Fatalf("NewStore() error = %v", err)
+			}
+			if err := store.Replace(context.Background(), "repo", mustCorpus(t, nil)); err != nil {
+				t.Fatalf("Replace() error = %v", err)
+			}
+			entries, err := os.ReadDir(directory)
+			if err != nil {
+				t.Fatalf("ReadDir() error = %v", err)
+			}
+			payload, err := json.Marshal(struct {
+				Version        int            `json:"version"`
+				RepositoryID   string         `json:"repository_id"`
+				PolicyVersion  string         `json:"policy_version"`
+				CorpusRevision string         `json:"corpus_revision"`
+				Chunks         []source.Chunk `json:"chunks"`
+			}{
+				Version:        2,
+				RepositoryID:   "repo",
+				PolicyVersion:  tt.policyVersion,
+				CorpusRevision: tt.revision,
+				Chunks:         []source.Chunk{chunk},
+			})
+			if err != nil {
+				t.Fatalf("Marshal(v2 snapshot) error = %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, entries[0].Name()), payload, 0o600); err != nil {
+				t.Fatalf("WriteFile(v2 snapshot) error = %v", err)
+			}
+
+			loaded, err := store.Load(context.Background(), "repo")
+			if !errors.Is(err, localstore.ErrReindexRequired) {
+				t.Fatalf("Load(v2 %s) error = %v, want ErrReindexRequired", tt.name, err)
+			}
+			if loaded != nil {
+				t.Fatalf("Load(v2 %s) = %#v, want nil", tt.name, loaded)
+			}
+			for _, canary := range []string{"PERSISTED_V2_CANARY", "persisted-canary.py", "forged-revision"} {
+				if strings.Contains(err.Error(), canary) {
+					t.Errorf("Load(v2 %s) error exposes %q: %q", tt.name, canary, err)
+				}
+			}
+		})
 	}
 }
 

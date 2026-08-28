@@ -116,6 +116,49 @@ func TestScannerClassifiesUnsafeContentAndReportsOnlyAggregates(t *testing.T) {
 	}
 }
 
+func TestScannerExcludesLiteralSecretsAfterTypeAnnotations(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "keep.py", "message: str = 'public'\n")
+	writeFile(t, root, "typed.py", "password: str = \"python-prod-canary\"\n")
+	writeFile(t, root, "typed.ts", "const password: string = \"typescript-prod-canary\"\n")
+
+	result, err := filesystem.NewScanner().Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if got := filePaths(result.Files); len(got) != 1 || got[0] != "keep.py" {
+		t.Fatalf("Scan() paths = %v, want [keep.py]", got)
+	}
+	if got := result.Report.Excluded[ingest.ExclusionSecret]; got != 2 {
+		t.Fatalf("secret exclusions = %d, want 2", got)
+	}
+}
+
+func TestScanReportBucketsUnrecognizedExtensionsWithoutLeakingNameFragment(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "keep.py", "print('safe')\n")
+	writeFile(t, root, "README.md", "documentation\n")
+	writeFile(t, root, "notes.customer-canary", "private naming convention\n")
+
+	result, err := filesystem.NewScanner().Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if got := result.Report.UnsupportedByExtension[".md"]; got != 1 {
+		t.Errorf("unsupported .md count = %d, want 1", got)
+	}
+	if got := result.Report.UnsupportedByExtension["<other>"]; got != 1 {
+		t.Errorf("unsupported <other> count = %d, want 1", got)
+	}
+	payload, err := json.Marshal(result.Report)
+	if err != nil {
+		t.Fatalf("Marshal(report) error = %v", err)
+	}
+	if bytes.Contains(payload, []byte("customer-canary")) || bytes.Contains(payload, []byte("notes")) {
+		t.Fatalf("report = %s, want repository-specific suffix bucketed", payload)
+	}
+}
+
 func TestScannerPreflightsNestedRepositoriesBeforeAnyChild(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, ".git/config", "root metadata\n")

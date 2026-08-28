@@ -8,6 +8,15 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
+var safeUnsupportedExtensions = map[string]struct{}{
+	".bash": {}, ".c": {}, ".cc": {}, ".cpp": {}, ".cs": {}, ".css": {}, ".csv": {},
+	".go": {}, ".h": {}, ".hpp": {}, ".html": {}, ".java": {}, ".js": {}, ".jsx": {},
+	".json": {}, ".kt": {}, ".kts": {}, ".less": {}, ".log": {}, ".lua": {}, ".md": {},
+	".php": {}, ".rb": {}, ".rs": {}, ".sass": {}, ".scala": {}, ".scss": {}, ".sh": {},
+	".sql": {}, ".swift": {}, ".toml": {}, ".txt": {}, ".vue": {}, ".xml": {}, ".yaml": {},
+	".yml": {}, ".zsh": {},
+}
+
 func newScanReport() ingest.ScanReport {
 	return ingest.ScanReport{
 		Excluded:               make(map[ingest.ExclusionReason]int),
@@ -26,6 +35,8 @@ func addUnsupported(report *ingest.ScanReport, name string) {
 	extension := strings.ToLower(path.Ext(name))
 	if extension == "" {
 		extension = "<none>"
+	} else if _, safe := safeUnsupportedExtensions[extension]; !safe {
+		extension = "<other>"
 	}
 	report.UnsupportedByExtension[extension]++
 }

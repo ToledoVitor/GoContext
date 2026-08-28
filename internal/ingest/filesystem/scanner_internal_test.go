@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ToledoVitor/GoContext/internal/ingest"
 )
 
 func TestScannerAppliesHardDenyBeforeOpen(t *testing.T) {
@@ -119,6 +121,58 @@ func TestValidRelativePathRejectsTraversalAndRootChanges(t *testing.T) {
 		t.Fatal("validRelativePath(valid Unicode path) = false, want true")
 	}
 }
+
+func TestScannerInspectsUnknownTypesBeforeAllowlist(t *testing.T) {
+	root := t.TempDir()
+	writeInternalFile(t, root, "container/nested/keep.py", "print('safe')\n")
+	writeInternalFile(t, root, "container/.github/secret.ts", "export const hidden = true\n")
+	scanner := &Scanner{
+		openPath: func(directory repositoryHandle, name string, wantDirectory bool) (repositoryHandle, error) {
+			file, err := openNoFollow(directory, name, wantDirectory)
+			if err != nil {
+				return nil, err
+			}
+			if wantDirectory && name == "container" {
+				return &unknownTypeDirectory{File: file}, nil
+			}
+			return file, nil
+		},
+	}
+
+	result, err := scanner.Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(result.Files) != 1 || result.Files[0].Reference.Path != "container/nested/keep.py" {
+		t.Fatalf("Scan() files = %#v, want nested keep.py", result.Files)
+	}
+	if result.Report.Excluded[ingest.ExclusionSecurity] != 1 {
+		t.Errorf("security exclusions = %d, want 1", result.Report.Excluded[ingest.ExclusionSecurity])
+	}
+	if result.Report.UnsupportedByExtension["<other>"] != 0 {
+		t.Errorf("unsupported <other> = %d, want 0 for denied .github directory", result.Report.UnsupportedByExtension["<other>"])
+	}
+}
+
+type unknownTypeDirectory struct {
+	*os.File
+}
+
+func (d *unknownTypeDirectory) ReadDir(n int) ([]os.DirEntry, error) {
+	entries, err := d.File.ReadDir(n)
+	unknown := make([]os.DirEntry, len(entries))
+	for index, entry := range entries {
+		unknown[index] = unknownTypeEntry{DirEntry: entry}
+	}
+	return unknown, err
+}
+
+type unknownTypeEntry struct {
+	os.DirEntry
+}
+
+func (e unknownTypeEntry) Type() os.FileMode { return 0 }
+func (e unknownTypeEntry) IsDir() bool       { return false }
 
 func writeInternalFile(t *testing.T, root, relativePath, content string) {
 	t.Helper()

@@ -10,7 +10,7 @@ import (
 )
 
 func openNoFollow(directory repositoryHandle, name string, wantDirectory bool) (*os.File, error) {
-	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
 	if wantDirectory {
 		flags |= unix.O_DIRECTORY
 	}

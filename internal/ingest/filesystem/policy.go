@@ -39,13 +39,13 @@ var knownCredentialPatterns = []*regexp.Regexp{
 }
 
 func classifyPath(name string, directory bool) (ingest.ExclusionReason, bool) {
+	if equalFoldAny(name, securityDirectories) {
+		return ingest.ExclusionSecurity, true
+	}
+	if equalFoldAny(name, dependencyBuildCacheDirectories) {
+		return ingest.ExclusionDependencyBuildCache, true
+	}
 	if directory {
-		if equalFoldAny(name, securityDirectories) {
-			return ingest.ExclusionSecurity, true
-		}
-		if equalFoldAny(name, dependencyBuildCacheDirectories) {
-			return ingest.ExclusionDependencyBuildCache, true
-		}
 		return "", false
 	}
 
@@ -146,7 +146,7 @@ func containsSecret(content []byte) bool {
 }
 
 func containsLiteralSecretAssignment(line string) bool {
-	delimiter := strings.IndexAny(line, "=:")
+	delimiter := literalAssignmentDelimiter(line)
 	if delimiter < 0 {
 		return false
 	}
@@ -160,4 +160,20 @@ func containsLiteralSecretAssignment(line string) bool {
 		return false
 	}
 	return strings.ContainsRune(right[1:], rune(right[0]))
+}
+
+func literalAssignmentDelimiter(line string) int {
+	for index := 0; index < len(line); index++ {
+		if line[index] != '=' {
+			continue
+		}
+		if index > 0 && strings.ContainsRune("=!<>", rune(line[index-1])) {
+			continue
+		}
+		if index+1 < len(line) && (line[index+1] == '=' || line[index+1] == '>') {
+			continue
+		}
+		return index
+	}
+	return strings.IndexByte(line, ':')
 }

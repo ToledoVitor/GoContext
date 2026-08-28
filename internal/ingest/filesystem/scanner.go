@@ -111,8 +111,25 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			addExclusion(&result.Report, ingest.ExclusionSymlink)
 			continue
 		}
-		if entry.IsDir() {
-			entryInfo, err := entry.Info()
+
+		var entryInfo os.FileInfo
+		var err error
+		isDirectory := entry.IsDir()
+		if entry.Type() == 0 {
+			entryInfo, err = entry.Info()
+			if err != nil {
+				return sanitizedPathError("inspect-entry", relativePath)
+			}
+			if entryInfo.Mode()&os.ModeSymlink != 0 {
+				addExclusion(&result.Report, ingest.ExclusionSymlink)
+				continue
+			}
+			isDirectory = entryInfo.IsDir()
+		}
+		if isDirectory {
+			if entryInfo == nil {
+				entryInfo, err = entry.Info()
+			}
 			if err != nil {
 				return sanitizedPathError("inspect-directory", relativePath)
 			}
@@ -145,17 +162,19 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			continue
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			return sanitizedPathError("inspect-file", relativePath)
+		if entryInfo == nil {
+			entryInfo, err = entry.Info()
+			if err != nil {
+				return sanitizedPathError("inspect-file", relativePath)
+			}
 		}
-		if !info.Mode().IsRegular() {
+		if !entryInfo.Mode().IsRegular() {
 			addExclusion(&result.Report, ingest.ExclusionNonRegular)
 			continue
 		}
 		result.Report.EligibleFiles++
-		result.Report.EligibleBytes += info.Size()
-		if info.Size() > DefaultMaxFileSize {
+		result.Report.EligibleBytes += entryInfo.Size()
+		if entryInfo.Size() > DefaultMaxFileSize {
 			addExclusion(&result.Report, ingest.ExclusionTooLarge)
 			continue
 		}
@@ -165,7 +184,7 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			return sanitizedPathError("open-file", relativePath)
 		}
 		openedInfo, statErr := file.Stat()
-		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(entryInfo, openedInfo) {
 			_ = file.Close()
 			return sanitizedPathError("file-changed", relativePath)
 		}

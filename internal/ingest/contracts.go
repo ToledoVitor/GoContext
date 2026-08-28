@@ -9,7 +9,7 @@ import (
 
 // ScanPolicyVersion identifies all scanner decisions that affect safe corpus
 // eligibility. A change to those decisions requires a new version.
-const ScanPolicyVersion = "scanner-v2"
+const ScanPolicyVersion = "scanner-v3"
 
 // ExclusionReason is a sanitized, aggregate-only scanner decision.
 type ExclusionReason string
