@@ -193,6 +193,154 @@ func TestParserJavaScriptRejectsPartialMalformedDeclarations(t *testing.T) {
 	assertSymbols(t, symbols, want)
 }
 
+func TestParserJavaScriptMalformedBlockStructureFailsClosed(t *testing.T) {
+	file := source.File{
+		Reference: source.Reference{Path: "src/unbalanced.js", StartLine: 1, EndLine: 2},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte("}\nfunction inventedAfterMalformedBlock() {}\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(symbols) != 0 {
+		t.Fatalf("Parse() symbols = %#v, want malformed lexical structure to fail closed", symbols)
+	}
+}
+
+func TestParserJavaScriptFindsOnlySyntacticTopLevelDeclarations(t *testing.T) {
+	lines := []string{
+		"if (ready) {",
+		"const hiddenArrow = () => {}",
+		"function hiddenFunction() {}",
+		"}",
+		"function outer() {",
+		"function nestedFunction() {}",
+		"}",
+		"class Container {",
+		"const nestedBinding = function() {}",
+		"}",
+		"const objectOnly = { formatter: () => ({ value: 1 }) }",
+		"const divisionOnly = total / divisor",
+		"export const View = (props) => <main style={{ color: 'red' }}>{props.value}</main>",
+		"const braceString = '{ not a block }'",
+		"const braceTemplate = `{ not a block }`",
+		"/* { not a block } */",
+		"if (/[{]/.test(value)) {",
+		"function regexBlockHidden() {}",
+		"}",
+		"export const Fragment = () => <><span /></>",
+		"function visible() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/blocks.jsx", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	want := []source.Symbol{
+		{Name: "outer", Kind: "function", Signature: lines[4], Reference: source.Reference{Path: "src/blocks.jsx", StartLine: 5, EndLine: 5}},
+		{Name: "Container", Kind: "class", Signature: lines[7], Reference: source.Reference{Path: "src/blocks.jsx", StartLine: 8, EndLine: 8}},
+		{Name: "View", Kind: "function", Signature: lines[12], Reference: source.Reference{Path: "src/blocks.jsx", StartLine: 13, EndLine: 13}},
+		{Name: "Fragment", Kind: "function", Signature: lines[19], Reference: source.Reference{Path: "src/blocks.jsx", StartLine: 20, EndLine: 20}},
+		{Name: "visible", Kind: "function", Signature: lines[20], Reference: source.Reference{Path: "src/blocks.jsx", StartLine: 21, EndLine: 21}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptValidatesCompleteFunctionParameters(t *testing.T) {
+	lines := []string{
+		"function directOpen(",
+		"function directReserved(return) {}",
+		"function directStrict(interface) {}",
+		"function directDuplicate(value, value) {}",
+		"const anonymousOpen = function(",
+		"const anonymousReserved = function(return) {}",
+		"const anonymousEmpty = function(, value) {}",
+		"export const duplicateExpression = function(a, a) {}",
+		"const namedEmpty = function named(, value) {}",
+		"const reservedNamed = function return(value) {}",
+		"const duplicateArrow = (a, a) => 0",
+		"export const interface = function() {}",
+		"const strictArrow = (interface) => 0",
+		"function interface() {}",
+		"function strictEval(eval) {}",
+		"const strictArguments = (arguments) => 0",
+		"const package = function() {}",
+		"function bodyless()",
+		"const bodylessExpression = function()",
+		"const bodylessArrow = () =>",
+		"function direct(value, other) {}",
+		"const anonymous = function(value) {}",
+		"const namedBinding = function named(value) {}",
+		"const arrow = (value, other) => 0",
+		"const rest = (...values) => values.length",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/parameters.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	want := []source.Symbol{
+		{Name: "direct", Kind: "function", Signature: lines[20], Reference: source.Reference{Path: "src/parameters.js", StartLine: 21, EndLine: 21}},
+		{Name: "anonymous", Kind: "function", Signature: lines[21], Reference: source.Reference{Path: "src/parameters.js", StartLine: 22, EndLine: 22}},
+		{Name: "namedBinding", Kind: "function", Signature: lines[22], Reference: source.Reference{Path: "src/parameters.js", StartLine: 23, EndLine: 23}},
+		{Name: "arrow", Kind: "function", Signature: lines[23], Reference: source.Reference{Path: "src/parameters.js", StartLine: 24, EndLine: 24}},
+		{Name: "rest", Kind: "function", Signature: lines[24], Reference: source.Reference{Path: "src/parameters.js", StartLine: 25, EndLine: 25}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptRegexLiteralsDoNotCorruptLexicalState(t *testing.T) {
+	patterns := []struct {
+		name    string
+		pattern string
+	}{
+		{name: "review regression", pattern: "`"},
+		{name: "escaped markers", pattern: "\\`\\{\\}\\/\\*"},
+		{name: "character class", pattern: "[`{}\\/\\*]"},
+	}
+	for _, test := range patterns {
+		t.Run(test.name, func(t *testing.T) {
+			lines := []string{
+				"const marker = /" + test.pattern + "/",
+				"const source = `first",
+				"function fake() {}",
+				"class FakeClass {}",
+				"`",
+				"function real() {}",
+			}
+			file := source.File{
+				Reference: source.Reference{Path: "src/regex.js", StartLine: 1, EndLine: len(lines)},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(strings.Join(lines, "\n") + "\n"),
+			}
+
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+
+			want := []source.Symbol{
+				{Name: "real", Kind: "function", Signature: lines[5], Reference: source.Reference{Path: "src/regex.js", StartLine: 6, EndLine: 6}},
+			}
+			assertSymbols(t, symbols, want)
+		})
+	}
+}
+
 func TestParserRejectsUnsupportedLanguageAndInvalidReference(t *testing.T) {
 	parser := lineparser.NewParser()
 
@@ -226,6 +374,32 @@ func TestParserRespectsCancellation(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Parse() error = %v, want context.Canceled", err)
+	}
+}
+
+type cancelAfterErrChecksContext struct {
+	context.Context
+	cancelAfter int
+	checks      int
+}
+
+func (ctx *cancelAfterErrChecksContext) Err() error {
+	ctx.checks++
+	if ctx.checks >= ctx.cancelAfter {
+		return context.Canceled
+	}
+	return nil
+}
+
+func TestParserJavaScriptChecksCancellationWithinLongLexicalScan(t *testing.T) {
+	ctx := &cancelAfterErrChecksContext{Context: context.Background(), cancelAfter: 4}
+	_, err := lineparser.NewParser().Parse(ctx, source.File{
+		Reference: source.Reference{Path: "long.js", StartLine: 1, EndLine: 1},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte("const value = " + strings.Repeat("x", 16*1024)),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Parse() error = %v after %d checks, want context.Canceled during lexical scan", err, ctx.checks)
 	}
 }
 

@@ -24,12 +24,6 @@ type declarationPattern struct {
 	validLine  func(string) bool
 }
 
-type javaScriptLexicalState struct {
-	blockComment bool
-	template     bool
-	stringQuote  byte
-}
-
 var pythonPatterns = []declarationPattern{
 	{expression: regexp.MustCompile(`^(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)`), kind: "function"},
 	{expression: regexp.MustCompile(`^class\s+([A-Za-z_][A-Za-z0-9_]*)`), kind: "class"},
@@ -47,6 +41,7 @@ var javaScriptPatterns = []declarationPattern{
 	{
 		expression: regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?(?:async\s+)?function(?:\s*\*\s*|\s+)([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`),
 		kind:       "function",
+		validLine:  validJavaScriptFunctionDeclaration,
 	},
 	{
 		expression: regexp.MustCompile(`^(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\s+extends\s+[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)?\s*\{`),
@@ -60,11 +55,12 @@ var javaScriptPatterns = []declarationPattern{
 }
 
 var javaScriptReservedIdentifiers = map[string]struct{}{
-	"await": {}, "break": {}, "case": {}, "catch": {}, "class": {}, "const": {},
+	"arguments": {}, "await": {}, "break": {}, "case": {}, "catch": {}, "class": {}, "const": {},
 	"continue": {}, "debugger": {}, "default": {}, "delete": {}, "do": {}, "else": {},
-	"enum": {}, "export": {}, "extends": {}, "false": {}, "finally": {}, "for": {},
-	"function": {}, "if": {}, "import": {}, "in": {}, "instanceof": {}, "let": {},
-	"new": {}, "null": {}, "return": {}, "static": {}, "super": {}, "switch": {},
+	"enum": {}, "eval": {}, "export": {}, "extends": {}, "false": {}, "finally": {}, "for": {},
+	"function": {}, "if": {}, "implements": {}, "import": {}, "in": {}, "instanceof": {}, "interface": {}, "let": {},
+	"new": {}, "null": {}, "package": {}, "private": {}, "protected": {}, "public": {}, "return": {},
+	"static": {}, "super": {}, "switch": {},
 	"this": {}, "throw": {}, "true": {}, "try": {}, "typeof": {}, "var": {},
 	"void": {}, "while": {}, "with": {}, "yield": {},
 }
@@ -93,19 +89,21 @@ func (p *Parser) Parse(ctx context.Context, file source.File) ([]source.Symbol, 
 
 	lines := strings.Split(string(file.Content), "\n")
 	symbols := make([]source.Symbol, 0)
-	var javaScriptState javaScriptLexicalState
+	javaScriptState := newJavaScriptLexicalState()
 	for index, rawLine := range lines {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
 		line := strings.TrimSuffix(rawLine, "\r")
-		lineStartsInCode := true
+		lineStartsAtTopLevel := true
 		if file.Language == source.LanguageJavaScript {
-			lineStartsInCode = javaScriptState.inCode()
-			javaScriptState.consume(line)
+			lineStartsAtTopLevel = javaScriptState.atTopLevel()
+			if err := javaScriptState.consume(ctx, line); err != nil {
+				return nil, err
+			}
 		}
-		if !lineStartsInCode || line == "" || line != strings.TrimLeft(line, " \t") {
+		if !lineStartsAtTopLevel || line == "" || line != strings.TrimLeft(line, " \t") {
 			continue
 		}
 
@@ -141,76 +139,9 @@ func (p *Parser) Parse(ctx context.Context, file source.File) ([]source.Symbol, 
 	return symbols, nil
 }
 
-func (state *javaScriptLexicalState) inCode() bool {
-	return !state.blockComment && !state.template && state.stringQuote == 0
-}
-
-// consume tracks only the multiline lexical forms needed to prevent declarations
-// inside comments and literals from becoming symbol boundaries. Template
-// substitutions remain opaque intentionally: this line parser prefers false
-// negatives to inventing declarations without a JavaScript grammar.
-func (state *javaScriptLexicalState) consume(line string) {
-	escaped := false
-	for index := 0; index < len(line); index++ {
-		character := line[index]
-
-		switch {
-		case state.blockComment:
-			if character == '*' && index+1 < len(line) && line[index+1] == '/' {
-				state.blockComment = false
-				index++
-			}
-		case state.template:
-			if escaped {
-				escaped = false
-				continue
-			}
-			if character == '\\' {
-				escaped = true
-				continue
-			}
-			if character == '`' {
-				state.template = false
-			}
-		case state.stringQuote != 0:
-			if escaped {
-				escaped = false
-				continue
-			}
-			if character == '\\' {
-				escaped = true
-				continue
-			}
-			if character == state.stringQuote {
-				state.stringQuote = 0
-			}
-		default:
-			switch character {
-			case '/', '\'', '"', '`':
-				switch character {
-				case '/':
-					if index+1 >= len(line) {
-						continue
-					}
-					switch line[index+1] {
-					case '/':
-						return
-					case '*':
-						state.blockComment = true
-						index++
-					}
-				case '\'', '"':
-					state.stringQuote = character
-				case '`':
-					state.template = true
-				}
-			}
-		}
-	}
-
-	if state.stringQuote != 0 && !escaped {
-		state.stringQuote = 0
-	}
+func validJavaScriptFunctionDeclaration(line string) bool {
+	function := strings.Index(line, "function")
+	return function >= 0 && validJavaScriptFunctionSyntax(line[function:], true)
 }
 
 func validJavaScriptFunctionInitializer(line string) bool {
@@ -221,50 +152,97 @@ func validJavaScriptFunctionInitializer(line string) bool {
 	right := strings.TrimSpace(line[delimiter+1:])
 	if hasJavaScriptKeywordPrefix(right, "async") {
 		remainder := strings.TrimSpace(right[len("async"):])
-		if !strings.HasPrefix(remainder, "=>") {
-			right = remainder
+		if hasJavaScriptKeywordPrefix(remainder, "function") || remainder == "function" {
+			return validJavaScriptFunctionSyntax(remainder, false)
 		}
-	}
-	if hasJavaScriptKeywordPrefix(right, "function") || right == "function" {
-		remainder := strings.TrimSpace(right[len("function"):])
-		if strings.HasPrefix(remainder, "*") {
-			remainder = strings.TrimSpace(remainder[1:])
-		}
-		if strings.HasPrefix(remainder, "(") {
+		if validJavaScriptArrowFunction(remainder) {
 			return true
 		}
-		name, rest := leadingJavaScriptIdentifier(remainder)
-		if name == "" || javaScriptIdentifierReserved(name) {
-			return false
-		}
-		return strings.HasPrefix(strings.TrimSpace(rest), "(")
+		return validJavaScriptArrowFunction(right)
 	}
-	if strings.HasPrefix(right, "(") {
-		return validJavaScriptParenthesizedArrowParameters(right)
+	if hasJavaScriptKeywordPrefix(right, "function") || right == "function" {
+		return validJavaScriptFunctionSyntax(right, false)
 	}
-	parameter, rest := leadingJavaScriptIdentifier(right)
-	return parameter != "" && !javaScriptIdentifierReserved(parameter) &&
-		strings.HasPrefix(strings.TrimSpace(rest), "=>")
+	return validJavaScriptArrowFunction(right)
 }
 
-func validJavaScriptParenthesizedArrowParameters(value string) bool {
-	closing := strings.IndexByte(value, ')')
-	if closing < 0 || !strings.HasPrefix(strings.TrimSpace(value[closing+1:]), "=>") {
+func validJavaScriptFunctionSyntax(value string, requireName bool) bool {
+	if !strings.HasPrefix(value, "function") {
 		return false
+	}
+	remainder := strings.TrimSpace(value[len("function"):])
+	if strings.HasPrefix(remainder, "*") {
+		remainder = strings.TrimSpace(remainder[1:])
+	}
+
+	if requireName || !strings.HasPrefix(remainder, "(") {
+		name, rest := leadingJavaScriptIdentifier(remainder)
+		if !validJavaScriptIdentifier(name) {
+			return false
+		}
+		remainder = strings.TrimSpace(rest)
+	}
+	tail, valid := validJavaScriptParameterList(remainder)
+	if !valid {
+		return false
+	}
+	tail = strings.TrimSpace(tail)
+	return strings.HasPrefix(tail, "{")
+}
+
+func validJavaScriptArrowFunction(value string) bool {
+	if strings.HasPrefix(value, "(") {
+		tail, valid := validJavaScriptParameterList(value)
+		return valid && validJavaScriptArrowTail(tail)
+	}
+	parameter, rest := leadingJavaScriptIdentifier(value)
+	return validJavaScriptIdentifier(parameter) && validJavaScriptArrowTail(rest)
+}
+
+func validJavaScriptArrowTail(value string) bool {
+	tail := strings.TrimSpace(value)
+	if !strings.HasPrefix(tail, "=>") {
+		return false
+	}
+	body := strings.TrimSpace(tail[len("=>"):])
+	return body != "" && !strings.HasPrefix(body, "//") && !strings.HasPrefix(body, "/*")
+}
+
+func validJavaScriptParameterList(value string) (string, bool) {
+	if !strings.HasPrefix(value, "(") {
+		return "", false
+	}
+	closing := strings.IndexByte(value, ')')
+	if closing < 0 {
+		return "", false
 	}
 	parameters := strings.TrimSpace(value[1:closing])
 	if parameters == "" {
-		return true
+		return value[closing+1:], true
 	}
-	for _, parameter := range strings.Split(parameters, ",") {
+	parts := strings.Split(parameters, ",")
+	seen := make(map[string]struct{}, len(parts))
+	for position, parameter := range parts {
 		parameter = strings.TrimSpace(parameter)
-		parameter = strings.TrimPrefix(parameter, "...")
-		identifier, rest := leadingJavaScriptIdentifier(parameter)
-		if identifier == "" || rest != "" || javaScriptIdentifierReserved(identifier) {
-			return false
+		if parameter == "" {
+			return "", false
 		}
+		if strings.HasPrefix(parameter, "...") {
+			if position != len(parts)-1 {
+				return "", false
+			}
+			parameter = strings.TrimSpace(parameter[len("..."):])
+		}
+		identifier, rest := leadingJavaScriptIdentifier(parameter)
+		if !validJavaScriptIdentifier(identifier) || rest != "" {
+			return "", false
+		}
+		if _, duplicate := seen[identifier]; duplicate {
+			return "", false
+		}
+		seen[identifier] = struct{}{}
 	}
-	return true
+	return value[closing+1:], true
 }
 
 func hasJavaScriptKeywordPrefix(value, keyword string) bool {
@@ -291,6 +269,14 @@ func leadingJavaScriptIdentifier(value string) (string, string) {
 func javaScriptIdentifierReserved(identifier string) bool {
 	_, reserved := javaScriptReservedIdentifiers[identifier]
 	return reserved
+}
+
+func validJavaScriptIdentifier(identifier string) bool {
+	if identifier == "" || javaScriptIdentifierReserved(identifier) {
+		return false
+	}
+	parsed, rest := leadingJavaScriptIdentifier(identifier)
+	return parsed == identifier && rest == ""
 }
 
 func patternsForLanguage(language source.Language) ([]declarationPattern, error) {
