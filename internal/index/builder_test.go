@@ -103,6 +103,8 @@ func TestBuilderOffDoesNotCallConfiguredEmbedder(t *testing.T) {
 func TestNewBuilderValidatesConfiguration(t *testing.T) {
 	store := &builderStore{activeErr: index.ErrNotFound}
 	embedder := &builderEmbedder{profile: embedding.Profile{Fingerprint: "profile", Model: "model"}}
+	var typedNilStore *builderStore
+	var typedNilEmbedder *builderEmbedder
 	tests := []struct {
 		name     string
 		store    index.Store
@@ -115,7 +117,10 @@ func TestNewBuilderValidatesConfiguration(t *testing.T) {
 		{name: "preferred accepts embedder", store: store, embedder: embedder, config: index.BuilderConfig{Mode: index.SemanticPreferred}},
 		{name: "required accepts embedder", store: store, embedder: embedder, config: index.BuilderConfig{Mode: index.SemanticRequired}},
 		{name: "nil store", config: index.BuilderConfig{Mode: index.SemanticOff}, wantErr: true},
+		{name: "typed nil store", store: typedNilStore, config: index.BuilderConfig{Mode: index.SemanticOff}, wantErr: true},
+		{name: "off with typed nil embedder", store: store, embedder: typedNilEmbedder, config: index.BuilderConfig{Mode: index.SemanticOff}, wantErr: true},
 		{name: "preferred without embedder", store: store, config: index.BuilderConfig{Mode: index.SemanticPreferred}, wantErr: true},
+		{name: "preferred with typed nil embedder", store: store, embedder: typedNilEmbedder, config: index.BuilderConfig{Mode: index.SemanticPreferred}, wantErr: true},
 		{name: "required without embedder", store: store, config: index.BuilderConfig{Mode: index.SemanticRequired}, wantErr: true},
 		{name: "unknown mode", store: store, embedder: embedder, config: index.BuilderConfig{Mode: "automatic"}, wantErr: true},
 		{name: "negative max chunks", store: store, config: index.BuilderConfig{Mode: index.SemanticOff, MaxChunks: -1}, wantErr: true},
@@ -189,6 +194,30 @@ func TestBuilderSemanticModesClassifyProviderFailures(t *testing.T) {
 			mode:      index.SemanticRequired,
 			embedErr:  errors.New(providerCanary),
 			wantError: index.ErrSemanticFailure,
+		},
+		{
+			name:      "preferred classifies typed invalid batch as integrity failure",
+			mode:      index.SemanticPreferred,
+			embedErr:  fmt.Errorf("%s: %w", providerCanary, embedding.ErrInvalidBatch),
+			wantError: index.ErrSemanticIntegrity,
+		},
+		{
+			name:      "required classifies typed invalid batch as integrity failure",
+			mode:      index.SemanticRequired,
+			embedErr:  fmt.Errorf("%s: %w", providerCanary, embedding.ErrInvalidBatch),
+			wantError: index.ErrSemanticIntegrity,
+		},
+		{
+			name:      "preferred classifies typed invalid vector as integrity failure",
+			mode:      index.SemanticPreferred,
+			embedErr:  fmt.Errorf("%s: %w", providerCanary, embedding.ErrInvalidVector),
+			wantError: index.ErrSemanticIntegrity,
+		},
+		{
+			name:      "required classifies typed invalid vector as integrity failure",
+			mode:      index.SemanticRequired,
+			embedErr:  fmt.Errorf("%s: %w", providerCanary, embedding.ErrInvalidVector),
+			wantError: index.ErrSemanticIntegrity,
 		},
 		{
 			name:             "parent cancellation never degrades",
@@ -467,6 +496,65 @@ func TestBuilderRejectsMalformedEmbeddingBatches(t *testing.T) {
 	}
 }
 
+func TestBuilderCancelsDuringHugeVectorValidationAndCopy(t *testing.T) {
+	const dimensions = 1 << 18
+	vector := make(embedding.Vector, dimensions)
+	vector[0] = 1
+	profile := embedding.Profile{Fingerprint: "PRIVATE_VECTOR_PROFILE_CANARY", Model: "PRIVATE_VECTOR_MODEL_CANARY"}
+	corpus := mustBuilderCorpus(t, "scanner-v4", []source.Chunk{
+		builderChunk("chunk", "PRIVATE_VECTOR_PATH_CANARY.py", "PRIVATE_VECTOR_TEXT_CANARY"),
+	})
+	tests := []struct {
+		name     string
+		cancelAt int
+	}{
+		{name: "component validation", cancelAt: 100},
+		{name: "component copy", cancelAt: 1_200},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newCountedCancelContext(tt.cancelAt)
+			embedder := &builderEmbedder{
+				profile: profile,
+				batch: embedding.Batch{
+					Profile:     profile,
+					Dimensions:  dimensions,
+					Vectors:     []embedding.Vector{vector},
+					Requests:    1,
+					UsageTokens: 1,
+				},
+			}
+			store := &builderStore{activeErr: index.ErrNotFound}
+			builder, err := index.NewBuilder(store, embedder, index.BuilderConfig{Mode: index.SemanticRequired})
+			if err != nil {
+				t.Fatalf("NewBuilder() error = %v", err)
+			}
+
+			report, err := builder.Replace(ctx, "repository", corpus)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Replace() error = %v, want context.Canceled", err)
+			}
+			if report != (index.Report{}) || store.replaceCallCount() != 0 {
+				t.Fatalf("canceled Replace() = report %#v publications %d, want unpublished", report, store.replaceCallCount())
+			}
+			if ctx.errCalls() < tt.cancelAt {
+				t.Fatalf("context Err() calls = %d, want cancellation threshold %d reached", ctx.errCalls(), tt.cancelAt)
+			}
+			for _, canary := range []string{
+				"PRIVATE_VECTOR_PROFILE_CANARY",
+				"PRIVATE_VECTOR_MODEL_CANARY",
+				"PRIVATE_VECTOR_PATH_CANARY",
+				"PRIVATE_VECTOR_TEXT_CANARY",
+			} {
+				if errorTreeContains(err, canary) {
+					t.Fatalf("Replace() error tree exposes %q", canary)
+				}
+			}
+		})
+	}
+}
+
 func TestBuilderGenerationIDIsDeterministicAndSpaceBound(t *testing.T) {
 	baseCorpus := mustBuilderCorpus(t, "scanner-v4", []source.Chunk{
 		builderChunk("chunk", "chunk.py", "chunk text"),
@@ -669,6 +757,78 @@ func TestBuilderCostLimitsAreCheckedBeforeStoreAndEmbedder(t *testing.T) {
 			}
 			if report.Chunks != len(tt.chunks) || store.replaceCallCount() != 1 {
 				t.Fatalf("boundary report/store = %#v/%d", report, store.replaceCallCount())
+			}
+		})
+	}
+}
+
+func TestBuilderCostGatePrecedesCorpusReconstructionAllocations(t *testing.T) {
+	tests := []struct {
+		name   string
+		config index.BuilderConfig
+		corpus source.Corpus
+	}{
+		{
+			name:   "chunk count",
+			config: index.BuilderConfig{Mode: index.SemanticPreferred, MaxChunks: 1},
+			corpus: source.Corpus{
+				PolicyVersion: "PRIVATE_FORGED_POLICY_CANARY",
+				Revision:      "PRIVATE_FORGED_REVISION_CANARY",
+				Chunks: []source.Chunk{
+					builderChunk("one", "PRIVATE_COST_ONE_CANARY.py", "one"),
+					builderChunk("two", "PRIVATE_COST_TWO_CANARY.py", "two"),
+				},
+			},
+		},
+		{
+			name:   "source bytes",
+			config: index.BuilderConfig{Mode: index.SemanticPreferred, MaxSourceBytes: 3},
+			corpus: source.Corpus{
+				PolicyVersion: "PRIVATE_FORGED_POLICY_CANARY",
+				Revision:      "PRIVATE_FORGED_REVISION_CANARY",
+				Chunks: []source.Chunk{
+					builderChunk("one", "PRIVATE_COST_ONE_CANARY.py", "ab"),
+					builderChunk("two", "PRIVATE_COST_TWO_CANARY.py", "cd"),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &builderStore{activeErr: index.ErrNotFound}
+			embedder := &builderEmbedder{profile: embedding.Profile{Fingerprint: "fingerprint", Model: "model"}}
+			builder, err := index.NewBuilder(store, embedder, tt.config)
+			if err != nil {
+				t.Fatalf("NewBuilder() error = %v", err)
+			}
+			var report index.Report
+			var replaceErr error
+			allocations := testing.AllocsPerRun(100, func() {
+				report, replaceErr = builder.Replace(context.Background(), "repository", tt.corpus)
+			})
+
+			if !errors.Is(replaceErr, index.ErrCostLimit) {
+				t.Fatalf("Replace() error = %v, want ErrCostLimit before corpus reconstruction", replaceErr)
+			}
+			if allocations != 0 {
+				t.Fatalf("Replace() allocations = %.0f, want 0 before cost rejection", allocations)
+			}
+			if report != (index.Report{}) || store.activeCallCount() != 0 || store.replaceCallCount() != 0 {
+				t.Fatalf("cost rejection crossed store boundary: report %#v active %d replace %d", report, store.activeCallCount(), store.replaceCallCount())
+			}
+			if calls, _, _ := embedder.calls(); calls != 0 {
+				t.Fatalf("cost rejection Embed() calls = %d, want 0", calls)
+			}
+			for _, canary := range []string{
+				"PRIVATE_FORGED_POLICY_CANARY",
+				"PRIVATE_FORGED_REVISION_CANARY",
+				"PRIVATE_COST_ONE_CANARY",
+				"PRIVATE_COST_TWO_CANARY",
+			} {
+				if errorTreeContains(replaceErr, canary) {
+					t.Fatalf("Replace() error tree exposes %q", canary)
+				}
 			}
 		})
 	}
@@ -1011,6 +1171,45 @@ type builderEmbedder struct {
 	callCount int
 	purpose   embedding.Purpose
 	texts     []string
+}
+
+type countedCancelContext struct {
+	context.Context
+	mu       sync.Mutex
+	cancelAt int
+	calls    int
+	done     chan struct{}
+	once     sync.Once
+}
+
+func newCountedCancelContext(cancelAt int) *countedCancelContext {
+	return &countedCancelContext{
+		Context:  context.Background(),
+		cancelAt: cancelAt,
+		done:     make(chan struct{}),
+	}
+}
+
+func (c *countedCancelContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *countedCancelContext) Err() error {
+	c.mu.Lock()
+	c.calls++
+	canceled := c.calls >= c.cancelAt
+	c.mu.Unlock()
+	if !canceled {
+		return nil
+	}
+	c.once.Do(func() { close(c.done) })
+	return context.Canceled
+}
+
+func (c *countedCancelContext) errCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 func (e *builderEmbedder) Profile() embedding.Profile {

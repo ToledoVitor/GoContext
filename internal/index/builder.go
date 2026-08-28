@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"math"
+	"reflect"
 	"strings"
 
 	"github.com/ToledoVitor/GoContext/internal/embedding"
@@ -80,7 +82,7 @@ type Builder struct {
 
 // NewBuilder validates dependencies and applies safe indexing defaults.
 func NewBuilder(store Store, embedder embedding.Embedder, config BuilderConfig) (*Builder, error) {
-	if store == nil || config.MaxChunks < 0 || config.MaxSourceBytes < 0 {
+	if isNilDependency(store) || (embedder != nil && isNilDependency(embedder)) || config.MaxChunks < 0 || config.MaxSourceBytes < 0 {
 		return nil, ErrInvalidBuilder
 	}
 	mode := config.Mode
@@ -90,7 +92,7 @@ func NewBuilder(store Store, embedder embedding.Embedder, config BuilderConfig) 
 	if mode != SemanticOff && mode != SemanticPreferred && mode != SemanticRequired {
 		return nil, ErrInvalidBuilder
 	}
-	if mode != SemanticOff && embedder == nil {
+	if mode != SemanticOff && isNilDependency(embedder) {
 		return nil, ErrInvalidBuilder
 	}
 	maxChunks := config.MaxChunks
@@ -110,9 +112,23 @@ func NewBuilder(store Store, embedder embedding.Embedder, config BuilderConfig) 
 	}, nil
 }
 
+func isNilDependency(dependency any) bool {
+	if dependency == nil {
+		return true
+	}
+	value := reflect.ValueOf(dependency)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 // Replace builds and atomically publishes a complete repository generation.
 func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus source.Corpus) (Report, error) {
-	if b == nil || b.store == nil || ctx == nil {
+	if b == nil || isNilDependency(b.store) || ctx == nil ||
+		(b.embedder != nil && isNilDependency(b.embedder)) || (b.mode != SemanticOff && b.embedder == nil) {
 		return Report{}, ErrInvalidBuilder
 	}
 	if err := ctx.Err(); err != nil {
@@ -120,6 +136,9 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 	}
 	if strings.TrimSpace(repositoryID) == "" {
 		return Report{}, ErrInvalidCorpus
+	}
+	if err := validateCost(ctx, corpus.Chunks, b.maxChunks, b.maxSourceBytes); err != nil {
+		return Report{}, err
 	}
 
 	chunks, err := cloneChunksContext(ctx, corpus.Chunks)
@@ -136,10 +155,6 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 	if validated.Revision != corpus.Revision {
 		return Report{}, ErrInvalidCorpus
 	}
-	if err := validateCost(ctx, chunks, b.maxChunks, b.maxSourceBytes); err != nil {
-		return Report{}, err
-	}
-
 	baseGeneration, err := b.activeGeneration(ctx, repositoryID)
 	if err != nil {
 		return Report{}, err
@@ -180,6 +195,9 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 		return Report{}, fmt.Errorf("build index generation: %w", err)
 	}
 	if embedErr != nil {
+		if errors.Is(embedErr, embedding.ErrInvalidBatch) || errors.Is(embedErr, embedding.ErrInvalidVector) {
+			return Report{}, ErrSemanticIntegrity
+		}
 		if errors.Is(embedErr, embedding.ErrSemanticUnavailable) {
 			if b.mode == SemanticPreferred {
 				generation := b.lexicalGeneration(repositoryID, baseGeneration, corpus, chunks)
@@ -196,7 +214,13 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 		}
 		return Report{}, ErrSemanticFailure
 	}
-	if err := embedding.ValidateBatch(batch, len(chunks)); err != nil || batch.Profile != profile || batch.UsageTokens < 0 {
+	if err := validateEmbeddingBatchContext(ctx, batch, len(chunks)); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return Report{}, fmt.Errorf("build index generation: %w", err)
+		}
+		return Report{}, ErrSemanticIntegrity
+	}
+	if batch.Profile != profile {
 		return Report{}, ErrSemanticIntegrity
 	}
 	if err := ctx.Err(); err != nil {
@@ -210,9 +234,13 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 				return Report{}, fmt.Errorf("build index generation: %w", err)
 			}
 		}
+		values, err := copyVectorContext(ctx, batch.Vectors[position])
+		if err != nil {
+			return Report{}, fmt.Errorf("build index generation: %w", err)
+		}
 		vectors[position] = VectorRecord{
 			ChunkID: chunk.ID,
-			Values:  append(embedding.Vector(nil), batch.Vectors[position]...),
+			Values:  values,
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -316,7 +344,68 @@ func cloneChunksContext(ctx context.Context, chunks []source.Chunk) ([]source.Ch
 	return clone, ctx.Err()
 }
 
+func validateEmbeddingBatchContext(ctx context.Context, batch embedding.Batch, expected int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if batch.Profile.Fingerprint == "" || batch.Profile.Model == "" || batch.Dimensions <= 0 ||
+		batch.Requests <= 0 || batch.UsageTokens < 0 || len(batch.Vectors) != expected {
+		return embedding.ErrInvalidBatch
+	}
+	for vectorPosition, vector := range batch.Vectors {
+		if vectorPosition%builderContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if len(vector) != batch.Dimensions {
+			return embedding.ErrInvalidVector
+		}
+		nonZero := false
+		for componentPosition, value := range vector {
+			if componentPosition%builderContextStride == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			component := float64(value)
+			if math.IsNaN(component) || math.IsInf(component, 0) {
+				return embedding.ErrInvalidVector
+			}
+			nonZero = nonZero || value != 0
+		}
+		if !nonZero {
+			return embedding.ErrInvalidVector
+		}
+	}
+	return ctx.Err()
+}
+
+func copyVectorContext(ctx context.Context, vector embedding.Vector) (embedding.Vector, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	clone := make(embedding.Vector, len(vector))
+	for offset := 0; offset < len(vector); offset += builderContextStride {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := offset + builderContextStride
+		if end > len(vector) {
+			end = len(vector)
+		}
+		copy(clone[offset:end], vector[offset:end])
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return clone, nil
+}
+
 func validateCost(ctx context.Context, chunks []source.Chunk, maxChunks int, maxSourceBytes int64) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("build index generation: %w", err)
+	}
 	if len(chunks) > maxChunks {
 		return ErrCostLimit
 	}
@@ -333,7 +422,10 @@ func validateCost(ctx context.Context, chunks []source.Chunk, maxChunks int, max
 		}
 		total += chunkBytes
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("build index generation: %w", err)
+	}
+	return nil
 }
 
 func generationID(policyVersion, revision, space, fingerprint string) string {
