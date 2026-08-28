@@ -33,6 +33,7 @@ var (
 	errPublicationFailed   = errors.New("sqlite index publication failed")
 	errOpenExistingFailed  = errors.New("open existing sqlite index store failed")
 	errOpenExistingCleanup = errors.New("open existing sqlite index store cleanup failed")
+	errOpenWriterFailed    = errors.New("open sqlite index writer failed")
 )
 
 func openExistingFailure(operationErr error, cleanupErrs ...error) error {
@@ -96,7 +97,11 @@ func NewStore(directory string) (*Store, error) {
 }
 
 type storeOpenHooks struct {
-	beforeCreateDatabase func(string) error
+	beforeCreateDatabase         func(string) error
+	beforeFreshIdentityInsert    func(string) error
+	beforeIdentitySidecarPublish func(string) error
+	beforeOperationalConnection  func(string) error
+	afterOperationalConnection   func(string) error
 }
 
 func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
@@ -134,12 +139,16 @@ func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 		if err := inspectDatabase(databasePath); err != nil {
 			return nil, fmt.Errorf("create sqlite index store: %w", err)
 		}
-		if err := os.Chmod(canonical, 0o700); err != nil {
-			return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
+		if err := validateDatabaseFile(databaseInfo, true); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: %w", err)
+		}
+		if err := validatePrivateMode(info); err != nil {
+			return nil, errors.New("create sqlite index store: unsafe private directory")
 		}
 	}
 
 	created := false
+	var createdInfo fs.FileInfo
 	if !databaseExists {
 		if err := os.Chmod(canonical, 0o700); err != nil {
 			return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
@@ -149,7 +158,7 @@ func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 				return nil, fmt.Errorf("create sqlite index store: prepare database creation: %w", err)
 			}
 		}
-		created, err = createPrivateDatabaseFile(databasePath)
+		created, createdInfo, err = createPrivateDatabaseFileWithInfo(databasePath)
 		if err != nil {
 			return nil, fmt.Errorf("create sqlite index store: create database: %w", err)
 		}
@@ -164,42 +173,49 @@ func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 			if err := inspectDatabase(databasePath); err != nil {
 				return nil, fmt.Errorf("create sqlite index store: %w", err)
 			}
-			databaseExists = true
 		}
-	}
-	if created {
-		if err := initializeNewDatabase(databasePath); err != nil {
-			removeCreatedDatabase(databasePath)
-			return nil, fmt.Errorf("create sqlite index store: initialize database: %w", err)
-		}
-	}
-	if !databaseExists {
-		if err := inspectDatabase(databasePath); err != nil {
-			if created {
-				removeCreatedDatabase(databasePath)
-			}
-			return nil, fmt.Errorf("create sqlite index store: %w", err)
-		}
-	}
-	if databaseExists || created {
-		if err := os.Chmod(databasePath, 0o600); err != nil {
-			if created {
-				removeCreatedDatabase(databasePath)
-			}
-			return nil, fmt.Errorf("create sqlite index store: secure database: %w", err)
-		}
-	}
-	storeIdentity, err := initializeStoreIdentity(canonical, databasePath)
-	if err != nil {
-		if created {
-			removeCreatedDatabase(databasePath)
-		}
-		return nil, formatStoreIdentityError("create sqlite index store")
 	}
 
-	db, err := sql.Open("sqlite", dataSourceName(databasePath))
+	databaseInfo, err = secureDatabaseInfo(databasePath)
 	if err != nil {
-		return nil, fmt.Errorf("create sqlite index store: open database: %w", err)
+		if created {
+			removeCreatedStore(canonical, databasePath, createdInfo, "")
+		}
+		return nil, fmt.Errorf("create sqlite index store: %w", err)
+	}
+	if created && (createdInfo == nil || !os.SameFile(createdInfo, databaseInfo)) {
+		removeCreatedStore(canonical, databasePath, createdInfo, "")
+		return nil, formatStoreIdentityError("create sqlite index store")
+	}
+	storeIdentity := ""
+	if created {
+		storeIdentity, err = newStoreIdentity()
+		if err == nil {
+			err = initializeFreshStore(databasePath, databaseInfo, storeIdentity, hooks.beforeFreshIdentityInsert)
+		}
+		if err == nil {
+			err = createStoreIdentitySidecar(canonical, storeIdentity, hooks.beforeIdentitySidecarPublish)
+		}
+		if err != nil {
+			removeCreatedStore(canonical, databasePath, databaseInfo, storeIdentity)
+			return nil, formatStoreIdentityError("create sqlite index store")
+		}
+	} else {
+		storeIdentity, err = readStoreIdentitySidecar(canonical)
+		if err != nil {
+			return nil, formatStoreIdentityError("create sqlite index store")
+		}
+	}
+
+	db, err := openWriterDatabase(databasePath, databaseInfo, storeIdentity, hooks)
+	if err != nil {
+		if created {
+			removeCreatedStore(canonical, databasePath, databaseInfo, storeIdentity)
+		}
+		if errors.Is(err, index.ErrReindexRequired) {
+			return nil, formatStoreIdentityError("create sqlite index store")
+		}
+		return nil, fmt.Errorf("create sqlite index store: %w", errOpenWriterFailed)
 	}
 	store := &Store{
 		db:            db,
@@ -208,13 +224,6 @@ func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 		readers:       make(map[*BoundReader]struct{}),
 	}
 	store.writeToken <- struct{}{}
-	if err := db.PingContext(context.Background()); err != nil {
-		_ = db.Close()
-		if created {
-			removeCreatedDatabase(databasePath)
-		}
-		return nil, fmt.Errorf("create sqlite index store: open operational database: %w", err)
-	}
 	return store, nil
 }
 
@@ -362,26 +371,33 @@ func validatePrivateMode(info fs.FileInfo) error {
 }
 
 func createPrivateDatabaseFile(path string) (bool, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, fs.ErrExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if err := file.Close(); err != nil {
-		return false, err
-	}
-	return true, nil
+	created, _, err := createPrivateDatabaseFileWithInfo(path)
+	return created, err
 }
 
-func dataSourceName(path string) string {
+func createPrivateDatabaseFileWithInfo(path string) (bool, fs.FileInfo, error) {
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	info, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		return false, nil, statErr
+	}
+	if err := file.Close(); err != nil {
+		return false, nil, err
+	}
+	return true, info, nil
+}
+
+func writerDataSourceName(path string) string {
 	dsn := &url.URL{Scheme: "file", Path: path}
 	query := dsn.Query()
-	query.Add("_pragma", "busy_timeout(5000)")
-	query.Add("_pragma", "foreign_keys(1)")
-	query.Add("_pragma", "journal_mode(WAL)")
-	query.Add("_pragma", "secure_delete(ON)")
+	query.Set("mode", "rw")
 	dsn.RawQuery = query.Encode()
 	return dsn.String()
 }
@@ -396,10 +412,6 @@ func readOnlyDataSourceName(path string) string {
 	return dsn.String()
 }
 
-func bootstrapDataSourceName(path string) string {
-	return (&url.URL{Scheme: "file", Path: path}).String()
-}
-
 func inspectionDataSourceName(path string) string {
 	dsn := &url.URL{Scheme: "file", Path: path}
 	query := dsn.Query()
@@ -409,16 +421,154 @@ func inspectionDataSourceName(path string) string {
 	return dsn.String()
 }
 
-func initializeNewDatabase(path string) error {
-	db, err := sql.Open("sqlite", bootstrapDataSourceName(path))
+func initializeFreshStore(path string, expectedInfo fs.FileInfo, identity string, beforeIdentityInsert func(string) error) error {
+	db, err := sql.Open("sqlite", writerDataSourceName(path))
 	if err != nil {
-		return err
+		return invalidStoreIdentity()
 	}
-	if _, err := db.ExecContext(context.Background(), schemaSQL); err != nil {
+	connection, err := db.Conn(context.Background())
+	if err != nil {
 		_ = db.Close()
-		return err
+		return invalidStoreIdentity()
 	}
-	return db.Close()
+	closeAll := func(operationErr error) error {
+		connectionCloseErr := connection.Close()
+		databaseCloseErr := db.Close()
+		if operationErr != nil || connectionCloseErr != nil || databaseCloseErr != nil {
+			return invalidStoreIdentity()
+		}
+		return nil
+	}
+	afterOpenInfo, err := secureDatabaseInfo(path)
+	if err != nil || expectedInfo == nil || !os.SameFile(expectedInfo, afterOpenInfo) {
+		return closeAll(invalidStoreIdentity())
+	}
+	var identityInsertHook func() error
+	if beforeIdentityInsert != nil {
+		identityInsertHook = func() error { return beforeIdentityInsert(path) }
+	}
+	if err := initializeFreshDatabaseIdentity(context.Background(), connection, identity, identityInsertHook); err != nil {
+		return closeAll(err)
+	}
+	afterInitializationInfo, err := secureDatabaseInfo(path)
+	if err != nil || !os.SameFile(expectedInfo, afterInitializationInfo) {
+		return closeAll(invalidStoreIdentity())
+	}
+	return closeAll(nil)
+}
+
+func openWriterDatabase(path string, expectedInfo fs.FileInfo, identity string, hooks storeOpenHooks) (*sql.DB, error) {
+	if err := verifyWriterDatabaseImmutable(path, expectedInfo, identity, hooks); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", writerDataSourceName(path))
+	if err != nil {
+		return nil, errOpenWriterFailed
+	}
+	connection, err := db.Conn(context.Background())
+	if err != nil {
+		_ = db.Close()
+		return nil, errOpenWriterFailed
+	}
+	closeFailure := func(operationErr error) (*sql.DB, error) {
+		_ = connection.Close()
+		_ = db.Close()
+		return nil, operationErr
+	}
+	afterOpenInfo, err := secureDatabaseInfo(path)
+	if err != nil || expectedInfo == nil || !os.SameFile(expectedInfo, afterOpenInfo) {
+		return closeFailure(invalidStoreIdentity())
+	}
+	if err := validateSchema(context.Background(), connection); err != nil {
+		return closeFailure(invalidStoreIdentity())
+	}
+	if err := verifyStoreIdentity(context.Background(), connection, identity); err != nil {
+		return closeFailure(invalidStoreIdentity())
+	}
+	afterValidationInfo, err := secureDatabaseInfo(path)
+	if err != nil || !os.SameFile(expectedInfo, afterValidationInfo) {
+		return closeFailure(invalidStoreIdentity())
+	}
+	if err := configureWriterConnection(context.Background(), connection, true); err != nil {
+		return closeFailure(errOpenWriterFailed)
+	}
+	afterConfigurationInfo, err := secureDatabaseInfo(path)
+	if err != nil || !os.SameFile(expectedInfo, afterConfigurationInfo) {
+		return closeFailure(invalidStoreIdentity())
+	}
+	if err := connection.Close(); err != nil {
+		_ = db.Close()
+		return nil, errOpenWriterFailed
+	}
+	return db, nil
+}
+
+func verifyWriterDatabaseImmutable(path string, expectedInfo fs.FileInfo, identity string, hooks storeOpenHooks) error {
+	db, err := sql.Open("sqlite", inspectionDataSourceName(path))
+	if err != nil {
+		return invalidStoreIdentity()
+	}
+	if hooks.beforeOperationalConnection != nil {
+		if err := hooks.beforeOperationalConnection(path); err != nil {
+			_ = db.Close()
+			return invalidStoreIdentity()
+		}
+	}
+	connection, err := db.Conn(context.Background())
+	if err != nil {
+		_ = db.Close()
+		return invalidStoreIdentity()
+	}
+	closeAll := func(operationErr error) error {
+		connectionCloseErr := connection.Close()
+		databaseCloseErr := db.Close()
+		if operationErr != nil || connectionCloseErr != nil || databaseCloseErr != nil {
+			return invalidStoreIdentity()
+		}
+		return nil
+	}
+	if hooks.afterOperationalConnection != nil {
+		if err := hooks.afterOperationalConnection(path); err != nil {
+			return closeAll(invalidStoreIdentity())
+		}
+	}
+	afterOpenInfo, err := secureDatabaseInfo(path)
+	if err != nil || expectedInfo == nil || !os.SameFile(expectedInfo, afterOpenInfo) {
+		return closeAll(invalidStoreIdentity())
+	}
+	if err := validateSchema(context.Background(), connection); err != nil {
+		return closeAll(invalidStoreIdentity())
+	}
+	if err := verifyStoreIdentity(context.Background(), connection, identity); err != nil {
+		return closeAll(invalidStoreIdentity())
+	}
+	afterValidationInfo, err := secureDatabaseInfo(path)
+	if err != nil || !os.SameFile(expectedInfo, afterValidationInfo) {
+		return closeAll(invalidStoreIdentity())
+	}
+	return closeAll(nil)
+}
+
+func configureWriterConnection(ctx context.Context, connection *sql.Conn, configureJournal bool) error {
+	for _, statement := range []string{
+		`PRAGMA busy_timeout=5000`,
+		`PRAGMA foreign_keys=ON`,
+		`PRAGMA secure_delete=ON`,
+	} {
+		if _, err := connection.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	if configureJournal {
+		var mode string
+		if err := connection.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode); err != nil {
+			return err
+		}
+		if !strings.EqualFold(mode, "wal") {
+			return errors.New("sqlite WAL mode unavailable")
+		}
+	}
+	return nil
 }
 
 func inspectDatabase(path string) error {
@@ -714,10 +864,22 @@ func equalStrings(left, right []string) bool {
 	return true
 }
 
-func removeCreatedDatabase(path string) {
-	_ = os.Remove(path)
-	_ = os.Remove(path + "-wal")
-	_ = os.Remove(path + "-shm")
+func removeCreatedStore(directory, path string, expectedInfo fs.FileInfo, identity string) {
+	currentInfo, err := os.Lstat(path)
+	ownedDatabase := err == nil && expectedInfo != nil && os.SameFile(expectedInfo, currentInfo)
+	if ownedDatabase {
+		_ = os.Remove(path + "-wal")
+		_ = os.Remove(path + "-shm")
+		_ = os.Remove(path + "-journal")
+		_ = os.Remove(path)
+	}
+	if validStoreIdentity(identity) {
+		storedIdentity, readErr := readStoreIdentitySidecar(directory)
+		if readErr == nil && storedIdentity == identity {
+			_ = os.Remove(filepath.Join(directory, storeIdentitySidecar))
+		}
+	}
+	_ = syncStoreDirectory(directory)
 }
 
 // Close releases database resources.
@@ -841,6 +1003,10 @@ func (s *Store) publishAttempt(ctx context.Context, generation index.Generation,
 	if err := verifyStoreIdentity(ctx, connection, s.storeIdentity); err != nil {
 		_ = connection.Close()
 		return false, invalidStoreIdentity()
+	}
+	if err := configureWriterConnection(ctx, connection, false); err != nil {
+		_ = connection.Close()
+		return false, errOpenWriterFailed
 	}
 	return publishOnConnection(ctx, connection, generation, vectors)
 }
@@ -991,14 +1157,22 @@ func finalizeWriteConnection(connection writeConnection) (index.CleanupStage, er
 }
 
 func (s *Store) purgeInactive(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if err := verifyStoreIdentity(ctx, connection, s.storeIdentity); err != nil {
+		return err
+	}
+	if err := configureWriterConnection(ctx, connection, false); err != nil {
+		return err
+	}
+	tx, err := connection.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := verifyStoreIdentity(ctx, tx, s.storeIdentity); err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM generations
 		WHERE NOT EXISTS (

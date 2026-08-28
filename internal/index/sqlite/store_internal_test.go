@@ -6,11 +6,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/index"
@@ -18,7 +20,23 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
-func TestWriterInitializesPrivateStoreIdentityAndReadOnlyRequiresIt(t *testing.T) {
+func bootstrapDataSourceName(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String()
+}
+
+func initializeNewDatabase(path string) error {
+	database, err := sql.Open("sqlite", bootstrapDataSourceName(path))
+	if err != nil {
+		return err
+	}
+	if _, err := database.ExecContext(context.Background(), schemaSQL); err != nil {
+		_ = database.Close()
+		return err
+	}
+	return database.Close()
+}
+
+func TestPreExistingIdentityLessStoreRequiresReindexWithoutMutation(t *testing.T) {
 	directory := t.TempDir()
 	databasePath := filepath.Join(directory, databaseName)
 	created, err := createPrivateDatabaseFile(databasePath)
@@ -34,23 +52,60 @@ func TestWriterInitializesPrivateStoreIdentityAndReadOnlyRequiresIt(t *testing.T
 	if err := os.Chmod(directory, 0o700); err != nil {
 		t.Fatalf("Chmod(directory) error = %v", err)
 	}
-
-	legacyReader, err := OpenExisting(directory)
-	if legacyReader != nil {
-		_ = legacyReader.Close()
-		t.Fatal("OpenExisting(legacy store) returned store, want nil")
+	beforeBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(database before) error = %v", err)
 	}
-	if !errors.Is(err, index.ErrReindexRequired) {
-		t.Fatalf("OpenExisting(legacy store) error = %v, want ErrReindexRequired", err)
-	}
-	identityPath := filepath.Join(directory, "index-v2.identity.json")
-	if _, err := os.Lstat(identityPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("OpenExisting(legacy store) identity sidecar error = %v, want absent", err)
+	beforeEntries, err := internalDirectoryEntries(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(before) error = %v", err)
 	}
 
+	for _, open := range []struct {
+		name string
+		open func(string) (*Store, error)
+	}{
+		{name: "read-only", open: OpenExisting},
+		{name: "writer", open: NewStore},
+	} {
+		t.Run(open.name, func(t *testing.T) {
+			store, err := open.open(directory)
+			if store != nil {
+				_ = store.Close()
+				t.Fatalf("%s open returned store, want nil", open.name)
+			}
+			if !errors.Is(err, index.ErrReindexRequired) {
+				t.Fatalf("%s open error = %v, want ErrReindexRequired", open.name, err)
+			}
+		})
+	}
+	afterBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(database after) error = %v", err)
+	}
+	if !bytes.Equal(afterBytes, beforeBytes) {
+		t.Fatal("identity-less store was mutated")
+	}
+	afterEntries, err := internalDirectoryEntries(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(after) error = %v", err)
+	}
+	if !reflect.DeepEqual(afterEntries, beforeEntries) {
+		t.Fatalf("identity-less store entries = %v, want unchanged %v", afterEntries, beforeEntries)
+	}
+	for _, sidecar := range []string{databasePath + "-wal", databasePath + "-shm", filepath.Join(directory, storeIdentitySidecar)} {
+		if _, statErr := os.Lstat(sidecar); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("Lstat(%s) error = %v, want absent", filepath.Base(sidecar), statErr)
+		}
+	}
+}
+
+func TestFreshWriterCreatesPrivateSingletonStoreIdentity(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, databaseName)
 	writer, err := NewStore(directory)
 	if err != nil {
-		t.Fatalf("NewStore(legacy store) error = %v", err)
+		t.Fatalf("NewStore() error = %v", err)
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("Close(writer) error = %v", err)
@@ -62,6 +117,7 @@ func TestWriterInitializesPrivateStoreIdentityAndReadOnlyRequiresIt(t *testing.T
 	if err := secondWriter.Close(); err != nil {
 		t.Fatalf("Close(second writer) error = %v", err)
 	}
+	identityPath := filepath.Join(directory, storeIdentitySidecar)
 	payload, err := os.ReadFile(identityPath)
 	if err != nil {
 		t.Fatalf("ReadFile(identity) error = %v", err)
@@ -105,6 +161,20 @@ func TestWriterInitializesPrivateStoreIdentityAndReadOnlyRequiresIt(t *testing.T
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close(reader) error = %v", err)
+	}
+}
+
+func TestWriterDataSourceNeverCreatesOrConfiguresBeforeIdentityVerification(t *testing.T) {
+	dsn, err := url.Parse(writerDataSourceName(filepath.Join(t.TempDir(), databaseName)))
+	if err != nil {
+		t.Fatalf("url.Parse(writer data source) error = %v", err)
+	}
+	query := dsn.Query()
+	if query.Get("mode") != "rw" {
+		t.Fatalf("writer mode = %q, want rw", query.Get("mode"))
+	}
+	if pragmas := query["_pragma"]; len(pragmas) != 0 {
+		t.Fatalf("writer data source pragmas = %v, want none before identity verification", pragmas)
 	}
 }
 
@@ -257,6 +327,7 @@ func TestNewStoreValidatesExclusiveCreateCollisionBeforeMutableOpen(t *testing.T
 		name   string
 		schema string
 	}{
+		{name: "identity-less v1", schema: schemaSQL},
 		{name: "future schema", schema: `CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2)`},
 		{name: "unrelated sqlite", schema: `CREATE TABLE unrelated(value TEXT)`},
 	} {
@@ -316,6 +387,175 @@ func TestNewStoreValidatesExclusiveCreateCollisionBeforeMutableOpen(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestFreshStoreIdentityPublicationFailureRemovesCreatedArtifacts(t *testing.T) {
+	directory := t.TempDir()
+	privateCanary := errors.New("PRIVATE_IDENTITY_PUBLICATION_CANARY")
+	store, err := newStore(directory, storeOpenHooks{
+		beforeIdentitySidecarPublish: func(string) error {
+			return privateCanary
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(identity publication failure) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("newStore(identity publication failure) error = %v, want ErrReindexRequired", err)
+	}
+	if errorTreeContains(err, privateCanary.Error()) {
+		t.Fatalf("newStore(identity publication failure) error exposes %q", privateCanary)
+	}
+	entries, readErr := internalDirectoryEntries(directory)
+	if readErr != nil {
+		t.Fatalf("ReadDir(after failed creation) error = %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed fresh store entries = %v, want no created artifacts", entries)
+	}
+}
+
+func TestFreshStoreInitializationFailureRollsBackAndRemovesCreatedArtifacts(t *testing.T) {
+	directory := t.TempDir()
+	privateCanary := errors.New("PRIVATE_IDENTITY_INITIALIZATION_CANARY")
+	store, err := newStore(directory, storeOpenHooks{
+		beforeFreshIdentityInsert: func(string) error {
+			return privateCanary
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(identity initialization failure) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("newStore(identity initialization failure) error = %v, want ErrReindexRequired", err)
+	}
+	if errorTreeContains(err, privateCanary.Error()) {
+		t.Fatalf("newStore(identity initialization failure) error exposes %q", privateCanary)
+	}
+	entries, readErr := internalDirectoryEntries(directory)
+	if readErr != nil {
+		t.Fatalf("ReadDir(after failed initialization) error = %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed fresh initialization entries = %v, want no created artifacts", entries)
+	}
+}
+
+func TestConcurrentNewStoreCreatesExactlyOneStoreIdentity(t *testing.T) {
+	directory := t.TempDir()
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			store, err := NewStore(directory)
+			if store != nil {
+				err = errors.Join(err, store.Close())
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(err, index.ErrReindexRequired) {
+			t.Fatalf("concurrent NewStore() error = %v, want nil or transient ErrReindexRequired", err)
+		}
+	}
+	if successes == 0 {
+		t.Fatal("concurrent NewStore() had no successful creator")
+	}
+	reopened, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore(after concurrent creation) error = %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close(reopened) error = %v", err)
+	}
+
+	identity, err := readStoreIdentitySidecar(directory)
+	if err != nil {
+		t.Fatalf("readStoreIdentitySidecar() error = %v", err)
+	}
+	database, err := sql.Open("sqlite", inspectionDataSourceName(filepath.Join(directory, databaseName)))
+	if err != nil {
+		t.Fatalf("sql.Open(identity inspection) error = %v", err)
+	}
+	defer database.Close()
+	identities, err := loadDatabaseIdentities(context.Background(), database)
+	if err != nil {
+		t.Fatalf("loadDatabaseIdentities() error = %v", err)
+	}
+	if len(identities) != 1 || identities[0] != identity {
+		t.Fatalf("database identities = %v, want singleton sidecar identity", identities)
+	}
+}
+
+func TestNewStoreRejectsMultipleReservedIdentitiesWithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	databasePath := filepath.Join(directory, databaseName)
+	database, err := sql.Open("sqlite", writerDataSourceName(databasePath))
+	if err != nil {
+		t.Fatalf("sql.Open(corrupt identity fixture) error = %v", err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO repositories(repository_id, active_generation) VALUES (?, NULL)`,
+		storeIdentityRepositoryID(strings.Repeat("b", 64)),
+	); err != nil {
+		_ = database.Close()
+		t.Fatalf("insert second identity error = %v", err)
+	}
+	if _, err := database.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		_ = database.Close()
+		t.Fatalf("checkpoint corrupt identity fixture error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("Close(corrupt identity fixture) error = %v", err)
+	}
+	beforeBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(before) error = %v", err)
+	}
+	beforeEntries, err := internalDirectoryEntries(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(before) error = %v", err)
+	}
+
+	opened, err := NewStore(directory)
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("NewStore(multiple identities) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("NewStore(multiple identities) error = %v, want ErrReindexRequired", err)
+	}
+	afterBytes, err := os.ReadFile(databasePath)
+	if err != nil || !bytes.Equal(afterBytes, beforeBytes) {
+		t.Fatalf("multiple-identity database changed: read error %v", err)
+	}
+	afterEntries, err := internalDirectoryEntries(directory)
+	if err != nil || !reflect.DeepEqual(afterEntries, beforeEntries) {
+		t.Fatalf("multiple-identity entries = %v, %v; want %v", afterEntries, err, beforeEntries)
 	}
 }
 
@@ -428,6 +668,100 @@ func TestOpenExistingRejectsDatabaseABAWhileOpening(t *testing.T) {
 	}
 	if _, err := os.Lstat(secondPath); err != nil {
 		t.Fatalf("Lstat(second restored database) error = %v", err)
+	}
+}
+
+func TestNewStoreRejectsDatabaseABAWhileOpeningWithoutMutation(t *testing.T) {
+	firstDirectory, firstPath := internalIdentityStore(t, "first-writer-repository", "first-writer-generation")
+	secondDirectory, secondPath := internalIdentityStore(t, "second-writer-repository", "second-writer-generation")
+	firstIdentity, err := readStoreIdentitySidecar(firstDirectory)
+	if err != nil {
+		t.Fatalf("readStoreIdentitySidecar(first) error = %v", err)
+	}
+	secondIdentity, err := readStoreIdentitySidecar(secondDirectory)
+	if err != nil {
+		t.Fatalf("readStoreIdentitySidecar(second) error = %v", err)
+	}
+	firstBefore, err := os.ReadFile(firstPath)
+	if err != nil {
+		t.Fatalf("ReadFile(first before) error = %v", err)
+	}
+	secondBefore, err := os.ReadFile(secondPath)
+	if err != nil {
+		t.Fatalf("ReadFile(second before) error = %v", err)
+	}
+	firstEntries, err := internalDirectoryEntries(firstDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(first before) error = %v", err)
+	}
+	secondEntries, err := internalDirectoryEntries(secondDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(second before) error = %v", err)
+	}
+	firstAside := firstPath + ".original"
+
+	store, err := newStore(firstDirectory, storeOpenHooks{
+		beforeOperationalConnection: func(string) error {
+			if err := os.Rename(firstPath, firstAside); err != nil {
+				return err
+			}
+			return os.Rename(secondPath, firstPath)
+		},
+		afterOperationalConnection: func(string) error {
+			if err := os.Rename(firstPath, secondPath); err != nil {
+				return err
+			}
+			return os.Rename(firstAside, firstPath)
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(ABA) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("newStore(ABA) error = %v, want ErrReindexRequired", err)
+	}
+	for _, identity := range []string{firstIdentity, secondIdentity} {
+		if strings.Contains(err.Error(), identity) {
+			t.Fatalf("newStore(ABA) error exposes opaque store identity %q", identity)
+		}
+	}
+	firstAfter, readErr := os.ReadFile(firstPath)
+	if readErr != nil || !bytes.Equal(firstAfter, firstBefore) {
+		t.Fatalf("first database changed after writer ABA: read error %v", readErr)
+	}
+	secondAfter, readErr := os.ReadFile(secondPath)
+	if readErr != nil || !bytes.Equal(secondAfter, secondBefore) {
+		t.Fatalf("second database changed after writer ABA: read error %v", readErr)
+	}
+	firstAfterEntries, err := internalDirectoryEntries(firstDirectory)
+	if err != nil || !reflect.DeepEqual(firstAfterEntries, firstEntries) {
+		t.Fatalf("first entries after ABA = %v, %v; want %v", firstAfterEntries, err, firstEntries)
+	}
+	secondAfterEntries, err := internalDirectoryEntries(secondDirectory)
+	if err != nil || !reflect.DeepEqual(secondAfterEntries, secondEntries) {
+		t.Fatalf("second entries after ABA = %v, %v; want %v", secondAfterEntries, err, secondEntries)
+	}
+}
+
+func TestNewStoreDoesNotRecreateDatabaseDeletedBeforeWriterConnection(t *testing.T) {
+	directory, databasePath := internalIdentityStore(t, "deleted-writer-repository", "deleted-writer-generation")
+	store, err := newStore(directory, storeOpenHooks{
+		beforeOperationalConnection: func(path string) error {
+			return os.Remove(path)
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("newStore(deleted database) returned store, want nil")
+	}
+	if err == nil {
+		t.Fatal("newStore(deleted database) error = nil, want failure")
+	}
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("Lstat(%s) error = %v, want absent and not recreated", filepath.Base(path), statErr)
+		}
 	}
 }
 

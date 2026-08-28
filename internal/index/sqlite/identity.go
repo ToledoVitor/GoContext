@@ -60,63 +60,62 @@ func isStoreIdentityRepositoryID(repositoryID string) bool {
 	return strings.HasPrefix(repositoryID, storeIdentityPrefix)
 }
 
-func initializeStoreIdentity(directory, databasePath string) (string, error) {
-	sidecarIdentity, sidecarErr := readStoreIdentitySidecar(directory)
-	if sidecarErr != nil && !errors.Is(sidecarErr, fs.ErrNotExist) {
-		return "", invalidStoreIdentity()
+func initializeFreshDatabaseIdentity(
+	ctx context.Context,
+	connection *sql.Conn,
+	identity string,
+	beforeIdentityInsert func() error,
+) error {
+	if !validStoreIdentity(identity) {
+		return invalidStoreIdentity()
 	}
+	if _, err := connection.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return invalidStoreIdentity()
+	}
+	transactionOpen := true
+	defer func() {
+		if transactionOpen {
+			_, _ = connection.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
 
-	db, err := sql.Open("sqlite", bootstrapDataSourceName(databasePath))
-	if err != nil {
-		return "", invalidStoreIdentity()
+	var applicationObjects int
+	if err := connection.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM sqlite_schema
+		WHERE name NOT LIKE 'sqlite_%'`,
+	).Scan(&applicationObjects); err != nil || applicationObjects != 0 {
+		return invalidStoreIdentity()
 	}
-	closeDatabase := func(operationErr error) (string, error) {
-		if closeErr := db.Close(); closeErr != nil && operationErr == nil {
-			operationErr = invalidStoreIdentity()
-		}
-		return "", operationErr
+	if _, err := connection.ExecContext(ctx, schemaSQL); err != nil {
+		return invalidStoreIdentity()
 	}
-	if err := validateSchema(context.Background(), db); err != nil {
-		return closeDatabase(invalidStoreIdentity())
+	identities, err := loadDatabaseIdentities(ctx, connection)
+	if err != nil || len(identities) != 0 {
+		return invalidStoreIdentity()
 	}
-	databaseIdentities, err := loadDatabaseIdentities(context.Background(), db)
-	if err != nil || len(databaseIdentities) > 1 {
-		return closeDatabase(invalidStoreIdentity())
-	}
-
-	identity := sidecarIdentity
-	if len(databaseIdentities) == 1 {
-		if identity != "" && identity != databaseIdentities[0] {
-			return closeDatabase(invalidStoreIdentity())
-		}
-		identity = databaseIdentities[0]
-	}
-	if identity == "" {
-		identity, err = newStoreIdentity()
-		if err != nil {
-			return closeDatabase(err)
+	if beforeIdentityInsert != nil {
+		if err := beforeIdentityInsert(); err != nil {
+			return invalidStoreIdentity()
 		}
 	}
-	if len(databaseIdentities) == 0 {
-		if _, err := db.ExecContext(context.Background(),
-			`INSERT INTO repositories(repository_id, active_generation) VALUES (?, NULL)`,
-			storeIdentityRepositoryID(identity),
-		); err != nil {
-			return closeDatabase(invalidStoreIdentity())
-		}
+	if _, err := connection.ExecContext(ctx,
+		`INSERT INTO repositories(repository_id, active_generation) VALUES (?, NULL)`,
+		storeIdentityRepositoryID(identity),
+	); err != nil {
+		return invalidStoreIdentity()
 	}
-	if _, err := db.ExecContext(context.Background(), `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		return closeDatabase(invalidStoreIdentity())
+	if err := validateSchema(ctx, connection); err != nil {
+		return invalidStoreIdentity()
 	}
-	if _, err := closeDatabase(nil); err != nil {
-		return "", err
+	if err := verifyStoreIdentity(ctx, connection, identity); err != nil {
+		return invalidStoreIdentity()
 	}
-	if sidecarIdentity == "" {
-		if err := createStoreIdentitySidecar(directory, identity); err != nil {
-			return "", invalidStoreIdentity()
-		}
+	if _, err := connection.ExecContext(ctx, `COMMIT`); err != nil {
+		return invalidStoreIdentity()
 	}
-	return identity, nil
+	transactionOpen = false
+	return nil
 }
 
 func loadDatabaseIdentities(ctx context.Context, queryer schemaQuerier) ([]string, error) {
@@ -206,7 +205,7 @@ func validatePrivateRegularFile(info fs.FileInfo) error {
 	return nil
 }
 
-func createStoreIdentitySidecar(directory, identity string) error {
+func createStoreIdentitySidecar(directory, identity string, beforePublish func(string) error) error {
 	payload, err := json.Marshal(storeIdentityDocument{Version: storeIdentityVersion, StoreID: identity})
 	if err != nil {
 		return invalidStoreIdentity()
@@ -238,16 +237,16 @@ func createStoreIdentitySidecar(directory, identity string) error {
 		return invalidStoreIdentity()
 	}
 	target := filepath.Join(directory, storeIdentitySidecar)
-	if err := os.Link(temporaryPath, target); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			existing, readErr := readStoreIdentitySidecar(directory)
-			if readErr == nil && existing == identity {
-				return nil
-			}
+	if beforePublish != nil {
+		if err := beforePublish(target); err != nil {
+			return invalidStoreIdentity()
 		}
-		return invalidStoreIdentity()
 	}
-	if err := os.Remove(temporaryPath); err != nil {
+	if err := publishStoreIdentitySidecar(temporaryPath, target, directory); err != nil {
+		existing, readErr := readStoreIdentitySidecar(directory)
+		if readErr == nil && existing == identity {
+			return nil
+		}
 		return invalidStoreIdentity()
 	}
 	keepTemporary = false
