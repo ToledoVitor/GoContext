@@ -10,3 +10,7 @@ import (
 func openNoFollow(repositoryHandle, string, bool) (*os.File, error) {
 	return nil, errors.New("descriptor-relative no-follow open is unavailable")
 }
+
+func openRootNoFollow(string) (*os.File, error) {
+	return nil, errors.New("no-follow root open is unavailable")
+}

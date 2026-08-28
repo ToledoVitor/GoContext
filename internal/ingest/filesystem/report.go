@@ -19,10 +19,11 @@ var safeUnsupportedExtensions = map[string]struct{}{
 
 func newScanReport() ingest.ScanReport {
 	return ingest.ScanReport{
-		Excluded:               make(map[ingest.ExclusionReason]int),
-		IncludedByLanguage:     make(map[source.Language]int),
-		SizeBands:              make(map[string]int),
-		UnsupportedByExtension: make(map[string]int),
+		Excluded:                    make(map[ingest.ExclusionReason]int),
+		IncludedByLanguage:          make(map[source.Language]int),
+		SizeBands:                   make(map[string]int),
+		UnsupportedByExtension:      make(map[string]int),
+		UnsupportedBytesByExtension: make(map[string]int64),
 	}
 }
 
@@ -30,7 +31,7 @@ func addExclusion(report *ingest.ScanReport, reason ingest.ExclusionReason) {
 	report.Excluded[reason]++
 }
 
-func addUnsupported(report *ingest.ScanReport, name string) {
+func addUnsupported(report *ingest.ScanReport, name string, bytes int64) {
 	addExclusion(report, ingest.ExclusionUnsupportedExtension)
 	extension := strings.ToLower(path.Ext(name))
 	if extension == "" {
@@ -39,6 +40,7 @@ func addUnsupported(report *ingest.ScanReport, name string) {
 		extension = "<other>"
 	}
 	report.UnsupportedByExtension[extension]++
+	report.UnsupportedBytesByExtension[extension] += bytes
 }
 
 func addIncluded(report *ingest.ScanReport, language source.Language, bytes int64) {

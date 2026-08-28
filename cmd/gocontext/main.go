@@ -32,6 +32,8 @@ func runWithSearchObserver(args []string, stdout, stderr io.Writer, observer sea
 		return runIndex(context.Background(), args[1:], stdout, stderr)
 	case "search":
 		return runSearchWithObserver(context.Background(), args[1:], stdout, stderr, observer)
+	case "eval":
+		return runEval(context.Background(), args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		printUsage(stdout)
 		return 0

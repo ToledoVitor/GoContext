@@ -30,14 +30,15 @@ const (
 
 // ScanReport contains only aggregate inventory and exclusion statistics.
 type ScanReport struct {
-	EligibleFiles          int
-	EligibleBytes          int64
-	IncludedFiles          int
-	IncludedBytes          int64
-	Excluded               map[ExclusionReason]int
-	IncludedByLanguage     map[source.Language]int
-	SizeBands              map[string]int
-	UnsupportedByExtension map[string]int
+	EligibleFiles               int
+	EligibleBytes               int64
+	IncludedFiles               int
+	IncludedBytes               int64
+	Excluded                    map[ExclusionReason]int
+	IncludedByLanguage          map[source.Language]int
+	SizeBands                   map[string]int
+	UnsupportedByExtension      map[string]int
+	UnsupportedBytesByExtension map[string]int64
 }
 
 // ScanResult binds eligible source files to the policy and audit report that

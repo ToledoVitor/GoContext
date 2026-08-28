@@ -201,6 +201,22 @@ func TestScanReportBucketsUnrecognizedExtensionsWithoutLeakingNameFragment(t *te
 	}
 }
 
+func TestScanReportsUnsupportedExtensionBytesWithoutOpeningUnsupportedFile(t *testing.T) {
+	root := t.TempDir()
+	unsupportedPath := filepath.Join(root, "notes.md")
+	if err := os.WriteFile(unsupportedPath, []byte("seven!!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := filesystem.NewScanner().Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if got := result.Report.UnsupportedBytesByExtension[".md"]; got != 7 {
+		t.Fatalf("unsupported .md bytes = %d, want 7", got)
+	}
+}
+
 func TestScannerPreflightsNestedRepositoriesBeforeAnyChild(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, ".git/config", "root metadata\n")

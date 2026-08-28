@@ -56,7 +56,7 @@ func (s *Scanner) Scan(ctx context.Context, root string) (ingest.ScanResult, err
 		return ingest.ScanResult{}, fmt.Errorf("scan repository: root is empty")
 	}
 
-	repository, err := os.Open(root)
+	repository, err := openRootNoFollow(root)
 	if err != nil {
 		return ingest.ScanResult{}, fmt.Errorf("scan repository: open root failed")
 	}
@@ -158,7 +158,17 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 
 		language, supported := languageForPath(relativePath)
 		if !supported {
-			addUnsupported(&result.Report, entry.Name())
+			if entryInfo == nil {
+				entryInfo, err = entry.Info()
+				if err != nil {
+					return sanitizedPathError("inspect-unsupported", relativePath)
+				}
+			}
+			var unsupportedBytes int64
+			if entryInfo.Mode().IsRegular() {
+				unsupportedBytes = entryInfo.Size()
+			}
+			addUnsupported(&result.Report, entry.Name(), unsupportedBytes)
 			continue
 		}
 

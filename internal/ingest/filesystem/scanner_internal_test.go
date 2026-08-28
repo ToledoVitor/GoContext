@@ -37,6 +37,30 @@ func TestScannerAppliesHardDenyBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestScannerAggregatesUnsupportedMetadataWithoutOpeningContent(t *testing.T) {
+	root := t.TempDir()
+	writeInternalFile(t, root, "notes.md", "metadata-only")
+	fileOpens := 0
+	scanner := &Scanner{
+		openPath: func(directory repositoryHandle, name string, wantDirectory bool) (repositoryHandle, error) {
+			if !wantDirectory {
+				fileOpens++
+			}
+			return openNoFollow(directory, name, wantDirectory)
+		},
+	}
+	result, err := scanner.Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if fileOpens != 0 {
+		t.Fatalf("unsupported file opens = %d, want zero", fileOpens)
+	}
+	if result.Report.UnsupportedByExtension[".md"] != 1 || result.Report.UnsupportedBytesByExtension[".md"] != 13 {
+		t.Fatalf("unsupported aggregate = %#v/%#v", result.Report.UnsupportedByExtension, result.Report.UnsupportedBytesByExtension)
+	}
+}
+
 func TestScannerFailsClosedWhenAllowedFileCannotBeRead(t *testing.T) {
 	root := t.TempDir()
 	writeInternalFile(t, root, "allowed.py", "read-error-canary\n")
@@ -96,6 +120,19 @@ func TestScannerRejectsFileSwappedToSymlinkBeforeOpen(t *testing.T) {
 		if strings.Contains(err.Error(), sensitive) {
 			t.Errorf("Scan() error = %q, must not expose %q", err, sensitive)
 		}
+	}
+}
+
+func TestScannerRejectsRepositoryRootSymlink(t *testing.T) {
+	realRoot := t.TempDir()
+	writeInternalFile(t, realRoot, "safe.py", "print('safe')\n")
+	alias := filepath.Join(t.TempDir(), "root-alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewScanner().Scan(context.Background(), alias)
+	if err == nil || !strings.Contains(err.Error(), "open root failed") {
+		t.Fatalf("Scan() error = %v, want sanitized no-follow root failure", err)
 	}
 }
 

@@ -20,3 +20,11 @@ func openNoFollow(directory repositoryHandle, name string, wantDirectory bool) (
 	}
 	return os.NewFile(uintptr(fileDescriptor), filepath.Join(directory.Name(), name)), nil
 }
+
+func openRootNoFollow(root string) (*os.File, error) {
+	fileDescriptor, err := unix.Open(root, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fileDescriptor), root), nil
+}
