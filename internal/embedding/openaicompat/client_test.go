@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -119,13 +120,17 @@ func TestClientRejectsInvalidResponseBatchShape(t *testing.T) {
 	tests := []struct {
 		name       string
 		dimensions int
+		textCount  int
 		body       string
 	}{
 		{name: "missing item", dimensions: 2, body: `{"data":[]}`},
-		{name: "duplicate index", dimensions: 2, body: `{"data":[{"index":0,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}`},
-		{name: "out of range index", dimensions: 2, body: `{"data":[{"index":2,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}`},
+		{name: "duplicate index", dimensions: 2, textCount: 2, body: `{"data":[{"index":0,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}`},
+		{name: "out of range index", dimensions: 2, textCount: 2, body: `{"data":[{"index":2,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}`},
+		{name: "missing index", dimensions: 1, body: `{"data":[{"embedding":[1]}]}`},
+		{name: "null index", dimensions: 1, body: `{"data":[{"index":null,"embedding":[1]}]}`},
 		{name: "requested dimension mismatch", dimensions: 2, body: `{"data":[{"index":0,"embedding":[1]}]}`},
-		{name: "inconsistent inferred dimensions", dimensions: 0, body: `{"data":[{"index":0,"embedding":[1,0]},{"index":1,"embedding":[1]}]}`},
+		{name: "inconsistent inferred dimensions", dimensions: 0, textCount: 2, body: `{"data":[{"index":0,"embedding":[1,0]},{"index":1,"embedding":[1]}]}`},
+		{name: "null vector component", dimensions: 2, body: `{"data":[{"index":0,"embedding":[1,null]}]}`},
 		{name: "non finite component", dimensions: 1, body: `{"data":[{"index":0,"embedding":[1e1000]}]}`},
 	}
 
@@ -138,9 +143,13 @@ func TestClientRejectsInvalidResponseBatchShape(t *testing.T) {
 			defer server.Close()
 
 			client := newFixtureClient(t, server.URL, test.dimensions)
-			texts := []string{"synthetic-alpha"}
-			if strings.Contains(test.name, "index") || strings.Contains(test.name, "inferred") {
-				texts = append(texts, "synthetic-beta")
+			textCount := test.textCount
+			if textCount == 0 {
+				textCount = 1
+			}
+			texts := make([]string, textCount)
+			for index := range texts {
+				texts[index] = fmt.Sprintf("synthetic-%d", index)
 			}
 			_, err := client.Embed(context.Background(), embedding.PurposeDocument, texts)
 			if !errors.Is(err, embedding.ErrInvalidBatch) {
@@ -269,6 +278,35 @@ func TestRetryDoesNotRetryOtherClientErrors(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRetryMaxIntCapsBeforeAddingAttempt(t *testing.T) {
+	client, err := New(Config{
+		BaseURL:    "https://api.example.com/v1",
+		Model:      "fixture-model",
+		Dimensions: 1,
+		MaxRetries: math.MaxInt,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	attempts := 0
+	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts < 3 {
+			return responseWithStatus(http.StatusServiceUnavailable, "retry-body-canary"), nil
+		}
+		return embeddingSuccessResponse(), nil
+	})
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+
+	batch, err := client.Embed(context.Background(), embedding.PurposeQuery, []string{"retry-max-input-canary"})
+	if err != nil {
+		t.Fatalf("Embed() error = %v", err)
+	}
+	if attempts != 3 || batch.Requests != 3 {
+		t.Fatalf("attempts/Requests = %d/%d, want 3/3", attempts, batch.Requests)
 	}
 }
 
@@ -503,6 +541,45 @@ func TestClientRejectsSingletonAboveBatchByteLimitWithoutNetwork(t *testing.T) {
 	}
 	if requests != 0 {
 		t.Fatalf("HTTP requests = %d, want 0", requests)
+	}
+}
+
+func TestClientBatchSizeMaxIntDoesNotOverflow(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		if !reflect.DeepEqual(body.Input, []string{"synthetic-alpha", "synthetic-beta"}) {
+			t.Errorf("input = %#v, want both inputs in one request", body.Input)
+		}
+		_, _ = writer.Write([]byte(`{"data":[{"index":1,"embedding":[0,1]},{"index":0,"embedding":[1,0]}]}`))
+	}))
+	defer server.Close()
+
+	client, err := New(Config{
+		BaseURL:    server.URL + "/v1",
+		Model:      "fixture-model",
+		Dimensions: 2,
+		BatchSize:  math.MaxInt,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	batch, err := client.Embed(context.Background(), embedding.PurposeDocument, []string{"synthetic-alpha", "synthetic-beta"})
+	if err != nil {
+		t.Fatalf("Embed() error = %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("HTTP requests = %d, want 1", requests)
+	}
+	if !reflect.DeepEqual(batch.Vectors, []embedding.Vector{{1, 0}, {0, 1}}) {
+		t.Fatalf("Embed().Vectors = %#v, want ordered vectors", batch.Vectors)
 	}
 }
 

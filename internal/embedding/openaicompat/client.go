@@ -27,13 +27,43 @@ type embeddingRequest struct {
 }
 
 type embeddingResponse struct {
-	Data []struct {
-		Embedding embedding.Vector `json:"embedding"`
-		Index     int              `json:"index"`
-	} `json:"data"`
+	Data  []embeddingResponseItem `json:"data"`
 	Usage struct {
 		TotalTokens int `json:"total_tokens"`
 	} `json:"usage"`
+}
+
+type embeddingResponseItem struct {
+	Embedding embedding.Vector
+	Index     int
+}
+
+func (item *embeddingResponseItem) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Embedding json.RawMessage `json:"embedding"`
+		Index     *int            `json:"index"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil || wire.Index == nil || len(wire.Embedding) == 0 || bytes.Equal(bytes.TrimSpace(wire.Embedding), []byte("null")) {
+		return errors.New("invalid embedding response item")
+	}
+
+	var components []json.RawMessage
+	if err := json.Unmarshal(wire.Embedding, &components); err != nil {
+		return errors.New("invalid embedding response item")
+	}
+	vector := make(embedding.Vector, len(components))
+	for index, component := range components {
+		if bytes.Equal(bytes.TrimSpace(component), []byte("null")) {
+			return errors.New("invalid embedding response item")
+		}
+		if err := json.Unmarshal(component, &vector[index]); err != nil {
+			return errors.New("invalid embedding response item")
+		}
+	}
+
+	item.Index = *wire.Index
+	item.Embedding = vector
+	return nil
 }
 
 type encodedBatch struct {
@@ -179,11 +209,15 @@ func (client *Client) encodeBatches(texts []string) ([]encodedBatch, error) {
 		return nil, embedding.ErrInvalidBatch
 	}
 
-	batches := make([]encodedBatch, 0, (len(texts)+client.config.BatchSize-1)/client.config.BatchSize)
+	batchCapacity := len(texts) / client.config.BatchSize
+	if len(texts)%client.config.BatchSize != 0 {
+		batchCapacity++
+	}
+	batches := make([]encodedBatch, 0, batchCapacity)
 	for start := 0; start < len(texts); {
-		limit := start + client.config.BatchSize
-		if limit > len(texts) {
-			limit = len(texts)
+		limit := len(texts)
+		if remaining := len(texts) - start; client.config.BatchSize < remaining {
+			limit = start + client.config.BatchSize
 		}
 
 		selectedEnd := start
@@ -203,6 +237,9 @@ func (client *Client) encodeBatches(texts []string) ([]encodedBatch, error) {
 			}
 			selectedEnd = end
 			selectedPayload = payload
+			if end == limit {
+				break
+			}
 		}
 		if selectedEnd == start {
 			return nil, embedding.ErrInvalidBatch
@@ -271,10 +308,11 @@ func normalizeVector(vector embedding.Vector) error {
 }
 
 func (client *Client) requestWithRetry(ctx context.Context, payload []byte) (embeddingResponse, int, error) {
-	limit := client.config.MaxRetries + 1
-	if limit > 3 {
-		limit = 3
+	retries := client.config.MaxRetries
+	if retries > 2 {
+		retries = 2
 	}
+	limit := retries + 1
 
 	for attempt := 1; attempt <= limit; attempt++ {
 		wire, temporary, retryAfter, err := client.requestOnce(ctx, payload)
