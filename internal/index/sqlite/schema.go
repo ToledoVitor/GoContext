@@ -1,6 +1,6 @@
 package sqlite
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 const generationsTableSQL = `CREATE TABLE IF NOT EXISTS generations (
     repository_id TEXT NOT NULL,
@@ -12,6 +12,8 @@ const generationsTableSQL = `CREATE TABLE IF NOT EXISTS generations (
     profile_model TEXT,
     dimensions INTEGER NOT NULL DEFAULT 0,
 	metric TEXT NOT NULL CHECK (metric = 'cosine'),
+	vector_digest TEXT NOT NULL,
+	manifest_digest TEXT NOT NULL,
     PRIMARY KEY (repository_id, generation_id),
     FOREIGN KEY (repository_id) REFERENCES repositories(repository_id) ON DELETE CASCADE
 )`
@@ -21,7 +23,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 INSERT INTO schema_version(version)
-SELECT 1
+SELECT 2
 WHERE NOT EXISTS (SELECT 1 FROM schema_version);
 
 CREATE TABLE IF NOT EXISTS repositories (

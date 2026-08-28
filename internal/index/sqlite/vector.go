@@ -2,11 +2,15 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/ToledoVitor/GoContext/internal/embedding"
@@ -21,6 +25,7 @@ const (
 	maxExactCandidateLimit = math.MaxInt32
 	unitNormTolerance      = 1e-4
 	vectorContextStride    = 256
+	vectorDigestVersion    = "sqlite-vector-digest-v1"
 )
 
 var errInvalidVectorEncoding = errors.New("invalid vector encoding")
@@ -29,6 +34,69 @@ type preparedVector struct {
 	chunkID    string
 	dimensions int
 	valuesBlob []byte
+}
+
+type vectorDigestWriter struct {
+	digest hash.Hash
+	count  int64
+}
+
+func newVectorDigestWriter(ctx context.Context) (*vectorDigestWriter, error) {
+	digest := sha256.New()
+	if err := writeCanonicalStringContext(ctx, digest, vectorDigestVersion); err != nil {
+		return nil, err
+	}
+	return &vectorDigestWriter{digest: digest}, nil
+}
+
+func (writer *vectorDigestWriter) add(ctx context.Context, chunkID string, encodingVersion, dimensions int64, valuesBlob []byte) error {
+	if err := writeCanonicalStringContext(ctx, writer.digest, chunkID); err != nil {
+		return err
+	}
+	writeCanonicalInteger(writer.digest, encodingVersion)
+	writeCanonicalInteger(writer.digest, dimensions)
+	writeCanonicalInteger(writer.digest, int64(len(valuesBlob)))
+	for offset := 0; offset < len(valuesBlob); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := offset + 64*1024
+		if end > len(valuesBlob) {
+			end = len(valuesBlob)
+		}
+		_, _ = writer.digest.Write(valuesBlob[offset:end])
+		offset = end
+	}
+	writer.count++
+	return nil
+}
+
+func (writer *vectorDigestWriter) sum() string {
+	writeCanonicalInteger(writer.digest, writer.count)
+	return hex.EncodeToString(writer.digest.Sum(nil))
+}
+
+func preparedVectorDigestContext(ctx context.Context, vectors []preparedVector) (string, error) {
+	ordered := append([]preparedVector(nil), vectors...)
+	sort.Slice(ordered, func(left, right int) bool { return ordered[left].chunkID < ordered[right].chunkID })
+	writer, err := newVectorDigestWriter(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, vector := range ordered {
+		if err := writer.add(ctx, vector.chunkID, vectorEncodingVersion, int64(vector.dimensions), vector.valuesBlob); err != nil {
+			return "", err
+		}
+	}
+	return writer.sum(), nil
+}
+
+func validSQLiteDigest(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func prepareGenerationVectors(generation index.Generation) ([]preparedVector, error) {
@@ -179,6 +247,9 @@ func (r *BoundReader) ValidateCorpus(ctx context.Context) (CorpusMetadata, error
 	if r.closed {
 		return CorpusMetadata{}, index.ErrReindexRequired
 	}
+	if !r.validPinnedManifest() {
+		return CorpusMetadata{}, index.ErrReindexRequired
+	}
 	chunks, err := r.loadCanonicalChunksLocked(ctx)
 	if err != nil {
 		return CorpusMetadata{}, err
@@ -294,6 +365,11 @@ func (r *BoundReader) scanVectorRowsLocked(
 	if err != nil {
 		return nil, vectorReadError(ctx)
 	}
+	digestWriter, err := newVectorDigestWriter(ctx)
+	if err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("search bound vector index: %w", err)
+	}
 
 	candidates := make([]vectorsearch.Candidate, 0)
 	seen := make(map[string]struct{}, len(chunks))
@@ -308,6 +384,10 @@ func (r *BoundReader) scanVectorRowsLocked(
 		if err := rows.Scan(&chunkID, &version, &dimensions, &blob); err != nil {
 			_ = rows.Close()
 			return nil, vectorReadError(ctx)
+		}
+		if err := digestWriter.add(ctx, chunkID, version.Int64, dimensions.Int64, blob); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("search bound vector index: %w", err)
 		}
 		chunk, known := canonicalByID[chunkID]
 		if _, duplicate := seen[chunkID]; duplicate || !known || !version.Valid || !dimensions.Valid {
@@ -360,6 +440,9 @@ func (r *BoundReader) scanVectorRowsLocked(
 	if len(seen) != len(chunks) {
 		return nil, vectorsearch.ErrVectorIntegrity
 	}
+	if digestWriter.sum() != r.vectorDigest {
+		return nil, vectorsearch.ErrVectorIntegrity
+	}
 	return candidates, nil
 }
 
@@ -389,7 +472,30 @@ func (r *BoundReader) validateLexicalOnlyVectorRowsLocked(ctx context.Context) e
 	if vectorCount != 0 {
 		return vectorsearch.ErrVectorIntegrity
 	}
+	emptyDigest, err := preparedVectorDigestContext(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if r.vectorDigest != emptyDigest {
+		return vectorsearch.ErrVectorIntegrity
+	}
 	return nil
+}
+
+func (r *BoundReader) validPinnedManifest() bool {
+	expected, err := index.GenerationManifestDigest(index.GenerationManifest{
+		RepositoryID:       r.repositoryID,
+		GenerationID:       r.generationID,
+		CorpusRevision:     r.corpusRevision,
+		ContentDigest:      r.contentDigest,
+		ScanPolicyVersion:  r.scanPolicyVersion,
+		ProfileFingerprint: r.profileFingerprint,
+		ProfileModel:       r.profileModel,
+		Dimensions:         r.dimensions,
+		Metric:             r.metric,
+		VectorDigest:       r.vectorDigest,
+	})
+	return err == nil && validSQLiteDigest(r.vectorDigest) && validSQLiteDigest(r.manifestDigest) && expected == r.manifestDigest
 }
 
 func vectorMatchesFilterContext(ctx context.Context, chunk source.Chunk, filter search.Filter) (bool, error) {

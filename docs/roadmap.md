@@ -32,7 +32,8 @@ Scanner, relatório, snapshots seguros e chunking preliminar estão entregues. P
 - modos semânticos `off`, `preferred` e `required`, com fallback lexical observável;
 - comando `gocontext search` com hits citados.
 - snapshot/semantic-off permanece default offline; SQLite, `auto` e semântica são opt-in;
-- rollback explícito de snapshot exige par atual validado ou reindex-first recovery;
+- rollback explícito de snapshot exige par atual validado e é fail-closed/indisponível no Windows M2 até existir gate runtime de DACL owner-only; snapshot padrão e reindexação permanecem a recuperação suportada;
+- schema SQLite v2 liga corpus, perfil e bytes vetoriais por digests; caches v1 exigem reindexação sem migração in-place;
 - cosseno exato em Go avisa acima de 20.000 chunks sem trocar ranking ou backend.
 
 **Pronto quando:** consultas exatas e conceituais encontram fixtures sem serviço de índice externo; modo default não abre rede; falha temporária semântica preserva busca lexical e referências canônicas.

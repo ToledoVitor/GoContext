@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func TestReadRollbackMarkerWindowsAcceptsRegularMarkerAndRejectsNonRegularEntry(t *testing.T) {
+func TestReadRollbackMarkerWindowsFailsClosedWithoutOwnerOnlyDACLValidation(t *testing.T) {
 	storeDirectory := t.TempDir()
 	repositoryID := "windows-rollback-repository"
 	digest := sha256.Sum256([]byte("windows-corpus"))
@@ -29,16 +29,12 @@ func TestReadRollbackMarkerWindowsAcceptsRegularMarkerAndRejectsNonRegularEntry(
 	if err != nil {
 		t.Fatalf("Lstat(marker) error = %v", err)
 	}
-	if err := validateRollbackMarkerPlatformMode(info); err != nil {
-		t.Fatalf("validateRollbackMarkerPlatformMode(Windows regular marker) error = %v", err)
+	if err := validateRollbackMarkerPlatformMode(info); !errors.Is(err, errRollbackMarkerPlatformUnsupported) {
+		t.Fatalf("validateRollbackMarkerPlatformMode(Windows regular marker) error = %v, want unsupported", err)
 	}
 
-	got, err := readRollbackMarker(context.Background(), storeDirectory, repositoryID)
-	if err != nil {
-		t.Fatalf("readRollbackMarker(Windows regular marker) error = %v", err)
-	}
-	if got != marker {
-		t.Fatalf("readRollbackMarker(Windows regular marker) = %#v, want %#v", got, marker)
+	if _, err := readRollbackMarker(context.Background(), storeDirectory, repositoryID); !errors.Is(err, errRollbackMarkerPlatformUnsupported) {
+		t.Fatalf("readRollbackMarker(Windows regular marker) error = %v, want unsupported", err)
 	}
 
 	if err := os.Remove(path); err != nil {
@@ -47,8 +43,15 @@ func TestReadRollbackMarkerWindowsAcceptsRegularMarkerAndRejectsNonRegularEntry(
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatalf("Mkdir(marker path) error = %v", err)
 	}
-	if _, err := readRollbackMarker(context.Background(), storeDirectory, repositoryID); !errors.Is(err, errInvalidRollbackMarker) {
-		t.Fatalf("readRollbackMarker(Windows directory) error = %v, want invalid marker", err)
+	directoryInfo, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(marker directory) error = %v", err)
+	}
+	if err := validatePrivateRollbackMarker(directoryInfo); !errors.Is(err, errInvalidRollbackMarker) {
+		t.Fatalf("validatePrivateRollbackMarker(Windows directory) error = %v, want invalid marker", err)
+	}
+	if _, err := readRollbackMarker(context.Background(), storeDirectory, repositoryID); !errors.Is(err, errRollbackMarkerPlatformUnsupported) {
+		t.Fatalf("readRollbackMarker(Windows directory) error = %v, want unsupported", err)
 	}
 }
 
@@ -63,7 +66,14 @@ func TestReadRollbackMarkerWindowsRejectsSymlinkWhenAvailable(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Skipf("Symlink unavailable to Windows test user: %v", err)
 	}
-	if _, err := readRollbackMarker(context.Background(), storeDirectory, repositoryID); !errors.Is(err, errInvalidRollbackMarker) {
-		t.Fatalf("readRollbackMarker(Windows symlink) error = %v, want invalid marker", err)
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(marker symlink) error = %v", err)
+	}
+	if err := validatePrivateRollbackMarker(info); !errors.Is(err, errInvalidRollbackMarker) {
+		t.Fatalf("validatePrivateRollbackMarker(Windows symlink) error = %v, want invalid marker", err)
+	}
+	if _, err := readRollbackMarker(context.Background(), storeDirectory, repositoryID); !errors.Is(err, errRollbackMarkerPlatformUnsupported) {
+		t.Fatalf("readRollbackMarker(Windows symlink) error = %v, want unsupported", err)
 	}
 }

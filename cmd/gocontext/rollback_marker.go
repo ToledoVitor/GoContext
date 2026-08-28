@@ -24,7 +24,10 @@ const (
 	maxRollbackMarkerSize       = 1024
 )
 
-var errInvalidRollbackMarker = errors.New("invalid rollback marker")
+var (
+	errInvalidRollbackMarker             = errors.New("invalid rollback marker")
+	errRollbackMarkerPlatformUnsupported = errors.New("rollback marker platform unsupported")
+)
 
 type rollbackMarker struct {
 	Version          int    `json:"version"`
@@ -82,6 +85,9 @@ func rollbackMarkerPath(storeDirectory, repositoryID string) string {
 
 func readRollbackMarker(ctx context.Context, storeDirectory, repositoryID string) (rollbackMarker, error) {
 	if err := ctx.Err(); err != nil {
+		return rollbackMarker{}, err
+	}
+	if err := validateRollbackMarkerPlatform(); err != nil {
 		return rollbackMarker{}, err
 	}
 	canonicalDirectory, err := canonicalMarkerDirectory(storeDirectory)

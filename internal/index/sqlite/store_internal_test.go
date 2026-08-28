@@ -113,6 +113,30 @@ func TestPreExistingIdentityLessStoreRequiresReindexWithoutMutation(t *testing.T
 	}
 }
 
+func TestValidateSchemaRejectsVersionOneWithoutMigration(t *testing.T) {
+	database, err := sql.Open("sqlite", "file::memory:?cache=private")
+	if err != nil {
+		t.Fatalf("sql.Open(memory) error = %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(schemaSQL); err != nil {
+		t.Fatalf("initialize schema error = %v", err)
+	}
+	if _, err := database.Exec(`UPDATE schema_version SET version = 1`); err != nil {
+		t.Fatalf("set legacy schema version error = %v", err)
+	}
+	if err := validateSchema(context.Background(), database); !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("validateSchema(v1) error = %v, want ErrReindexRequired", err)
+	}
+	var version int
+	if err := database.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
+		t.Fatalf("read schema version after rejection error = %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("schema version after rejection = %d, want unchanged 1", version)
+	}
+}
+
 func TestFreshWriterCreatesPrivateSingletonStoreIdentity(t *testing.T) {
 	directory := t.TempDir()
 	databasePath := filepath.Join(directory, databaseName)
@@ -174,6 +198,38 @@ func TestFreshWriterCreatesPrivateSingletonStoreIdentity(t *testing.T) {
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close(reader) error = %v", err)
+	}
+}
+
+func TestBoundReaderCloseReleasesCanonicalChunkCache(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	generation := internalTestGeneration(t, "cache-release-repository", "cache-release-generation", "cache.py", "CACHE_RELEASE_SOURCE")
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	reader, err := store.BindActive(context.Background(), generation.RepositoryID)
+	if err != nil {
+		t.Fatalf("BindActive() error = %v", err)
+	}
+	if _, err := reader.Load(context.Background(), generation.RepositoryID); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !reader.canonicalLoaded || len(reader.canonicalChunks) == 0 {
+		t.Fatal("Load() did not populate canonical cache")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if reader.canonicalLoaded || reader.canonicalChunks != nil {
+		t.Fatalf("Close() retained canonical cache: loaded=%v chunks=%d", reader.canonicalLoaded, len(reader.canonicalChunks))
+	}
+	if _, err := reader.Load(context.Background(), generation.RepositoryID); !errors.Is(err, errBoundReaderClosed) {
+		t.Fatalf("Load(after Close) error = %v, want closed reader", err)
 	}
 }
 
@@ -340,8 +396,8 @@ func TestNewStoreValidatesExclusiveCreateCollisionBeforeMutableOpen(t *testing.T
 		name   string
 		schema string
 	}{
-		{name: "identity-less v1", schema: schemaSQL},
-		{name: "future schema", schema: `CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2)`},
+		{name: "identity-less v2", schema: schemaSQL},
+		{name: "future schema", schema: `CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (3)`},
 		{name: "unrelated sqlite", schema: `CREATE TABLE unrelated(value TEXT)`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1915,7 +1971,11 @@ func TestPublishOnConnectionReportsCommittedFinalizationFailureAndAllowsRetry(t 
 			if prepareErr != nil {
 				t.Fatalf("prepareGenerationVectors() error = %v", prepareErr)
 			}
-			published, err := publishOnConnection(context.Background(), wrapped, generation, vectors)
+			publication, prepareErr := prepareGenerationPublication(context.Background(), generation, vectors)
+			if prepareErr != nil {
+				t.Fatalf("prepareGenerationPublication() error = %v", prepareErr)
+			}
+			published, err := publishOnConnection(context.Background(), wrapped, generation, publication)
 			if !published {
 				t.Fatalf("publishOnConnection() published = false, want true after commit")
 			}

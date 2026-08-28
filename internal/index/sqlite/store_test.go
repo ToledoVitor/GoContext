@@ -833,8 +833,8 @@ func TestStoreCreatesPrivateVersionedWALDatabase(t *testing.T) {
 	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("schema version query error = %v", err)
 	}
-	if version != 1 {
-		t.Errorf("schema version = %d, want 1", version)
+	if version != 2 {
+		t.Errorf("schema version = %d, want 2", version)
 	}
 	for _, table := range []string{"repositories", "generations", "chunks", "vectors"} {
 		var count int
@@ -856,7 +856,7 @@ func TestStoreRejectsUnknownSchemaWithoutMutatingIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
-	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (3)`); err != nil {
 		t.Fatalf("create future schema marker error = %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -922,7 +922,7 @@ func TestStoreRejectsUnknownSchemaWithoutMutatingIt(t *testing.T) {
 		t.Fatalf("inspect future schema error = %v", err)
 	}
 	if createdTables != 0 {
-		t.Fatalf("future schema gained %d v1 tables, want no mutation", createdTables)
+		t.Fatalf("future schema gained %d index tables, want no mutation", createdTables)
 	}
 }
 
@@ -938,7 +938,7 @@ func TestStoreRejectsUnknownWALSchemaWithoutMutatingDatabaseFamily(t *testing.T)
 		PRAGMA journal_mode=WAL;
 		PRAGMA wal_autocheckpoint=0;
 		CREATE TABLE schema_version(version INTEGER NOT NULL);
-		INSERT INTO schema_version VALUES (2)`); err != nil {
+		INSERT INTO schema_version VALUES (3)`); err != nil {
 		_ = db.Close()
 		t.Fatalf("create future WAL schema error = %v", err)
 	}
@@ -1196,8 +1196,8 @@ func TestStoreRejectsMaliciousSchemaIndexNameWithoutExecutingIt(t *testing.T) {
 	if err := db.QueryRow(`SELECT version FROM schema_version`).Scan(&marker); err != nil {
 		t.Fatalf("read schema marker after rejection error = %v", err)
 	}
-	if marker != 1 {
-		t.Fatalf("schema marker after rejection = %d, want 1", marker)
+	if marker != 2 {
+		t.Fatalf("schema marker after rejection = %d, want 2", marker)
 	}
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name = 'injected'`).Scan(&injectedTables); err != nil {
 		t.Fatalf("inspect injected schema objects error = %v", err)
@@ -1539,7 +1539,7 @@ func TestOpenExistingRejectsUnknownSchemaWithoutMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
-	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (3)`); err != nil {
 		t.Fatalf("create future schema marker error = %v", err)
 	}
 	if err := db.Close(); err != nil {

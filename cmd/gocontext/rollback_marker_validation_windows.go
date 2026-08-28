@@ -4,8 +4,13 @@ package main
 
 import "io/fs"
 
-// Windows FileMode exposes only the read-only attribute as synthetic POSIX
-// bits. Regular-file, reparse-point, identity, and schema checks remain common.
+// Windows rollback markers remain fail-closed until GoContext can create and
+// validate an owner-only DACL on a Windows runtime. Inherited ACLs are not
+// privacy proof.
+func validateRollbackMarkerPlatform() error {
+	return errRollbackMarkerPlatformUnsupported
+}
+
 func validateRollbackMarkerPlatformMode(fs.FileInfo) error {
-	return nil
+	return errRollbackMarkerPlatformUnsupported
 }

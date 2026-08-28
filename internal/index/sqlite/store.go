@@ -86,6 +86,8 @@ type BoundReader struct {
 	profileModel       string
 	dimensions         int
 	metric             index.VectorMetric
+	vectorDigest       string
+	manifestDigest     string
 	store              *Store
 	canonicalChunks    []source.Chunk
 	canonicalLoaded    bool
@@ -867,6 +869,8 @@ var requiredSchemaColumns = map[string][]schemaColumn{
 		{name: "profile_model", typeName: "TEXT"},
 		{name: "dimensions", typeName: "INTEGER", notNull: 1, defaultSQL: "0", hasDefault: true},
 		{name: "metric", typeName: "TEXT", notNull: 1},
+		{name: "vector_digest", typeName: "TEXT", notNull: 1},
+		{name: "manifest_digest", typeName: "TEXT", notNull: 1},
 	},
 	"chunks": {
 		{name: "repository_id", typeName: "TEXT", notNull: 1, primaryKeyPosition: 1},
@@ -1156,6 +1160,13 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	if err != nil || corpus.Revision != generation.CorpusRevision {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
 	}
+	publication, err := prepareGenerationPublication(ctx, generation, preparedVectors)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("replace sqlite index: %w", contextErr)
+		}
+		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
+	}
 	select {
 	case <-ctx.Done():
 		return fmt.Errorf("replace sqlite index: %w", ctx.Err())
@@ -1163,7 +1174,7 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	}
 	defer func() { s.writeToken <- struct{}{} }()
 
-	published, err := s.publish(ctx, generation, preparedVectors)
+	published, err := s.publish(ctx, generation, publication)
 	if err != nil {
 		if published {
 			var committed *index.CommittedCleanupError
@@ -1188,10 +1199,38 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	return nil
 }
 
-func (s *Store) publish(ctx context.Context, generation index.Generation, vectors []preparedVector) (bool, error) {
+type preparedGenerationPublication struct {
+	vectors        []preparedVector
+	contentDigest  string
+	vectorDigest   string
+	manifestDigest string
+}
+
+func prepareGenerationPublication(ctx context.Context, generation index.Generation, vectors []preparedVector) (preparedGenerationPublication, error) {
+	contentDigest, err := canonicalContentDigestContext(ctx, generation.Chunks)
+	if err != nil {
+		return preparedGenerationPublication{}, err
+	}
+	vectorDigest, err := preparedVectorDigestContext(ctx, vectors)
+	if err != nil {
+		return preparedGenerationPublication{}, err
+	}
+	manifestDigest, err := index.GenerationManifestDigest(generationManifest(generation, contentDigest, vectorDigest))
+	if err != nil {
+		return preparedGenerationPublication{}, err
+	}
+	return preparedGenerationPublication{
+		vectors:        vectors,
+		contentDigest:  contentDigest,
+		vectorDigest:   vectorDigest,
+		manifestDigest: manifestDigest,
+	}, nil
+}
+
+func (s *Store) publish(ctx context.Context, generation index.Generation, publication preparedGenerationPublication) (bool, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		published, err := s.publishAttempt(ctx, generation, vectors)
+		published, err := s.publishAttempt(ctx, generation, publication)
 		if err == nil || published {
 			return published, err
 		}
@@ -1219,7 +1258,7 @@ func (s *Store) publish(ctx context.Context, generation index.Generation, vector
 	}
 }
 
-func (s *Store) publishAttempt(ctx context.Context, generation index.Generation, vectors []preparedVector) (published bool, returnedErr error) {
+func (s *Store) publishAttempt(ctx context.Context, generation index.Generation, publication preparedGenerationPublication) (published bool, returnedErr error) {
 	connection, err := s.db.Conn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquire write connection: %w", err)
@@ -1232,7 +1271,7 @@ func (s *Store) publishAttempt(ctx context.Context, generation index.Generation,
 		_ = connection.Close()
 		return false, errOpenWriterFailed
 	}
-	return publishOnConnection(ctx, connection, generation, vectors)
+	return publishOnConnection(ctx, connection, generation, publication)
 }
 
 type writeConnection interface {
@@ -1242,7 +1281,7 @@ type writeConnection interface {
 	Close() error
 }
 
-func publishOnConnection(ctx context.Context, connection writeConnection, generation index.Generation, vectors []preparedVector) (published bool, returnedErr error) {
+func publishOnConnection(ctx context.Context, connection writeConnection, generation index.Generation, publication preparedGenerationPublication) (published bool, returnedErr error) {
 	committed := false
 	defer func() {
 		stage, finalizationErr := finalizeWriteConnection(connection)
@@ -1280,7 +1319,7 @@ func publishOnConnection(ctx context.Context, connection writeConnection, genera
 		return false, fmt.Errorf("read repository manifest: %w", err)
 	}
 	if activeGeneration == generation.ID {
-		matches, err := generationMetadataMatches(ctx, connection, generation, vectors)
+		matches, err := generationMetadataMatches(ctx, connection, generation, publication)
 		if err != nil {
 			if contextErr := ctx.Err(); contextErr != nil {
 				return false, contextErr
@@ -1306,10 +1345,10 @@ func publishOnConnection(ctx context.Context, connection writeConnection, genera
 	if _, err := connection.ExecContext(ctx, `
 		INSERT INTO generations(
 			repository_id, generation_id, corpus_revision, content_digest, scan_policy_version,
-			profile_fingerprint, profile_model, dimensions, metric
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		generation.RepositoryID, generation.ID, generation.CorpusRevision, canonicalContentDigest(generation.Chunks), generation.ScanPolicyVersion,
-		storedFingerprint, storedModel, generation.Dimensions, string(generation.Metric),
+			profile_fingerprint, profile_model, dimensions, metric, vector_digest, manifest_digest
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		generation.RepositoryID, generation.ID, generation.CorpusRevision, publication.contentDigest, generation.ScanPolicyVersion,
+		storedFingerprint, storedModel, generation.Dimensions, string(generation.Metric), publication.vectorDigest, publication.manifestDigest,
 	); err != nil {
 		return false, fmt.Errorf("insert generation: %w", err)
 	}
@@ -1326,7 +1365,7 @@ func publishOnConnection(ctx context.Context, connection writeConnection, genera
 			return false, fmt.Errorf("insert chunk: %w", err)
 		}
 	}
-	for _, vector := range vectors {
+	for _, vector := range publication.vectors {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
@@ -1448,13 +1487,13 @@ type generationMetadataQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func generationMetadataMatches(ctx context.Context, database generationMetadataQuerier, generation index.Generation, vectors []preparedVector) (bool, error) {
-	var revision, contentDigest, policy, fingerprint, model, metric string
+func generationMetadataMatches(ctx context.Context, database generationMetadataQuerier, generation index.Generation, publication preparedGenerationPublication) (bool, error) {
+	var revision, contentDigest, policy, fingerprint, model, metric, vectorDigest, manifestDigest string
 	var dimensions, chunks, vectorCount int
 	err := database.QueryRowContext(ctx, `
 		SELECT g.corpus_revision, g.content_digest, g.scan_policy_version,
 		       COALESCE(g.profile_fingerprint, ''), COALESCE(g.profile_model, ''),
-		       g.dimensions, g.metric, count(c.chunk_id),
+		       g.dimensions, g.metric, g.vector_digest, g.manifest_digest, count(c.chunk_id),
 		       (SELECT count(*) FROM vectors AS v
 		        WHERE v.repository_id = g.repository_id AND v.generation_id = g.generation_id)
 		FROM generations AS g
@@ -1462,20 +1501,22 @@ func generationMetadataMatches(ctx context.Context, database generationMetadataQ
 		  ON c.repository_id = g.repository_id AND c.generation_id = g.generation_id
 		WHERE g.repository_id = ? AND g.generation_id = ?
 		GROUP BY g.repository_id, g.generation_id`, generation.RepositoryID, generation.ID,
-	).Scan(&revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric, &chunks, &vectorCount)
+	).Scan(&revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric, &vectorDigest, &manifestDigest, &chunks, &vectorCount)
 	if err != nil {
 		return false, err
 	}
 	expectedFingerprint, expectedModel := profileMetadata(generation)
 	metadataMatches := revision == generation.CorpusRevision &&
-		contentDigest == canonicalContentDigest(generation.Chunks) &&
+		contentDigest == publication.contentDigest &&
 		policy == generation.ScanPolicyVersion &&
 		fingerprint == expectedFingerprint &&
 		model == expectedModel &&
 		dimensions == generation.Dimensions &&
 		metric == string(generation.Metric) &&
+		vectorDigest == publication.vectorDigest &&
+		manifestDigest == publication.manifestDigest &&
 		chunks == len(generation.Chunks) &&
-		vectorCount == len(vectors)
+		vectorCount == len(publication.vectors)
 	if !metadataMatches {
 		return false, nil
 	}
@@ -1488,8 +1529,8 @@ func generationMetadataMatches(ctx context.Context, database generationMetadataQ
 		return false, err
 	}
 	defer rows.Close()
-	expected := make(map[string]preparedVector, len(vectors))
-	for _, vector := range vectors {
+	expected := make(map[string]preparedVector, len(publication.vectors))
+	for _, vector := range publication.vectors {
 		expected[vector.chunkID] = vector
 	}
 	seen := 0
@@ -1509,7 +1550,7 @@ func generationMetadataMatches(ctx context.Context, database generationMetadataQ
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	return seen == len(vectors), nil
+	return seen == len(publication.vectors), nil
 }
 
 func canonicalContentDigest(chunks []source.Chunk) string {
@@ -1593,6 +1634,22 @@ func profileMetadata(generation index.Generation) (string, string) {
 	return generation.Profile.Fingerprint, generation.Profile.Model
 }
 
+func generationManifest(generation index.Generation, contentDigest, vectorDigest string) index.GenerationManifest {
+	fingerprint, model := profileMetadata(generation)
+	return index.GenerationManifest{
+		RepositoryID:       generation.RepositoryID,
+		GenerationID:       generation.ID,
+		CorpusRevision:     generation.CorpusRevision,
+		ContentDigest:      contentDigest,
+		ScanPolicyVersion:  generation.ScanPolicyVersion,
+		ProfileFingerprint: fingerprint,
+		ProfileModel:       model,
+		Dimensions:         generation.Dimensions,
+		Metric:             generation.Metric,
+		VectorDigest:       vectorDigest,
+	}
+}
+
 // ActiveGeneration returns the active generation ID for one repository.
 func (s *Store) ActiveGeneration(ctx context.Context, repositoryID string) (string, error) {
 	if err := ctx.Err(); err != nil {
@@ -1662,15 +1719,15 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 		return nil, index.ErrReindexRequired
 	}
 
-	var generationID, revision, contentDigest, policy, fingerprint, model, metric string
+	var generationID, revision, contentDigest, policy, fingerprint, model, metric, vectorDigest, manifestDigest string
 	var dimensions int
 	err = tx.QueryRowContext(ctx, `
 		SELECT generation_id, corpus_revision, content_digest, scan_policy_version,
 		       COALESCE(profile_fingerprint, ''), COALESCE(profile_model, ''),
-		       dimensions, metric
+		       dimensions, metric, vector_digest, manifest_digest
 		FROM generations
 		WHERE repository_id = ? AND generation_id = ?`, repositoryID, activeGeneration.String,
-	).Scan(&generationID, &revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric)
+	).Scan(&generationID, &revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric, &vectorDigest, &manifestDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = tx.Rollback()
 		return nil, index.ErrReindexRequired
@@ -1690,6 +1747,23 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 		_ = tx.Rollback()
 		return nil, index.ErrReindexRequired
 	}
+	persistedManifest := index.GenerationManifest{
+		RepositoryID:       repositoryID,
+		GenerationID:       generationID,
+		CorpusRevision:     revision,
+		ContentDigest:      contentDigest,
+		ScanPolicyVersion:  policy,
+		ProfileFingerprint: fingerprint,
+		ProfileModel:       model,
+		Dimensions:         dimensions,
+		Metric:             index.VectorMetric(metric),
+		VectorDigest:       vectorDigest,
+	}
+	expectedManifestDigest, digestErr := index.GenerationManifestDigest(persistedManifest)
+	if digestErr != nil || !validSQLiteDigest(vectorDigest) || !validSQLiteDigest(manifestDigest) || expectedManifestDigest != manifestDigest {
+		_ = tx.Rollback()
+		return nil, index.ErrReindexRequired
+	}
 	reader := &BoundReader{
 		tx:                 tx,
 		repositoryID:       repositoryID,
@@ -1701,6 +1775,8 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 		profileModel:       model,
 		dimensions:         dimensions,
 		metric:             index.VectorMetric(metric),
+		vectorDigest:       vectorDigest,
+		manifestDigest:     manifestDigest,
 		store:              s,
 	}
 	s.readers[reader] = struct{}{}
@@ -1825,6 +1901,8 @@ func (r *BoundReader) Close() error {
 		return nil
 	}
 	r.closed = true
+	r.canonicalChunks = nil
+	r.canonicalLoaded = false
 	err := r.tx.Rollback()
 	r.mu.Unlock()
 	if r.store != nil {

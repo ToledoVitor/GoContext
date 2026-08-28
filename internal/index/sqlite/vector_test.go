@@ -169,6 +169,204 @@ func TestVectorPublicationPersistsNormalizedVersionedRows(t *testing.T) {
 	if !reflect.DeepEqual(stored, want) {
 		t.Fatalf("stored vectors = %#v, want one normalized row per chunk %#v", stored, want)
 	}
+	var vectorDigest, manifestDigest string
+	if err := database.QueryRow(`
+		SELECT vector_digest, manifest_digest
+		FROM generations
+		WHERE repository_id = ? AND generation_id = ?`, generation.RepositoryID, generation.ID,
+	).Scan(&vectorDigest, &manifestDigest); err != nil {
+		t.Fatalf("query persisted generation digests error = %v", err)
+	}
+	for name, digest := range map[string]string{"vector": vectorDigest, "manifest": manifestDigest} {
+		if len(digest) != 64 || digest != strings.ToLower(digest) {
+			t.Fatalf("%s digest = %q, want strict lowercase SHA-256", name, digest)
+		}
+	}
+}
+
+func TestExactSearchRejectsSameSizeAlternateUnitVectorByPersistedDigest(t *testing.T) {
+	directory := t.TempDir()
+	store := newVectorStore(t, directory)
+	generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
+		vectorChunk("chunk", "private/digest.py", 1, source.LanguagePython, "PRIVATE_DIGEST_SOURCE_CANARY"),
+	}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	alternate, err := encodeVector(embedding.Vector{0, 1})
+	if err != nil {
+		t.Fatalf("encodeVector(alternate) error = %v", err)
+	}
+	database, err := sql.Open("sqlite", filepath.Join(directory, databaseName))
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := database.Exec(`
+		UPDATE vectors SET values_blob = ?
+		WHERE repository_id = ? AND generation_id = ?`, alternate, generation.RepositoryID, generation.ID,
+	); err != nil {
+		_ = database.Close()
+		t.Fatalf("replace vector bytes error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close mutation database error = %v", err)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+	if _, err := reader.Search(context.Background(), vectorIndexQuery(generation, embedding.Vector{1, 0}, 1)); !errors.Is(err, vectorsearch.ErrVectorIntegrity) {
+		t.Fatalf("Search(alternate unit vector) error = %v, want ErrVectorIntegrity", err)
+	}
+	if _, err := reader.ValidateCorpus(context.Background()); !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("ValidateCorpus(alternate unit vector) error = %v, want ErrReindexRequired", err)
+	}
+}
+
+func TestBindActiveRejectsCoherentSemanticMetadataMutations(t *testing.T) {
+	mutations := []struct {
+		name   string
+		mutate func(*testing.T, *sql.DB, index.Generation)
+	}{
+		{
+			name: "profile and model",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				if _, err := database.Exec(`
+					UPDATE generations
+					SET profile_fingerprint = 'coherent-other-fingerprint', profile_model = 'coherent-other-model'
+					WHERE repository_id = ? AND generation_id = ?`, generation.RepositoryID, generation.ID,
+				); err != nil {
+					t.Fatalf("mutate profile/model error = %v", err)
+				}
+			},
+		},
+		{
+			name: "dimensions and vector",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				blob, err := encodeVector(embedding.Vector{1, 0, 0})
+				if err != nil {
+					t.Fatalf("encode coherent vector error = %v", err)
+				}
+				if _, err := database.Exec(`
+					UPDATE generations SET dimensions = 3 WHERE repository_id = ? AND generation_id = ?;
+					UPDATE vectors SET dimensions = 3, values_blob = ? WHERE repository_id = ? AND generation_id = ?`,
+					generation.RepositoryID, generation.ID, blob, generation.RepositoryID, generation.ID,
+				); err != nil {
+					t.Fatalf("mutate dimensions/vector error = %v", err)
+				}
+			},
+		},
+		{
+			name: "metric",
+			mutate: func(t *testing.T, database *sql.DB, generation index.Generation) {
+				if _, err := database.Exec(`
+					PRAGMA ignore_check_constraints=ON;
+					UPDATE generations SET metric = 'dot-product' WHERE repository_id = ? AND generation_id = ?`,
+					generation.RepositoryID, generation.ID,
+				); err != nil {
+					t.Fatalf("mutate metric error = %v", err)
+				}
+			},
+		},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			directory := t.TempDir()
+			store := newVectorStore(t, directory)
+			generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
+				vectorChunk("chunk", "private/manifest.py", 1, source.LanguagePython, "PRIVATE_MANIFEST_SOURCE_CANARY"),
+			}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+			if err := store.Replace(context.Background(), generation); err != nil {
+				t.Fatalf("Replace() error = %v", err)
+			}
+			database, err := sql.Open("sqlite", filepath.Join(directory, databaseName))
+			if err != nil {
+				t.Fatalf("sql.Open() error = %v", err)
+			}
+			mutation.mutate(t, database, generation)
+			if err := database.Close(); err != nil {
+				t.Fatalf("close mutation database error = %v", err)
+			}
+			reader, err := store.BindActive(context.Background(), generation.RepositoryID)
+			if reader != nil {
+				_ = reader.Close()
+				t.Fatal("BindActive(coherent metadata mutation) returned reader, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) {
+				t.Fatalf("BindActive(coherent metadata mutation) error = %v, want ErrReindexRequired", err)
+			}
+		})
+	}
+}
+
+func TestBindActiveRejectsNonCanonicalGenerationDigests(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		column string
+		value  string
+	}{
+		{name: "vector uppercase", column: "vector_digest", value: strings.Repeat("A", 64)},
+		{name: "manifest short", column: "manifest_digest", value: "abcd"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			store := newVectorStore(t, directory)
+			generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
+				vectorChunk("chunk", "private/noncanonical.py", 1, source.LanguagePython, "PRIVATE_NONCANONICAL_SOURCE_CANARY"),
+			}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+			if err := store.Replace(context.Background(), generation); err != nil {
+				t.Fatalf("Replace() error = %v", err)
+			}
+			database, err := sql.Open("sqlite", filepath.Join(directory, databaseName))
+			if err != nil {
+				t.Fatalf("sql.Open() error = %v", err)
+			}
+			if _, err := database.Exec(`UPDATE generations SET `+test.column+` = ? WHERE repository_id = ? AND generation_id = ?`, test.value, generation.RepositoryID, generation.ID); err != nil {
+				_ = database.Close()
+				t.Fatalf("mutate %s error = %v", test.column, err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatalf("close mutation database error = %v", err)
+			}
+			reader, err := store.BindActive(context.Background(), generation.RepositoryID)
+			if reader != nil {
+				_ = reader.Close()
+				t.Fatal("BindActive(noncanonical digest) returned reader, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) {
+				t.Fatalf("BindActive(noncanonical digest) error = %v, want ErrReindexRequired", err)
+			}
+		})
+	}
+}
+
+func TestLexicalOnlyGenerationPersistsCanonicalEmptyVectorDigest(t *testing.T) {
+	directory := t.TempDir()
+	store := newVectorStore(t, directory)
+	generation := lexicalVectorGeneration(t, "repository", "generation", "chunk", "lexical.py")
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	want, err := preparedVectorDigestContext(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("preparedVectorDigestContext(empty) error = %v", err)
+	}
+	database, err := sql.Open("sqlite", filepath.Join(directory, databaseName))
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	defer database.Close()
+	var got string
+	if err := database.QueryRow(`
+		SELECT vector_digest FROM generations
+		WHERE repository_id = ? AND generation_id = ?`, generation.RepositoryID, generation.ID,
+	).Scan(&got); err != nil {
+		t.Fatalf("query lexical vector digest error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("lexical vector digest = %q, want canonical empty %q", got, want)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+	if _, err := reader.ValidateCorpus(context.Background()); err != nil {
+		t.Fatalf("ValidateCorpus(lexical) error = %v", err)
+	}
 }
 
 func TestExactSearchRanksKnownCosinesAndReturnsCanonicalChunks(t *testing.T) {

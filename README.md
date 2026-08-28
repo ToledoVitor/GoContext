@@ -83,7 +83,7 @@ go run ./cmd/gocontext index --store /caminho/do/cache /caminho/do/repositório
 
 ### Opt-in SQLite sem embeddings
 
-A migração suportada é uma reindexação completa explícita. Ela publica a geração SQLite e um snapshot companheiro do mesmo corpus, sem rede:
+A migração suportada é uma reindexação completa explícita. O schema SQLite v2 liga metadados semânticos e bytes vetoriais por digests SHA-256; caches SQLite v1 não são migrados no lugar e exigem reindexação. A operação publica a geração v2 e um snapshot companheiro do mesmo corpus, sem rede:
 
 ```bash
 go run ./cmd/gocontext index --store /caminho/do/cache --index-backend sqlite --semantic off /caminho/do/repositório
@@ -146,9 +146,9 @@ O snapshot implícito permanece a compatibilidade padrão. Já `--index-backend 
 go run ./cmd/gocontext search --store /caminho/do/cache --index-backend snapshot /caminho/do/repositório "carregar usuário"
 ```
 
-Sem banco SQLite, ou sem geração ativa para esse repositório, basta existir snapshot atual validado. Com geração ativa, o comando exige snapshot companheiro, marker regular `rollback_ready` sem symlink/reparse, policy atual, mesma revisão de corpus e mesma geração SQLite ativa; chunks e vetores da geração fixada também são validados antes da autorização. Em sistemas POSIX, bits de grupo/outros tornam o marker permissivo e inválido; no Windows, onde `FileMode` não representa ACLs POSIX, permanecem as validações estruturais, de identidade e no-follow. Marker ausente, legado, malformado ou divergente — e SQLite corrupto/inacessível — falham fechados com uma categoria sanitizada de reindexação.
+Sem banco SQLite, ou sem geração ativa para esse repositório, basta existir snapshot atual validado. Com geração ativa, o comando exige snapshot companheiro, marker regular `rollback_ready` sem symlink/reparse, policy atual, mesma revisão de corpus e mesma geração SQLite ativa; chunks, vetores e digests da geração fixada também são validados antes da autorização. Em sistemas POSIX, bits de grupo/outros tornam o marker permissivo e inválido. No Windows, rollback explícito apoiado em marker é deliberadamente indisponível no M2 e falha fechado com a mesma categoria sanitizada de reindexação: ACL herdada não prova privacidade owner-only. SQLite e o snapshot padrão continuam suportados. Suporte futuro exige criação e validação de DACL owner-only testadas em runtime Windows. Marker ausente, legado, malformado ou divergente — e SQLite corrupto/inacessível — também falham fechados.
 
-Para recuperar um par saudável, reindexe primeiro com `--index-backend sqlite --semantic off` e só então solicite o rollback explícito. Se SQLite estiver corrupto, uma reindexação snapshot padrão restaura o caminho implícito atual, mas não torna o rollback explícito pronto; o store SQLite precisa de recuperação administrativa separada. Não exclua SQLite apenas para contornar o guard.
+Em POSIX, recupere um par saudável reindexando primeiro com `--index-backend sqlite --semantic off` e só então solicite o rollback explícito. No Windows, omita `--index-backend snapshot` para usar o snapshot padrão ou reindexe no backend pretendido; o marker explícito continuará bloqueado nesta versão. Se SQLite estiver corrupto, uma reindexação snapshot padrão restaura o caminho implícito atual, mas não torna o rollback explícito pronto; o store SQLite precisa de recuperação administrativa separada. Não exclua SQLite apenas para contornar o guard.
 
 Uma reindexação snapshot padrão depois de SQLite invalida `rollback_ready` antes de substituir o snapshot e continua autoritativa para a busca padrão. Se a invalidação falhar, o CLI reporta falha sanitizada e não anuncia nem grava o novo snapshot. Promover SQLite/`auto` a default exige uma decisão futura.
 
