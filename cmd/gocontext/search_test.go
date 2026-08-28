@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,10 +16,12 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ToledoVitor/GoContext/internal/embedding"
 	indexdomain "github.com/ToledoVitor/GoContext/internal/index"
 	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
+	searchdomain "github.com/ToledoVitor/GoContext/internal/search"
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
@@ -774,41 +777,95 @@ func TestRunSearchExplicitSnapshotRejectsStaleSnapshotAndSwappedActiveGeneration
 	t.Run("swapped active generation", func(t *testing.T) {
 		repository, storeDirectory, marker := prepareCLIRollbackFixture(t)
 		repositoryID := canonicalPath(t, repository)
-		store, err := indexsqlite.NewStore(storeDirectory)
-		if err != nil {
-			t.Fatalf("NewStore(SQLite) error = %v", err)
-		}
-		active, err := store.ActiveGeneration(context.Background(), repositoryID)
-		if err != nil {
-			_ = store.Close()
-			t.Fatalf("ActiveGeneration() error = %v", err)
-		}
 		newChunk := source.Chunk{
 			ID: "swapped-generation", Text: "def swapped_generation_value():\n    return 3",
 			Language:  source.LanguagePython,
 			Reference: source.Reference{Path: "swapped.py", StartLine: 1, EndLine: 2},
 		}
 		corpus := mustCLICorpus(t, []source.Chunk{newChunk})
-		if err := store.Replace(context.Background(), indexdomain.Generation{
-			RepositoryID: repositoryID, ID: strings.Repeat("d", 64), BaseGeneration: active,
-			CorpusRevision: corpus.Revision, ScanPolicyVersion: corpus.PolicyVersion,
-			Chunks: corpus.Chunks, Metric: indexdomain.VectorMetricCosine,
-		}); err != nil {
-			_ = store.Close()
-			t.Fatalf("Replace(swapped generation) error = %v", err)
+		newGenerationID := strings.Repeat("d", 64)
+		var hookCalls atomic.Int64
+		hits, err := searchExplicitSnapshotRollbackWithHooks(
+			context.Background(),
+			storeDirectory,
+			searchdomain.Query{RepositoryID: repositoryID, Text: "rollback value", Limit: defaultSearchLimit},
+			snapshotRollbackHooks{afterBind: func(context.Context, *indexsqlite.BoundReader) error {
+				hookCalls.Add(1)
+				store, err := indexsqlite.NewStore(storeDirectory)
+				if err != nil {
+					return err
+				}
+				defer store.Close()
+				err = store.Replace(context.Background(), indexdomain.Generation{
+					RepositoryID: repositoryID, ID: newGenerationID, BaseGeneration: marker.ActiveGeneration,
+					CorpusRevision: corpus.Revision, ScanPolicyVersion: corpus.PolicyVersion,
+					Chunks: corpus.Chunks, Metric: indexdomain.VectorMetricCosine,
+				})
+				var committed *indexdomain.CommittedCleanupError
+				if err != nil && !errors.As(err, &committed) {
+					return err
+				}
+				return nil
+			}},
+		)
+		if err != nil {
+			t.Fatalf("searchExplicitSnapshotRollbackWithHooks(swapped active) error = %v", err)
 		}
-		if err := store.Close(); err != nil {
-			t.Fatalf("Close(SQLite) error = %v", err)
+		if hookCalls.Load() != 1 || len(hits) == 0 || !strings.Contains(hits[0].Chunk.Text, "rollback_value") {
+			t.Fatalf("pinned rollback hits = %#v, hook calls = %d; want old pinned snapshot", hits, hookCalls.Load())
 		}
+		store, err := indexsqlite.OpenExisting(storeDirectory)
+		if err != nil {
+			t.Fatalf("OpenExisting(after swap) error = %v", err)
+		}
+		active, activeErr := store.ActiveGeneration(context.Background(), repositoryID)
+		closeErr := store.Close()
+		if activeErr != nil || closeErr != nil || active != newGenerationID {
+			t.Fatalf("active generation after pinned rollback = %q, active error %v, close error %v; want %q", active, activeErr, closeErr, newGenerationID)
+		}
+	})
+}
 
-		var stdout bytes.Buffer
-		var stderr bytes.Buffer
-		code := run([]string{
-			"search", "--store", storeDirectory, "--index-backend", "snapshot",
-			repository, "rollback", "value",
-		}, &stdout, &stderr)
-		assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
-			repository, marker.ActiveGeneration, strings.Repeat("d", 64))
+func TestSearchExplicitSnapshotRollbackPreservesContextCategoriesAfterBind(t *testing.T) {
+	t.Run("canceled", func(t *testing.T) {
+		repository, storeDirectory, _ := prepareCLIRollbackFixture(t)
+		repositoryID := canonicalPath(t, repository)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		_, err := searchExplicitSnapshotRollbackWithHooks(
+			ctx,
+			storeDirectory,
+			searchdomain.Query{RepositoryID: repositoryID, Text: "rollback value", Limit: defaultSearchLimit},
+			snapshotRollbackHooks{afterBind: func(context.Context, *indexsqlite.BoundReader) error {
+				cancel()
+				return nil
+			}},
+		)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("searchExplicitSnapshotRollbackWithHooks(canceled) error = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, indexdomain.ErrReindexRequired) {
+			t.Fatalf("searchExplicitSnapshotRollbackWithHooks(canceled) error = %v, must not map cancellation to reindex", err)
+		}
+	})
+
+	t.Run("deadline exceeded", func(t *testing.T) {
+		repository, storeDirectory, _ := prepareCLIRollbackFixture(t)
+		repositoryID := canonicalPath(t, repository)
+		_, err := searchExplicitSnapshotRollbackWithHooks(
+			context.Background(),
+			storeDirectory,
+			searchdomain.Query{RepositoryID: repositoryID, Text: "rollback value", Limit: defaultSearchLimit},
+			snapshotRollbackHooks{afterBind: func(context.Context, *indexsqlite.BoundReader) error {
+				return context.DeadlineExceeded
+			}},
+		)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("searchExplicitSnapshotRollbackWithHooks(deadline) error = %v, want context.DeadlineExceeded", err)
+		}
+		if errors.Is(err, indexdomain.ErrReindexRequired) {
+			t.Fatalf("searchExplicitSnapshotRollbackWithHooks(deadline) error = %v, must not map deadline to reindex", err)
+		}
 	})
 }
 
@@ -876,6 +933,90 @@ func TestRunSearchExplicitSnapshotAllowsAbsentSQLiteRepositoryButRejectsCorruptS
 	}, &stdout, &stderr)
 	assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
 		requestedRepository, "CORRUPT_SQLITE_CANARY", "CORRUPT_SNAPSHOT_CANARY")
+}
+
+func TestRunSearchExplicitSnapshotRejectsCorruptPinnedSQLiteCorpus(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	mutations := []struct {
+		name  string
+		query string
+	}{
+		{name: "deleted canonical chunk", query: `DELETE FROM chunks`},
+		{name: "modified canonical chunk", query: `UPDATE chunks SET text = 'PRIVATE_MODIFIED_CHUNK_CANARY'`},
+		{name: "deleted vector", query: `DELETE FROM vectors`},
+		{name: "modified vector", query: `UPDATE vectors SET values_blob = X'010203'`},
+		{name: "modified generation manifest", query: `UPDATE generations SET corpus_revision = 'PRIVATE_MODIFIED_MANIFEST_CANARY'`},
+		{name: "dangling active generation", query: `UPDATE repositories SET active_generation = 'PRIVATE_DANGLING_GENERATION_CANARY'`},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			repository, storeDirectory, generation := prepareCLIRollbackVectorFixture(t)
+			database, err := sql.Open("sqlite", filepath.Join(storeDirectory, "index-v2.sqlite3"))
+			if err != nil {
+				t.Fatalf("sql.Open() error = %v", err)
+			}
+			if _, err := database.Exec(test.query); err != nil {
+				_ = database.Close()
+				t.Fatalf("mutate SQLite corpus error = %v", err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatalf("close mutation database error = %v", err)
+			}
+
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			code := run([]string{
+				"search", "--store", storeDirectory, "--index-backend", "snapshot",
+				repository, "rollback", "value",
+			}, &stdout, &stderr)
+			assertRollbackReindexFailure(t, code, stdout.String(), stderr.String(),
+				repository, generation.ID, "PRIVATE_MODIFIED_CHUNK_CANARY",
+				"PRIVATE_MODIFIED_MANIFEST_CANARY", "PRIVATE_DANGLING_GENERATION_CANARY")
+		})
+	}
+}
+
+func prepareCLIRollbackVectorFixture(t *testing.T) (string, string, indexdomain.Generation) {
+	t.Helper()
+	repository := t.TempDir()
+	repositoryID := canonicalPath(t, repository)
+	storeDirectory := t.TempDir()
+	chunk := source.Chunk{
+		ID: "rollback-vector", Text: "def rollback_value():\n    return 1",
+		Language:  source.LanguagePython,
+		Reference: source.Reference{Path: "rollback.py", StartLine: 1, EndLine: 2},
+	}
+	corpus := mustCLICorpus(t, []source.Chunk{chunk})
+	generation := indexdomain.Generation{
+		RepositoryID: repositoryID, ID: strings.Repeat("a", 64),
+		CorpusRevision: corpus.Revision, ScanPolicyVersion: corpus.PolicyVersion,
+		Chunks:     corpus.Chunks,
+		Profile:    &embedding.Profile{Fingerprint: "rollback-vector-profile", Model: "rollback-vector-model"},
+		Dimensions: 2, Metric: indexdomain.VectorMetricCosine,
+		Vectors: []indexdomain.VectorRecord{{ChunkID: chunk.ID, Values: embedding.Vector{1, 0}}},
+	}
+	store, err := indexsqlite.NewStore(storeDirectory)
+	if err != nil {
+		t.Fatalf("NewStore(SQLite) error = %v", err)
+	}
+	if err := store.Replace(context.Background(), generation); err != nil {
+		_ = store.Close()
+		t.Fatalf("Replace(SQLite) error = %v", err)
+	}
+	if err := writeRollbackCompanion(
+		context.Background(),
+		storeDirectory,
+		repositoryIngest{repositoryID: repositoryID, corpus: corpus},
+		generation.ID,
+		store,
+	); err != nil {
+		_ = store.Close()
+		t.Fatalf("writeRollbackCompanion() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(SQLite) error = %v", err)
+	}
+	return repository, storeDirectory, generation
 }
 
 func prepareCLIRollbackFixture(t *testing.T) (string, string, rollbackMarker) {

@@ -17,6 +17,7 @@ import (
 	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
+	searchdomain "github.com/ToledoVitor/GoContext/internal/search"
 )
 
 func TestRunIndexDefaultBuildsRepositorySnapshot(t *testing.T) {
@@ -292,6 +293,139 @@ func TestRunIndexSnapshotAfterSQLiteInvalidatesRollbackAndKeepsDefaultAuthoritat
 	}
 	if !strings.Contains(stdout.String(), "old_value") || strings.Contains(stdout.String(), "new_value") {
 		t.Fatalf("run(search auto stale SQLite) stdout = %q, want old opt-in SQLite generation", stdout.String())
+	}
+}
+
+func TestPublishSnapshotStopsBeforeCommitWhenRollbackMarkerRemovalFails(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	repository := t.TempDir()
+	storeDirectory := t.TempDir()
+	writeCLIFile(t, repository, "value.py", "def old_value():\n    return 1\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run([]string{"index", "--store", storeDirectory, "--index-backend", "sqlite", repository}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(index SQLite fixture) code = %d; stderr = %q", code, stderr.String())
+	}
+	repositoryID := canonicalPath(t, repository)
+	markerPath := rollbackMarkerPath(storeDirectory, repositoryID)
+	markerBefore, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("ReadFile(marker before) error = %v", err)
+	}
+	sqliteStore, err := indexsqlite.OpenExisting(storeDirectory)
+	if err != nil {
+		t.Fatalf("OpenExisting(SQLite) error = %v", err)
+	}
+	activeBefore, err := sqliteStore.ActiveGeneration(context.Background(), repositoryID)
+	if err != nil {
+		_ = sqliteStore.Close()
+		t.Fatalf("ActiveGeneration(before) error = %v", err)
+	}
+	if err := sqliteStore.Close(); err != nil {
+		t.Fatalf("Close(SQLite) error = %v", err)
+	}
+
+	writeCLIFile(t, repository, "value.py", "def new_value():\n    return 2\n")
+	newIngest, err := ingestRepository(context.Background(), repository)
+	if err != nil {
+		t.Fatalf("ingestRepository(new corpus) error = %v", err)
+	}
+	privateCanary := errors.New("PRIVATE_MARKER_REMOVE_FAILURE_CANARY")
+	err = publishSnapshotWithOperations(
+		context.Background(),
+		storeDirectory,
+		newIngest,
+		snapshotPublicationOperations{removeRollbackMarker: func(string, string) error {
+			return privateCanary
+		}},
+	)
+	if !errors.Is(err, errSnapshotRollbackInvalidation) {
+		t.Fatalf("publishSnapshotWithOperations(remove failure) error = %v, want sanitized invalidation category", err)
+	}
+	if strings.Contains(err.Error(), privateCanary.Error()) || strings.Contains(err.Error(), repositoryID) {
+		t.Fatalf("publishSnapshotWithOperations(remove failure) error exposes private state: %v", err)
+	}
+
+	snapshotStore, err := localstore.OpenExisting(storeDirectory)
+	if err != nil {
+		t.Fatalf("OpenExisting(snapshot) error = %v", err)
+	}
+	loaded, err := snapshotStore.Load(context.Background(), repositoryID)
+	if err != nil {
+		t.Fatalf("Load(snapshot after failed publication) error = %v", err)
+	}
+	if len(loaded) != 1 || !strings.Contains(loaded[0].Text, "old_value") || strings.Contains(loaded[0].Text, "new_value") {
+		t.Fatalf("snapshot after failed marker removal = %#v, want unchanged old committed corpus", loaded)
+	}
+	markerAfter, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("ReadFile(marker after) error = %v", err)
+	}
+	if !bytes.Equal(markerAfter, markerBefore) {
+		t.Fatalf("marker changed after failed removal: before=%q after=%q", markerBefore, markerAfter)
+	}
+	sqliteStore, err = indexsqlite.OpenExisting(storeDirectory)
+	if err != nil {
+		t.Fatalf("OpenExisting(SQLite after) error = %v", err)
+	}
+	activeAfter, activeErr := sqliteStore.ActiveGeneration(context.Background(), repositoryID)
+	closeErr := sqliteStore.Close()
+	if activeErr != nil || closeErr != nil || activeAfter != activeBefore {
+		t.Fatalf("active generation after failed snapshot publication = %q, active error %v, close error %v; want unchanged %q", activeAfter, activeErr, closeErr, activeBefore)
+	}
+	hits, err := searchExplicitSnapshotRollback(
+		context.Background(),
+		storeDirectory,
+		searchdomain.Query{RepositoryID: repositoryID, Text: "old value", Limit: defaultSearchLimit},
+	)
+	if err != nil || len(hits) != 1 || !strings.Contains(hits[0].Chunk.Text, "old_value") {
+		t.Fatalf("explicit rollback after failed snapshot publication = %#v, %v; want unchanged valid old pair", hits, err)
+	}
+}
+
+func TestRunIndexSnapshotDoesNotReportSuccessWhenMarkerCannotBeRemoved(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	repository := t.TempDir()
+	storeDirectory := t.TempDir()
+	writeCLIFile(t, repository, "value.py", "def old_value():\n    return 1\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run([]string{"index", "--store", storeDirectory, "--index-backend", "sqlite", repository}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(index SQLite fixture) code = %d; stderr = %q", code, stderr.String())
+	}
+	repositoryID := canonicalPath(t, repository)
+	markerPath := rollbackMarkerPath(storeDirectory, repositoryID)
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("Remove(marker fixture) error = %v", err)
+	}
+	if err := os.Mkdir(markerPath, 0o700); err != nil {
+		t.Fatalf("Mkdir(marker collision) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(markerPath, "PRIVATE_REMOVE_CANARY"), []byte("PRIVATE_REMOVE_CANARY"), 0o600); err != nil {
+		t.Fatalf("WriteFile(marker collision) error = %v", err)
+	}
+	writeCLIFile(t, repository, "value.py", "def new_value():\n    return 2\n")
+
+	stdout.Reset()
+	stderr.Reset()
+	code := run([]string{"index", "--store", storeDirectory, repository}, &stdout, &stderr)
+	if code != 1 || stdout.Len() != 0 {
+		t.Fatalf("run(index snapshot remove failure) code = %d stdout = %q, want failure without success report", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), errSnapshotRollbackInvalidation.Error()) ||
+		strings.Contains(stderr.String(), markerPath) || strings.Contains(stderr.String(), "PRIVATE_REMOVE_CANARY") {
+		t.Fatalf("run(index snapshot remove failure) stderr = %q, want sanitized invalidation category", stderr.String())
+	}
+	snapshotStore, err := localstore.OpenExisting(storeDirectory)
+	if err != nil {
+		t.Fatalf("OpenExisting(snapshot) error = %v", err)
+	}
+	loaded, err := snapshotStore.Load(context.Background(), repositoryID)
+	if err != nil {
+		t.Fatalf("Load(snapshot after failed CLI publication) error = %v", err)
+	}
+	if len(loaded) != 1 || !strings.Contains(loaded[0].Text, "old_value") || strings.Contains(loaded[0].Text, "new_value") {
+		t.Fatalf("snapshot after failed CLI publication = %#v, want unchanged old corpus", loaded)
 	}
 }
 

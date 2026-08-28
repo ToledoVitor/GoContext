@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -23,9 +24,23 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/search"
 	vectorsearch "github.com/ToledoVitor/GoContext/internal/search/vector"
 	"github.com/ToledoVitor/GoContext/internal/source"
+	modernsqlite "modernc.org/sqlite"
 )
 
 var _ vectorsearch.Index = (*BoundReader)(nil)
+
+var canonicalChunkReadProbe atomic.Int64
+
+func init() {
+	modernsqlite.MustRegisterScalarFunction(
+		"gocontext_test_canonical_chunk_read",
+		1,
+		func(_ *modernsqlite.FunctionContext, arguments []driver.Value) (driver.Value, error) {
+			canonicalChunkReadProbe.Add(1)
+			return arguments[0], nil
+		},
+	)
+}
 
 func TestVectorEncodingUsesLittleEndianFloat32(t *testing.T) {
 	values := embedding.Vector{1, -2.5, math.SmallestNonzeroFloat32}
@@ -205,6 +220,65 @@ func TestExactSearchRanksKnownCosinesAndReturnsCanonicalChunks(t *testing.T) {
 		if !reflect.DeepEqual(candidate.Chunk, chunkByID[candidate.Chunk.ID]) {
 			t.Errorf("candidate %d chunk = %#v, want canonical %#v", position, candidate.Chunk, chunkByID[candidate.Chunk.ID])
 		}
+	}
+}
+
+func TestHybridLoadThenExactSearchReusesOneValidatedCanonicalChunkScan(t *testing.T) {
+	directory := t.TempDir()
+	store := newVectorStore(t, directory)
+	chunks := []source.Chunk{
+		vectorChunk("first", "pkg/first.py", 1, source.LanguagePython, "FIRST_SOURCE"),
+		vectorChunk("second", "pkg/second.py", 2, source.LanguagePython, "SECOND_SOURCE"),
+	}
+	generation := vectorGeneration(t, "repository", "generation", "", chunks, []index.VectorRecord{
+		{ChunkID: "first", Values: embedding.Vector{1, 0}},
+		{ChunkID: "second", Values: embedding.Vector{0, 1}},
+	})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	database, err := sql.Open("sqlite", filepath.Join(directory, databaseName))
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := database.Exec(`
+		PRAGMA foreign_keys=OFF;
+		ALTER TABLE chunks RENAME TO probed_chunks;
+		CREATE VIEW chunks AS
+		SELECT repository_id, generation_id, chunk_id, ordinal,
+		       gocontext_test_canonical_chunk_read(text) AS text,
+		       language, symbol_name, path, start_line, end_line
+		FROM probed_chunks;`); err != nil {
+		_ = database.Close()
+		t.Fatalf("install canonical chunk read probe error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close probe database error = %v", err)
+	}
+
+	canonicalChunkReadProbe.Store(0)
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+	loaded, err := reader.Load(context.Background(), generation.RepositoryID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	loaded[0].Text = "MUTATED_CALLER_COPY"
+	candidates, err := reader.Search(context.Background(), vectorIndexQuery(generation, embedding.Vector{1, 0}, 2))
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 2 || candidates[0].Chunk.Text != "FIRST_SOURCE" {
+		t.Fatalf("Search() candidates = %#v, want defensive cached canonical chunks", candidates)
+	}
+	loadedAgain, err := reader.Load(context.Background(), generation.RepositoryID)
+	if err != nil {
+		t.Fatalf("Load(cached) error = %v", err)
+	}
+	if loadedAgain[0].Text != "FIRST_SOURCE" {
+		t.Fatalf("Load(cached) = %#v, want caller mutation isolated", loadedAgain)
+	}
+	if got, want := canonicalChunkReadProbe.Load(), int64(len(chunks)); got != want {
+		t.Fatalf("canonical chunk rows read = %d, want exactly one %d-row scan across Load+Search", got, want)
 	}
 }
 
@@ -1296,6 +1370,9 @@ func TestExactSearchCancelsDuringCandidateRanking(t *testing.T) {
 		t.Fatalf("Replace() error = %v", err)
 	}
 	reader := bindVectorReader(t, store, generation.RepositoryID)
+	if _, err := reader.Load(context.Background(), generation.RepositoryID); err != nil {
+		t.Fatalf("Load(warm canonical cache) error = %v", err)
+	}
 	filteredQuery := vectorIndexQuery(generation, embedding.Vector{1, 1}, candidateCount)
 	filteredQuery.Filter = search.Filter{PathPrefixes: []string{"not-ranked"}}
 	baselineCtx := &errCountingContext{Context: context.Background()}

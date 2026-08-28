@@ -21,10 +21,11 @@ type indexStats struct {
 }
 
 var (
-	errSQLiteIndexFailure        = errors.New("falha na indexação SQLite")
-	errSQLiteIndexMaintenance    = errors.New("índice SQLite publicado; manutenção incompleta")
-	errSQLiteIndexClose          = errors.New("falha ao fechar índice SQLite")
-	errRollbackCompanionNotReady = errors.New("índice SQLite publicado; rollback não está pronto")
+	errSQLiteIndexFailure           = errors.New("falha na indexação SQLite")
+	errSQLiteIndexMaintenance       = errors.New("índice SQLite publicado; manutenção incompleta")
+	errSQLiteIndexClose             = errors.New("falha ao fechar índice SQLite")
+	errRollbackCompanionNotReady    = errors.New("índice SQLite publicado; rollback não está pronto")
+	errSnapshotRollbackInvalidation = errors.New("falha ao invalidar prontidão de rollback")
 )
 
 func runIndex(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -95,14 +96,33 @@ func printIndexReport(stdout io.Writer, stats indexStats, mode semanticMode, rep
 }
 
 func publishSnapshot(ctx context.Context, storeDirectory string, ingested repositoryIngest) error {
+	return publishSnapshotWithOperations(ctx, storeDirectory, ingested, snapshotPublicationOperations{})
+}
+
+type snapshotPublicationOperations struct {
+	removeRollbackMarker func(string, string) error
+}
+
+func publishSnapshotWithOperations(
+	ctx context.Context,
+	storeDirectory string,
+	ingested repositoryIngest,
+	operations snapshotPublicationOperations,
+) error {
 	store, err := localstore.NewStore(storeDirectory)
 	if err != nil {
 		return err
 	}
+	removeMarker := operations.removeRollbackMarker
+	if removeMarker == nil {
+		removeMarker = removeRollbackMarker
+	}
+	if err := removeMarker(storeDirectory, ingested.repositoryID); err != nil {
+		return errSnapshotRollbackInvalidation
+	}
 	if err := store.Replace(ctx, ingested.repositoryID, ingested.corpus); err != nil {
 		return err
 	}
-	_ = removeRollbackMarker(storeDirectory, ingested.repositoryID)
 	return nil
 }
 

@@ -67,15 +67,15 @@ Sem modo `preferred|required` explícito, nenhuma chamada de rede ocorre, mesmo 
 
 - Sem flags/env, `index` e `search` usam snapshot/semantic-off e não abrem SQLite ou rede.
 - `--index-backend sqlite` e `auto` são opt-in. `auto` lê SQLite ativo quando presente e snapshot validado quando banco/store/repositório está ausente; busca não cria store.
-- Uma indexação SQLite bem-sucedida publica snapshot companheiro e marker privado ligados à mesma policy, revisão e geração ativa.
-- `--index-backend snapshot` explícito é rollback. Com geração SQLite ativa, valida marker limitado, no-follow, privado e schema estrito enquanto um reader fixa a geração. Qualquer divergência ou SQLite desconhecido/corrupto falha com categoria sanitizada de reindexação.
-- Uma indexação snapshot padrão posterior remove a prontidão de rollback. A busca padrão lê o snapshot novo; `auto` continua sendo a escolha explícita que pode ler a geração SQLite anterior.
+- Uma indexação SQLite bem-sucedida publica snapshot companheiro e marker protegido pela política de arquivo da plataforma, ligados à mesma policy, revisão e geração ativa.
+- `--index-backend snapshot` explícito é rollback. Com geração SQLite ativa, mantém uma transação de leitura fixada, valida chunks e vetores persistidos e então lê marker limitado, no-follow, regular e de schema estrito. Bits privados são exigidos onde o sistema expõe permissões POSIX; Windows mantém checagens de reparse, tipo e identidade sem interpretar seus bits sintéticos como ACL. Qualquer divergência ou SQLite desconhecido/corrupto falha com categoria sanitizada de reindexação; cancelamento e deadline preservam suas categorias.
+- Uma indexação snapshot padrão posterior remove a prontidão de rollback antes de substituir o snapshot. Falha nessa remoção é reportada de forma sanitizada, sem commit nem mensagem de sucesso. A busca padrão lê o snapshot novo após sucesso; `auto` continua sendo a escolha explícita que pode ler a geração SQLite anterior.
 
 Recuperação é reindex-first: um store SQLite saudável recebe nova indexação completa para recriar o par; SQLite corrupto não é mascarado por cache antigo. O operador pode reindexar snapshot para restaurar o caminho padrão, mas rollback explícito continua bloqueado até recuperação administrativa do store. Promoção de SQLite a default exige ADR futura.
 
 ### Escala exata
 
-O reader SQLite faz cosseno exato O(n × dimensão), sem ANN implícito e sem alterar ranking. O CLI carrega e valida a geração canônica uma vez antes da busca, usa essa mesma carga no caminho lexical e emite, no máximo uma vez por operação, aviso fixo quando há mais de 20.000 chunks; exatamente 20.000 permanece silencioso. Não há segunda carga apenas para contar, e o backend snapshot padrão não emite esse diagnóstico. Benchmark manual e evidência host-specific ficam no [ADR 0002](decisions/0002-embeddings-vector-search.md).
+O reader SQLite faz cosseno exato O(n × dimensão), sem ANN implícito e sem alterar ranking. A primeira carga fixa, valida e guarda internamente uma cópia imutável dos chunks canônicos; consumidores recebem cópias defensivas. O híbrido reutiliza esse cache no caminho vetorial, que consulta somente linhas de vetores e ainda verifica ausências, duplicatas, órfãos, encoding, dimensões e norma. Assim, chunks são consultados uma vez por reader, a mesma carga alimenta o lexical e o aviso acima de 20.000, e exatamente 20.000 permanece silencioso. O backend snapshot padrão não emite esse diagnóstico. Benchmark manual e evidência host-specific ficam no [ADR 0002](decisions/0002-embeddings-vector-search.md).
 
 ## Parsing e chunking
 

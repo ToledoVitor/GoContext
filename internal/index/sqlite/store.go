@@ -87,6 +87,8 @@ type BoundReader struct {
 	dimensions         int
 	metric             index.VectorMetric
 	store              *Store
+	canonicalChunks    []source.Chunk
+	canonicalLoaded    bool
 
 	mu     sync.Mutex
 	closed bool
@@ -1642,21 +1644,36 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 		_ = tx.Rollback()
 		return nil, err
 	}
+	var activeGeneration sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT active_generation
+		FROM repositories
+		WHERE repository_id = ?`, repositoryID,
+	).Scan(&activeGeneration)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !activeGeneration.Valid) {
+		_ = tx.Rollback()
+		return nil, index.ErrNotFound
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, fmt.Errorf("bind active sqlite index: %w", contextErr)
+		}
+		return nil, index.ErrReindexRequired
+	}
+
 	var generationID, revision, contentDigest, policy, fingerprint, model, metric string
 	var dimensions int
 	err = tx.QueryRowContext(ctx, `
-		SELECT g.generation_id, g.corpus_revision, g.content_digest, g.scan_policy_version,
-		       COALESCE(g.profile_fingerprint, ''), COALESCE(g.profile_model, ''),
-		       g.dimensions, g.metric
-		FROM repositories AS r
-		JOIN generations AS g
-		  ON g.repository_id = r.repository_id
-		 AND g.generation_id = r.active_generation
-		WHERE r.repository_id = ?`, repositoryID,
+		SELECT generation_id, corpus_revision, content_digest, scan_policy_version,
+		       COALESCE(profile_fingerprint, ''), COALESCE(profile_model, ''),
+		       dimensions, metric
+		FROM generations
+		WHERE repository_id = ? AND generation_id = ?`, repositoryID, activeGeneration.String,
 	).Scan(&generationID, &revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = tx.Rollback()
-		return nil, index.ErrNotFound
+		return nil, index.ErrReindexRequired
 	}
 	if err != nil {
 		_ = tx.Rollback()
@@ -1697,32 +1714,11 @@ func validStoredVectorMetadata(fingerprint, model string, dimensions int) bool {
 	return strings.TrimSpace(fingerprint) != "" && strings.TrimSpace(model) != "" && dimensions > 0
 }
 
-// CorpusMetadata describes the immutable corpus pinned by a bound reader.
-// It performs no additional database scan.
+// CorpusMetadata describes a corpus pinned and validated by a bound reader.
 type CorpusMetadata struct {
 	GenerationID      string
 	CorpusRevision    string
 	ScanPolicyVersion string
-}
-
-// CorpusMetadata returns validated metadata for the reader's pinned corpus.
-func (r *BoundReader) CorpusMetadata(ctx context.Context) (CorpusMetadata, error) {
-	if err := ctx.Err(); err != nil {
-		return CorpusMetadata{}, fmt.Errorf("describe bound sqlite corpus: %w", err)
-	}
-	if r == nil {
-		return CorpusMetadata{}, index.ErrReindexRequired
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return CorpusMetadata{}, index.ErrReindexRequired
-	}
-	return CorpusMetadata{
-		GenerationID:      r.generationID,
-		CorpusRevision:    r.corpusRevision,
-		ScanPolicyVersion: r.scanPolicyVersion,
-	}, nil
 }
 
 // GenerationID returns the generation pinned by the reader.
@@ -1745,6 +1741,20 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil, fmt.Errorf("load bound sqlite index: %w", errBoundReaderClosed)
+	}
+	chunks, err := r.loadCanonicalChunksLocked(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cloneCanonicalChunks(chunks), nil
+}
+
+func (r *BoundReader) loadCanonicalChunksLocked(ctx context.Context) ([]source.Chunk, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("load bound sqlite index: %w", err)
+	}
+	if r.canonicalLoaded {
+		return r.canonicalChunks, nil
 	}
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT c.chunk_id, c.text, c.language, c.symbol_name, c.path, c.start_line, c.end_line
@@ -1774,11 +1784,27 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 	if iterationErr != nil || closeErr != nil {
 		return nil, boundLoadError(ctx)
 	}
-	corpus, err := source.NewCorpus(r.scanPolicyVersion, chunks)
-	if err != nil || corpus.Revision != r.corpusRevision || canonicalContentDigest(chunks) != r.contentDigest {
+	corpus, err := source.NewCorpusContext(ctx, r.scanPolicyVersion, chunks)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, fmt.Errorf("load bound sqlite index: %w", contextErr)
+		}
 		return nil, index.ErrReindexRequired
 	}
-	return chunks, nil
+	contentDigest, err := canonicalContentDigestContext(ctx, chunks)
+	if err != nil {
+		return nil, fmt.Errorf("load bound sqlite index: %w", err)
+	}
+	if corpus.Revision != r.corpusRevision || contentDigest != r.contentDigest {
+		return nil, index.ErrReindexRequired
+	}
+	r.canonicalChunks = cloneCanonicalChunks(chunks)
+	r.canonicalLoaded = true
+	return r.canonicalChunks, nil
+}
+
+func cloneCanonicalChunks(chunks []source.Chunk) []source.Chunk {
+	return append([]source.Chunk(nil), chunks...)
 }
 
 func boundLoadError(ctx context.Context) error {

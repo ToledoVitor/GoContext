@@ -82,7 +82,7 @@ func rollbackMarkerPath(storeDirectory, repositoryID string) string {
 
 func readRollbackMarker(ctx context.Context, storeDirectory, repositoryID string) (rollbackMarker, error) {
 	if err := ctx.Err(); err != nil {
-		return rollbackMarker{}, errInvalidRollbackMarker
+		return rollbackMarker{}, err
 	}
 	canonicalDirectory, err := canonicalMarkerDirectory(storeDirectory)
 	if err != nil {
@@ -105,12 +105,15 @@ func readRollbackMarker(ctx context.Context, storeDirectory, repositoryID string
 	payload, readErr := readRollbackMarkerPayload(ctx, file)
 	after, pathErr := os.Lstat(path)
 	closeErr := file.Close()
+	if err := ctx.Err(); err != nil {
+		return rollbackMarker{}, err
+	}
 	if readErr != nil || pathErr != nil || closeErr != nil ||
 		validatePrivateRollbackMarker(after) != nil || !os.SameFile(before, after) || !os.SameFile(opened, after) {
 		return rollbackMarker{}, errInvalidRollbackMarker
 	}
 	if err := ctx.Err(); err != nil {
-		return rollbackMarker{}, errInvalidRollbackMarker
+		return rollbackMarker{}, err
 	}
 	if !hasExactRollbackMarkerFields(payload) {
 		return rollbackMarker{}, errInvalidRollbackMarker
@@ -131,6 +134,9 @@ func readRollbackMarker(ctx context.Context, storeDirectory, repositoryID string
 		!validSHA256Hex(marker.CorpusRevision) ||
 		!validSHA256Hex(marker.ActiveGeneration) {
 		return rollbackMarker{}, errInvalidRollbackMarker
+	}
+	if err := ctx.Err(); err != nil {
+		return rollbackMarker{}, err
 	}
 	return marker, nil
 }
@@ -197,10 +203,10 @@ func readRollbackMarkerPayload(ctx context.Context, reader io.Reader) ([]byte, e
 }
 
 func validatePrivateRollbackMarker(info fs.FileInfo) error {
-	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return errInvalidRollbackMarker
 	}
-	return nil
+	return validateRollbackMarkerPlatformMode(info)
 }
 
 func validSHA256Hex(value string) bool {

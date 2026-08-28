@@ -1373,6 +1373,44 @@ func TestStoreReportsMissingRepository(t *testing.T) {
 	}
 }
 
+func TestBindActiveDistinguishesMissingRepositoryFromDanglingActiveGeneration(t *testing.T) {
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	generation := generationFromCorpus(t, "repository", "generation", "", []source.Chunk{
+		sampleChunk("chunk", "dangling.py", "DANGLING_SOURCE_CANARY"),
+	})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	database := openRawDatabase(t, directory)
+	if _, err := database.Exec(
+		`DELETE FROM generations WHERE repository_id = ? AND generation_id = ?`,
+		generation.RepositoryID,
+		generation.ID,
+	); err != nil {
+		_ = database.Close()
+		t.Fatalf("delete active generation error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close corruption database error = %v", err)
+	}
+
+	reader, err := store.BindActive(context.Background(), generation.RepositoryID)
+	if reader != nil {
+		_ = reader.Close()
+		t.Fatal("BindActive(dangling generation) returned reader, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("BindActive(dangling generation) error = %v, want ErrReindexRequired", err)
+	}
+	if strings.Contains(err.Error(), "DANGLING_SOURCE_CANARY") || strings.Contains(err.Error(), generation.ID) {
+		t.Fatalf("BindActive(dangling generation) error exposes private state: %v", err)
+	}
+	if _, err := store.BindActive(context.Background(), "missing"); !errors.Is(err, index.ErrNotFound) {
+		t.Fatalf("BindActive(missing repository) error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestNewStoreRejectsEmptyPathAndExistingFile(t *testing.T) {
 	if _, err := indexsqlite.NewStore(""); err == nil {
 		t.Fatal("NewStore(empty) error = nil, want error")

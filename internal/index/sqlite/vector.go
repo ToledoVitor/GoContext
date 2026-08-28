@@ -162,6 +162,51 @@ func (r *BoundReader) Describe(ctx context.Context, repositoryID string) (vector
 	}, nil
 }
 
+// ValidateCorpus verifies the canonical chunks and vector rows for the reader's
+// pinned generation before a rollback decision trusts its metadata.
+func (r *BoundReader) ValidateCorpus(ctx context.Context) (CorpusMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return CorpusMetadata{}, fmt.Errorf("validate bound sqlite corpus: %w", err)
+	}
+	if r == nil {
+		return CorpusMetadata{}, index.ErrReindexRequired
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return CorpusMetadata{}, fmt.Errorf("validate bound sqlite corpus: %w", err)
+	}
+	if r.closed {
+		return CorpusMetadata{}, index.ErrReindexRequired
+	}
+	chunks, err := r.loadCanonicalChunksLocked(ctx)
+	if err != nil {
+		return CorpusMetadata{}, err
+	}
+	if r.profileFingerprint == "" && r.profileModel == "" && r.dimensions == 0 {
+		if err := r.validateLexicalOnlyVectorRowsLocked(ctx); err != nil {
+			return CorpusMetadata{}, boundCorpusValidationError(ctx, err)
+		}
+	} else if _, err := r.scanVectorRowsLocked(ctx, chunks, nil, search.Filter{}); err != nil {
+		return CorpusMetadata{}, boundCorpusValidationError(ctx, err)
+	}
+	return CorpusMetadata{
+		GenerationID:      r.generationID,
+		CorpusRevision:    r.corpusRevision,
+		ScanPolicyVersion: r.scanPolicyVersion,
+	}, nil
+}
+
+func boundCorpusValidationError(ctx context.Context, err error) error {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("validate bound sqlite corpus: %w", contextErr)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("validate bound sqlite corpus: %w", err)
+	}
+	return index.ErrReindexRequired
+}
+
 // Search scans exact cosine candidates from the reader's pinned generation.
 func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery) ([]vectorsearch.Candidate, error) {
 	if err := ctx.Err(); err != nil {
@@ -202,47 +247,74 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 	if lexicalOnly {
 		return nil, r.lexicalOnlyVectorState(ctx, "search bound vector index")
 	}
+	chunks, err := r.loadCanonicalChunksLocked(ctx)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, fmt.Errorf("search bound vector index: %w", contextErr)
+		}
+		return nil, vectorsearch.ErrVectorIntegrity
+	}
+	candidates, err := r.scanVectorRowsLocked(ctx, chunks, normalizedQuery, query.Filter)
+	if err != nil {
+		return nil, err
+	}
 
+	if err := sortCandidatesContext(ctx, candidates); err != nil {
+		return nil, fmt.Errorf("search bound vector index: %w", err)
+	}
+	if len(candidates) > query.Limit {
+		candidates = candidates[:query.Limit]
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("search bound vector index: %w", err)
+	}
+	return candidates, nil
+}
+
+func (r *BoundReader) scanVectorRowsLocked(
+	ctx context.Context,
+	chunks []source.Chunk,
+	normalizedQuery embedding.Vector,
+	filter search.Filter,
+) ([]vectorsearch.Candidate, error) {
+	canonicalByID := make(map[string]source.Chunk, len(chunks))
+	for position, chunk := range chunks {
+		if position%vectorContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("search bound vector index: %w", err)
+			}
+		}
+		canonicalByID[chunk.ID] = chunk
+	}
 	rows, err := r.tx.QueryContext(ctx, `
-		SELECT c.chunk_id, c.text, c.language, c.symbol_name, c.path, c.start_line, c.end_line,
-		       v.encoding_version, v.dimensions, v.values_blob
-		FROM chunks AS c
-		LEFT JOIN vectors AS v
-		  ON v.repository_id = c.repository_id
-		 AND v.generation_id = c.generation_id
-		 AND v.chunk_id = c.chunk_id
-		WHERE c.repository_id = ? AND c.generation_id = ?
-		ORDER BY c.ordinal`, r.repositoryID, r.generationID)
+		SELECT chunk_id, encoding_version, dimensions, values_blob
+		FROM vectors
+		WHERE repository_id = ? AND generation_id = ?
+		ORDER BY chunk_id`, r.repositoryID, r.generationID)
 	if err != nil {
 		return nil, vectorReadError(ctx)
 	}
 
-	chunks := make([]source.Chunk, 0)
 	candidates := make([]vectorsearch.Candidate, 0)
-	seen := make(map[string]struct{})
+	seen := make(map[string]struct{}, len(chunks))
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("search bound vector index: %w", err)
 		}
-		var chunk source.Chunk
-		var language string
+		var chunkID string
 		var version, dimensions sql.NullInt64
 		var blob []byte
-		if err := rows.Scan(
-			&chunk.ID, &chunk.Text, &language, &chunk.SymbolName,
-			&chunk.Reference.Path, &chunk.Reference.StartLine, &chunk.Reference.EndLine,
-			&version, &dimensions, &blob,
-		); err != nil {
+		if err := rows.Scan(&chunkID, &version, &dimensions, &blob); err != nil {
 			_ = rows.Close()
 			return nil, vectorReadError(ctx)
 		}
-		if _, duplicate := seen[chunk.ID]; duplicate || !version.Valid || !dimensions.Valid {
+		chunk, known := canonicalByID[chunkID]
+		if _, duplicate := seen[chunkID]; duplicate || !known || !version.Valid || !dimensions.Valid {
 			_ = rows.Close()
 			return nil, vectorsearch.ErrVectorIntegrity
 		}
-		seen[chunk.ID] = struct{}{}
-		chunk.Language = source.Language(language)
+		seen[chunkID] = struct{}{}
 		if err := validateStoredVectorHeader(version.Int64, dimensions.Int64, r.dimensions); err != nil {
 			_ = rows.Close()
 			return nil, vectorsearch.ErrVectorIntegrity
@@ -264,19 +336,20 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 			_ = rows.Close()
 			return nil, vectorsearch.ErrVectorIntegrity
 		}
-		similarity, err := cosineSimilarity(ctx, normalizedQuery, storedVector)
-		if err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		chunks = append(chunks, chunk)
-		matches, err := vectorMatchesFilterContext(ctx, chunk, query.Filter)
-		if err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if matches {
-			candidates = append(candidates, vectorsearch.Candidate{Chunk: chunk, Similarity: similarity})
+		if normalizedQuery != nil {
+			similarity, err := cosineSimilarity(ctx, normalizedQuery, storedVector)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			matches, err := vectorMatchesFilterContext(ctx, chunk, filter)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if matches {
+				candidates = append(candidates, vectorsearch.Candidate{Chunk: chunk, Similarity: similarity})
+			}
 		}
 	}
 	iterationErr := rows.Err()
@@ -284,51 +357,23 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 	if iterationErr != nil || closeErr != nil {
 		return nil, vectorReadError(ctx)
 	}
-
-	corpus, err := source.NewCorpusContext(ctx, r.scanPolicyVersion, chunks)
-	if err != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, fmt.Errorf("search bound vector index: %w", contextErr)
-		}
+	if len(seen) != len(chunks) {
 		return nil, vectorsearch.ErrVectorIntegrity
-	}
-	contentDigest, err := canonicalContentDigestContext(ctx, chunks)
-	if err != nil {
-		return nil, fmt.Errorf("search bound vector index: %w", err)
-	}
-	if corpus.Revision != r.corpusRevision || contentDigest != r.contentDigest {
-		return nil, vectorsearch.ErrVectorIntegrity
-	}
-	var orphaned int
-	if err := r.tx.QueryRowContext(ctx, `
-		SELECT count(*)
-		FROM vectors AS v
-		LEFT JOIN chunks AS c
-		  ON c.repository_id = v.repository_id
-		 AND c.generation_id = v.generation_id
-		 AND c.chunk_id = v.chunk_id
-		WHERE v.repository_id = ? AND v.generation_id = ? AND c.chunk_id IS NULL`,
-		r.repositoryID, r.generationID,
-	).Scan(&orphaned); err != nil {
-		return nil, vectorReadError(ctx)
-	}
-	if orphaned != 0 {
-		return nil, vectorsearch.ErrVectorIntegrity
-	}
-
-	if err := sortCandidatesContext(ctx, candidates); err != nil {
-		return nil, fmt.Errorf("search bound vector index: %w", err)
-	}
-	if len(candidates) > query.Limit {
-		candidates = candidates[:query.Limit]
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("search bound vector index: %w", err)
 	}
 	return candidates, nil
 }
 
 func (r *BoundReader) lexicalOnlyVectorState(ctx context.Context, operation string) error {
+	if err := r.validateLexicalOnlyVectorRowsLocked(ctx); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("%s: %w", operation, contextErr)
+		}
+		return err
+	}
+	return vectorsearch.ErrVectorUnavailable
+}
+
+func (r *BoundReader) validateLexicalOnlyVectorRowsLocked(ctx context.Context) error {
 	var vectorCount int64
 	if err := r.tx.QueryRowContext(ctx, `
 		SELECT count(*)
@@ -337,14 +382,14 @@ func (r *BoundReader) lexicalOnlyVectorState(ctx context.Context, operation stri
 		r.repositoryID, r.generationID,
 	).Scan(&vectorCount); err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return fmt.Errorf("%s: %w", operation, contextErr)
+			return contextErr
 		}
 		return vectorsearch.ErrVectorIntegrity
 	}
 	if vectorCount != 0 {
 		return vectorsearch.ErrVectorIntegrity
 	}
-	return vectorsearch.ErrVectorUnavailable
+	return nil
 }
 
 func vectorMatchesFilterContext(ctx context.Context, chunk source.Chunk, filter search.Filter) (bool, error) {

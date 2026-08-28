@@ -146,11 +146,11 @@ O snapshot implícito permanece a compatibilidade padrão. Já `--index-backend 
 go run ./cmd/gocontext search --store /caminho/do/cache --index-backend snapshot /caminho/do/repositório "carregar usuário"
 ```
 
-Sem banco SQLite, ou sem geração ativa para esse repositório, basta existir snapshot atual validado. Com geração ativa, o comando exige snapshot companheiro, marker privado `rollback_ready`, policy atual, mesma revisão de corpus e mesma geração SQLite ativa. Marker ausente, legado, permissivo, malformado ou divergente — e SQLite corrupto/inacessível — falham fechados com uma categoria sanitizada de reindexação.
+Sem banco SQLite, ou sem geração ativa para esse repositório, basta existir snapshot atual validado. Com geração ativa, o comando exige snapshot companheiro, marker regular `rollback_ready` sem symlink/reparse, policy atual, mesma revisão de corpus e mesma geração SQLite ativa; chunks e vetores da geração fixada também são validados antes da autorização. Em sistemas POSIX, bits de grupo/outros tornam o marker permissivo e inválido; no Windows, onde `FileMode` não representa ACLs POSIX, permanecem as validações estruturais, de identidade e no-follow. Marker ausente, legado, malformado ou divergente — e SQLite corrupto/inacessível — falham fechados com uma categoria sanitizada de reindexação.
 
 Para recuperar um par saudável, reindexe primeiro com `--index-backend sqlite --semantic off` e só então solicite o rollback explícito. Se SQLite estiver corrupto, uma reindexação snapshot padrão restaura o caminho implícito atual, mas não torna o rollback explícito pronto; o store SQLite precisa de recuperação administrativa separada. Não exclua SQLite apenas para contornar o guard.
 
-Uma reindexação snapshot padrão depois de SQLite grava o snapshot novo, invalida `rollback_ready` e continua autoritativa para a busca padrão. Promover SQLite/`auto` a default exige uma decisão futura.
+Uma reindexação snapshot padrão depois de SQLite invalida `rollback_ready` antes de substituir o snapshot e continua autoritativa para a busca padrão. Se a invalidação falhar, o CLI reporta falha sanitizada e não anuncia nem grava o novo snapshot. Promover SQLite/`auto` a default exige uma decisão futura.
 
 ## Escala da busca exata
 

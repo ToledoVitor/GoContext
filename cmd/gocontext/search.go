@@ -153,10 +153,26 @@ func searchExplicitSnapshotRollback(
 	storePath string,
 	query searchdomain.Query,
 ) ([]searchdomain.Hit, error) {
+	return searchExplicitSnapshotRollbackWithHooks(ctx, storePath, query, snapshotRollbackHooks{})
+}
+
+type snapshotRollbackHooks struct {
+	afterBind func(context.Context, *indexsqlite.BoundReader) error
+}
+
+func searchExplicitSnapshotRollbackWithHooks(
+	ctx context.Context,
+	storePath string,
+	query searchdomain.Query,
+	hooks snapshotRollbackHooks,
+) ([]searchdomain.Hit, error) {
 	store, err := indexsqlite.OpenExistingContext(ctx, storePath)
 	if err != nil {
 		if errors.Is(err, index.ErrNotFound) {
 			return searchExistingSnapshot(ctx, storePath, query)
+		}
+		if cancellation := snapshotRollbackCancellation(ctx, err); cancellation != nil {
+			return nil, cancellation
 		}
 		return nil, errSnapshotRollbackReindex
 	}
@@ -166,47 +182,84 @@ func searchExplicitSnapshotRollback(
 		if errors.Is(err, index.ErrNotFound) && closeErr == nil {
 			return searchExistingSnapshot(ctx, storePath, query)
 		}
+		if cancellation := snapshotRollbackCancellation(ctx, err); cancellation != nil {
+			return nil, cancellation
+		}
 		return nil, errSnapshotRollbackReindex
 	}
+	if hooks.afterBind != nil {
+		if err := hooks.afterBind(ctx, reader); err != nil {
+			return nil, finishSnapshotRollback(ctx, reader, store, err)
+		}
+	}
 
-	metadata, metadataErr := reader.CorpusMetadata(ctx)
-	marker, markerErr := readRollbackMarker(ctx, storePath, query.RepositoryID)
+	metadata, err := reader.ValidateCorpus(ctx)
+	if err != nil {
+		return nil, finishSnapshotRollback(ctx, reader, store, err)
+	}
+	marker, err := readRollbackMarker(ctx, storePath, query.RepositoryID)
+	if err != nil {
+		return nil, finishSnapshotRollback(ctx, reader, store, err)
+	}
 	snapshotStore, snapshotStoreErr := localstore.OpenExisting(storePath)
-	var chunks []source.Chunk
-	var snapshotErr error
-	if snapshotStoreErr == nil {
-		chunks, snapshotErr = snapshotStore.Load(ctx, query.RepositoryID)
+	if snapshotStoreErr != nil {
+		return nil, finishSnapshotRollback(ctx, reader, store, snapshotStoreErr)
 	}
-	var corpus source.Corpus
-	if snapshotErr == nil && snapshotStoreErr == nil {
-		corpus, snapshotErr = source.NewCorpusContext(ctx, ingest.ScanPolicyVersion, chunks)
+	chunks, err := snapshotStore.Load(ctx, query.RepositoryID)
+	if err != nil {
+		return nil, finishSnapshotRollback(ctx, reader, store, err)
 	}
-	valid := metadataErr == nil && markerErr == nil && snapshotStoreErr == nil && snapshotErr == nil &&
-		metadata.ScanPolicyVersion == ingest.ScanPolicyVersion &&
+	corpus, err := source.NewCorpusContext(ctx, ingest.ScanPolicyVersion, chunks)
+	if err != nil {
+		return nil, finishSnapshotRollback(ctx, reader, store, err)
+	}
+	valid := metadata.ScanPolicyVersion == ingest.ScanPolicyVersion &&
 		marker.RepositoryHash == repositoryHash(query.RepositoryID) &&
 		marker.ScanPolicy == ingest.ScanPolicyVersion &&
 		marker.CorpusRevision == corpus.Revision &&
 		marker.CorpusRevision == metadata.CorpusRevision &&
 		marker.ActiveGeneration == metadata.GenerationID
 	if !valid {
-		_ = reader.Close()
-		_ = store.Close()
-		return nil, errSnapshotRollbackReindex
+		return nil, finishSnapshotRollback(ctx, reader, store, errSnapshotRollbackReindex)
 	}
 
 	searcher, err := lexical.NewSearcher(fixedSnapshotLoader{repositoryID: query.RepositoryID, chunks: chunks})
-	if err == nil {
-		chunks = nil
-		var hits []searchdomain.Hit
-		hits, err = searcher.Search(ctx, query)
-		if closeErr := closeSQLiteSearch(reader, store, err); closeErr != nil {
-			return nil, errSnapshotRollbackReindex
-		}
-		return hits, nil
+	if err != nil {
+		return nil, finishSnapshotRollback(ctx, reader, store, err)
 	}
-	_ = reader.Close()
-	_ = store.Close()
-	return nil, errSnapshotRollbackReindex
+	chunks = nil
+	hits, err := searcher.Search(ctx, query)
+	if err := finishSnapshotRollback(ctx, reader, store, err); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+func finishSnapshotRollback(
+	ctx context.Context,
+	reader *indexsqlite.BoundReader,
+	store *indexsqlite.Store,
+	operationErr error,
+) error {
+	readerCloseErr := reader.Close()
+	storeCloseErr := store.Close()
+	if cancellation := snapshotRollbackCancellation(ctx, operationErr); cancellation != nil {
+		return cancellation
+	}
+	if operationErr != nil || readerCloseErr != nil || storeCloseErr != nil {
+		return errSnapshotRollbackReindex
+	}
+	return nil
+}
+
+func snapshotRollbackCancellation(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func searchSnapshot(ctx context.Context, storePath string, query searchdomain.Query) ([]searchdomain.Hit, error) {
