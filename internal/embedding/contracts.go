@@ -16,6 +16,48 @@ var (
 	ErrInvalidVector = errors.New("invalid embedding vector")
 )
 
+type semanticUnavailableError struct {
+	attemptedRequests int
+}
+
+func (err *semanticUnavailableError) Error() string {
+	return ErrSemanticUnavailable.Error()
+}
+
+func (err *semanticUnavailableError) Unwrap() error {
+	return ErrSemanticUnavailable
+}
+
+func (err *semanticUnavailableError) AttemptedRequests() int {
+	if err == nil || err.attemptedRequests < 0 {
+		return 0
+	}
+	return err.attemptedRequests
+}
+
+// NewSemanticUnavailable returns the provider-neutral exhausted temporary
+// failure category with only a sanitized count of attempted requests.
+func NewSemanticUnavailable(attemptedRequests int) error {
+	if attemptedRequests < 0 {
+		attemptedRequests = 0
+	}
+	return &semanticUnavailableError{attemptedRequests: attemptedRequests}
+}
+
+// AttemptedRequests returns sanitized attempt metadata when an error carries
+// it, and zero for all other errors.
+func AttemptedRequests(err error) int {
+	var counted interface{ AttemptedRequests() int }
+	if !errors.As(err, &counted) {
+		return 0
+	}
+	requests := counted.AttemptedRequests()
+	if requests < 0 {
+		return 0
+	}
+	return requests
+}
+
 const validateBatchContextStride = 256
 
 // Purpose identifies how an embedding will be used.

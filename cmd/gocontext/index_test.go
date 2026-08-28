@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -420,6 +422,74 @@ func TestRunIndexSQLiteCommittedCleanupOutcomeStillPublishesRollbackCompanion(t 
 	}
 	if len(pinnedChunks) != 1 || !strings.Contains(pinnedChunks[0].Text, "first_generation") {
 		t.Fatalf("pinned chunks = %#v, want immutable first generation", pinnedChunks)
+	}
+}
+
+func TestPublishSQLiteIndexJoinsCommittedMaintenanceAndRollbackFailure(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	repository := t.TempDir()
+	repositoryID := canonicalPath(t, repository)
+	storeDirectory := t.TempDir()
+	writeCLIFile(t, repository, "combined.py", "def first_generation():\n    return 'PRIVATE_SOURCE_CANARY'\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if code := run([]string{"index", "--store", storeDirectory, "--index-backend", "sqlite", repository}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(index first generation) code = %d; stderr = %q", code, stderr.String())
+	}
+
+	readerStore, err := indexsqlite.OpenExisting(storeDirectory)
+	if err != nil {
+		t.Fatalf("OpenExisting(reader) error = %v", err)
+	}
+	reader, err := readerStore.BindActive(context.Background(), repositoryID)
+	if err != nil {
+		_ = readerStore.Close()
+		t.Fatalf("BindActive() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = readerStore.Close()
+	})
+	if _, err := reader.Load(context.Background(), repositoryID); err != nil {
+		t.Fatalf("reader.Load(first) error = %v", err)
+	}
+
+	snapshotCollision := filepath.Join(storeDirectory, repositoryHash(repositoryID)+".json")
+	if err := os.Remove(snapshotCollision); err != nil {
+		t.Fatalf("Remove(first rollback snapshot) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(snapshotCollision, "non-empty"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(snapshot collision) error = %v", err)
+	}
+	writeCLIFile(t, repository, "combined.py", "def second_generation():\n    return 'PRIVATE_SOURCE_CANARY'\n")
+	ingested, err := ingestRepository(context.Background(), repository)
+	if err != nil {
+		t.Fatalf("ingestRepository() error = %v", err)
+	}
+
+	report, published, err := publishSQLiteIndex(
+		context.Background(),
+		storeDirectory,
+		ingested,
+		resolvedEmbeddingConfig{mode: semanticModeOff},
+		&stderr,
+	)
+	if !published || report.GenerationID == "" {
+		t.Fatalf("publishSQLiteIndex() = report %#v published %v, want committed generation", report, published)
+	}
+	if !errors.Is(err, errSQLiteIndexMaintenance) || !errors.Is(err, errRollbackCompanionNotReady) {
+		t.Fatalf("publishSQLiteIndex() error = %v, want maintenance and rollback categories", err)
+	}
+	diagnostics := fmt.Sprintf("indexar repositório: %v\n", err)
+	for _, want := range []string{"manutenção incompleta", "rollback não está pronto"} {
+		if !strings.Contains(diagnostics, want) {
+			t.Fatalf("combined diagnostics = %q, want %q", diagnostics, want)
+		}
+	}
+	for _, canary := range []string{repositoryID, "combined.py", "PRIVATE_SOURCE_CANARY"} {
+		if strings.Contains(diagnostics, canary) {
+			t.Fatalf("combined diagnostics expose %q: %q", canary, diagnostics)
+		}
 	}
 }
 

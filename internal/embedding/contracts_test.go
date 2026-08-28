@@ -3,6 +3,7 @@ package embedding_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"sync"
@@ -10,6 +11,28 @@ import (
 
 	"github.com/ToledoVitor/GoContext/internal/embedding"
 )
+
+func TestSemanticUnavailableCarriesOnlySanitizedAttemptMetadata(t *testing.T) {
+	for _, requests := range []int{-1, 0, 3} {
+		err := embedding.NewSemanticUnavailable(requests)
+		if !errors.Is(err, embedding.ErrSemanticUnavailable) {
+			t.Fatalf("NewSemanticUnavailable(%d) error = %v, want ErrSemanticUnavailable", requests, err)
+		}
+		want := requests
+		if want < 0 {
+			want = 0
+		}
+		if got := embedding.AttemptedRequests(fmt.Errorf("safe wrapper: %w", err)); got != want {
+			t.Fatalf("AttemptedRequests(NewSemanticUnavailable(%d)) = %d, want %d", requests, got, want)
+		}
+		if got := err.Error(); got != embedding.ErrSemanticUnavailable.Error() {
+			t.Fatalf("NewSemanticUnavailable(%d).Error() = %q, want sanitized sentinel text", requests, got)
+		}
+	}
+	if got := embedding.AttemptedRequests(errors.New("provider raw cause")); got != 0 {
+		t.Fatalf("AttemptedRequests(untyped error) = %d, want 0", got)
+	}
+}
 
 func TestValidateBatchAcceptsOrderedFiniteVectors(t *testing.T) {
 	batch := embedding.Batch{

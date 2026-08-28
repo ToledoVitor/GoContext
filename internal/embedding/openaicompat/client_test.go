@@ -243,6 +243,9 @@ func TestRetryTemporaryFailuresStopsAfterThreeAttempts(t *testing.T) {
 			if attempts != 3 {
 				t.Fatalf("attempts = %d, want 3", attempts)
 			}
+			if got := embedding.AttemptedRequests(err); got != 3 {
+				t.Fatalf("AttemptedRequests(Embed error) = %d, want 3", got)
+			}
 			if len(waits) != 2 {
 				t.Fatalf("waits = %d, want 2", len(waits))
 			}
@@ -252,6 +255,87 @@ func TestRetryTemporaryFailuresStopsAfterThreeAttempts(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestClientAggregatesAttemptedRequestsAcrossCanceledConcurrentBatches(t *testing.T) {
+	client := newRetryClient(t)
+	client.config.BatchSize = 1
+	client.config.MaxInFlight = 2
+	var calls atomic.Int64
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		call := calls.Add(1)
+		if call <= 2 {
+			started <- struct{}{}
+			<-release
+		}
+		return responseWithStatus(http.StatusServiceUnavailable, "concurrent-body-canary"), nil
+	})
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Embed(context.Background(), embedding.PurposeDocument, []string{"batch-one", "batch-two"})
+		done <- err
+	}()
+	<-started
+	<-started
+	close(release)
+	err := <-done
+	if !errors.Is(err, embedding.ErrSemanticUnavailable) {
+		t.Fatalf("Embed() error = %v, want ErrSemanticUnavailable", err)
+	}
+	requests := embedding.AttemptedRequests(err)
+	if got := int(calls.Load()); requests != got || requests <= 3 {
+		t.Fatalf("AttemptedRequests(error)/HTTP calls = %d/%d, want equal aggregate above one batch", requests, got)
+	}
+	for _, canary := range []string{"batch-one", "batch-two", "concurrent-body-canary"} {
+		if strings.Contains(err.Error(), canary) {
+			t.Fatalf("Embed() error exposes %q: %v", canary, err)
+		}
+	}
+}
+
+func TestClientInternalTimeoutPreservesAttemptedRequestCount(t *testing.T) {
+	client := newRetryClient(t)
+	client.config.Timeout = 20 * time.Millisecond
+	var calls atomic.Int64
+	client.httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})
+
+	_, err := client.Embed(context.Background(), embedding.PurposeQuery, []string{"timeout-input-canary"})
+	if !errors.Is(err, embedding.ErrSemanticUnavailable) {
+		t.Fatalf("Embed() error = %v, want ErrSemanticUnavailable", err)
+	}
+	if got, want := embedding.AttemptedRequests(err), int(calls.Load()); got != want || got != 1 {
+		t.Fatalf("AttemptedRequests(error)/HTTP calls = %d/%d, want 1/1", got, want)
+	}
+	if strings.Contains(err.Error(), "timeout-input-canary") {
+		t.Fatalf("Embed() error exposes input: %v", err)
+	}
+}
+
+func TestClientCanceledBeforeEmbedReportsZeroAttemptedRequests(t *testing.T) {
+	client := newRetryClient(t)
+	var calls atomic.Int64
+	client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return embeddingSuccessResponse(), nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.Embed(ctx, embedding.PurposeQuery, []string{"never-sent-canary"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Embed() error = %v, want context.Canceled", err)
+	}
+	if got := embedding.AttemptedRequests(err); got != 0 || calls.Load() != 0 {
+		t.Fatalf("AttemptedRequests(error)/HTTP calls = %d/%d, want 0/0", got, calls.Load())
 	}
 }
 

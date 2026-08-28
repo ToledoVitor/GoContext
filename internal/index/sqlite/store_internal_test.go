@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -11,6 +14,88 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
+
+func TestOpenExistingPinsValidatedDatabaseIdentityAcrossPathSwap(t *testing.T) {
+	firstDirectory := t.TempDir()
+	firstStore, err := NewStore(firstDirectory)
+	if err != nil {
+		t.Fatalf("NewStore(first) error = %v", err)
+	}
+	firstGeneration := internalTestGeneration(t, "first-repository", "first-generation", "first.py", "FIRST = 1")
+	if err := firstStore.Replace(context.Background(), firstGeneration); err != nil {
+		t.Fatalf("Replace(first) error = %v", err)
+	}
+	if err := firstStore.checkpoint(context.Background()); err != nil {
+		t.Fatalf("checkpoint(first) error = %v", err)
+	}
+	if err := firstStore.Close(); err != nil {
+		t.Fatalf("Close(first) error = %v", err)
+	}
+
+	secondDirectory := t.TempDir()
+	secondStore, err := NewStore(secondDirectory)
+	if err != nil {
+		t.Fatalf("NewStore(second) error = %v", err)
+	}
+	secondGeneration := internalTestGeneration(t, "second-repository", "second-generation", "second.py", "SECOND = 2")
+	if err := secondStore.Replace(context.Background(), secondGeneration); err != nil {
+		t.Fatalf("Replace(second) error = %v", err)
+	}
+	if err := secondStore.checkpoint(context.Background()); err != nil {
+		t.Fatalf("checkpoint(second) error = %v", err)
+	}
+	if err := secondStore.Close(); err != nil {
+		t.Fatalf("Close(second) error = %v", err)
+	}
+
+	opened, err := OpenExisting(firstDirectory)
+	if err != nil {
+		t.Fatalf("OpenExisting(first) error = %v", err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	opened.db.SetMaxIdleConns(0)
+	firstPath := filepath.Join(firstDirectory, databaseName)
+	secondPath := filepath.Join(secondDirectory, databaseName)
+	if err := os.Rename(firstPath, firstPath+".original"); err != nil {
+		t.Fatalf("Rename(first aside) error = %v", err)
+	}
+	if err := os.Rename(secondPath, firstPath); err != nil {
+		t.Fatalf("Rename(second into first path) error = %v", err)
+	}
+
+	loaded, err := opened.Load(context.Background(), firstGeneration.RepositoryID)
+	if err != nil {
+		t.Fatalf("Load(first after path swap) error = %v", err)
+	}
+	if !reflect.DeepEqual(loaded, firstGeneration.Chunks) {
+		t.Fatalf("Load(first after path swap) = %#v, want pinned %#v", loaded, firstGeneration.Chunks)
+	}
+	if _, err := opened.Load(context.Background(), secondGeneration.RepositoryID); !errors.Is(err, index.ErrNotFound) {
+		t.Fatalf("Load(second after path swap) error = %v, want pinned database ErrNotFound", err)
+	}
+}
+
+func internalTestGeneration(t *testing.T, repositoryID, generationID, path, text string) index.Generation {
+	t.Helper()
+	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, []source.Chunk{{
+		ID:         generationID + "-chunk",
+		Text:       text,
+		Language:   source.LanguagePython,
+		SymbolName: "Fixture",
+		Reference:  source.Reference{Path: path, StartLine: 1, EndLine: 1},
+	}})
+	if err != nil {
+		t.Fatalf("NewCorpus() error = %v", err)
+	}
+	return index.Generation{
+		RepositoryID:      repositoryID,
+		ID:                generationID,
+		CorpusRevision:    corpus.Revision,
+		ScanPolicyVersion: corpus.PolicyVersion,
+		Chunks:            corpus.Chunks,
+		Metric:            index.VectorMetricCosine,
+	}
+}
 
 type failingCorpusReader struct {
 	loadErr  error

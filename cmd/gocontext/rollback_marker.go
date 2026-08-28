@@ -158,16 +158,3 @@ func temporaryMarkerPath(directory, repositoryHash string) (string, error) {
 	}
 	return filepath.Join(directory, fmt.Sprintf(".%s.%s.tmp", repositoryHash, hex.EncodeToString(suffix[:]))), nil
 }
-
-func syncMarkerDirectory(directory string) error {
-	root, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	syncErr := root.Sync()
-	closeErr := root.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
-}

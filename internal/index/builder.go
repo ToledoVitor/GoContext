@@ -198,18 +198,20 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 			return Report{}, ErrSemanticIntegrity
 		}
 		if errors.Is(embedErr, embedding.ErrSemanticUnavailable) {
+			attemptedRequests := embedding.AttemptedRequests(embedErr)
 			if b.mode == SemanticPreferred {
 				generation := b.lexicalGeneration(repositoryID, baseGeneration, corpus, chunks)
 				report := Report{
 					GenerationID:   generation.ID,
 					CorpusRevision: corpus.Revision,
 					Chunks:         len(chunks),
+					Requests:       attemptedRequests,
 					Semantic:       SemanticStatusDegraded,
 					DegradedReason: DegradedReasonUnavailable,
 				}
 				return b.publish(ctx, generation, report)
 			}
-			return Report{}, fmt.Errorf("build index generation: %w", embedding.ErrSemanticUnavailable)
+			return Report{}, fmt.Errorf("build index generation: %w", embedding.NewSemanticUnavailable(attemptedRequests))
 		}
 		return Report{}, ErrSemanticFailure
 	}

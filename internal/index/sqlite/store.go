@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -34,8 +35,10 @@ var (
 
 // Store keeps complete repository generations in one local SQLite database.
 type Store struct {
-	db         *sql.DB
-	writeToken chan struct{}
+	db              *sql.DB
+	operationalConn *sql.Conn
+	readOnly        bool
+	writeToken      chan struct{}
 
 	lifecycleMu sync.Mutex
 	readers     map[*BoundReader]struct{}
@@ -86,12 +89,15 @@ func NewStore(directory string) (*Store, error) {
 		return nil, fmt.Errorf("create sqlite index store: resolve directory: %w", err)
 	}
 	databasePath := filepath.Join(canonical, databaseName)
-	_, statErr := os.Stat(databasePath)
+	databaseInfo, statErr := os.Lstat(databasePath)
 	databaseExists := statErr == nil
 	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
 		return nil, fmt.Errorf("create sqlite index store: inspect database: %w", statErr)
 	}
 	if databaseExists {
+		if err := validateDatabaseFile(databaseInfo, false); err != nil {
+			return nil, fmt.Errorf("create sqlite index store: %w", err)
+		}
 		if err := inspectDatabase(databasePath); err != nil {
 			return nil, fmt.Errorf("create sqlite index store: %w", err)
 		}
@@ -108,6 +114,16 @@ func NewStore(directory string) (*Store, error) {
 		created, err = createPrivateDatabaseFile(databasePath)
 		if err != nil {
 			return nil, fmt.Errorf("create sqlite index store: create database: %w", err)
+		}
+		if !created {
+			databaseInfo, err = os.Lstat(databasePath)
+			if err != nil {
+				return nil, fmt.Errorf("create sqlite index store: inspect database collision: %w", err)
+			}
+			if err := validateDatabaseFile(databaseInfo, false); err != nil {
+				return nil, fmt.Errorf("create sqlite index store: %w", err)
+			}
+			databaseExists = true
 		}
 	}
 	if created {
@@ -178,12 +194,13 @@ func OpenExisting(directory string) (*Store, error) {
 		return nil, fmt.Errorf("open existing sqlite index store: resolve directory: %w", err)
 	}
 	databasePath := filepath.Join(canonical, databaseName)
-	if _, err := os.Stat(databasePath); errors.Is(err, fs.ErrNotExist) {
+	beforeInfo, err := os.Lstat(databasePath)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("open existing sqlite index store: %w", index.ErrNotFound)
 	} else if err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: inspect database: %w", err)
 	}
-	if err := inspectDatabase(databasePath); err != nil {
+	if err := validateDatabaseFile(beforeInfo, true); err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: %w", err)
 	}
 
@@ -191,17 +208,75 @@ func OpenExisting(directory string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: open database: %w", err)
 	}
-	store := &Store{
-		db:         db,
-		writeToken: make(chan struct{}, 1),
-		readers:    make(map[*BoundReader]struct{}),
-	}
-	store.writeToken <- struct{}{}
-	if err := db.PingContext(context.Background()); err != nil {
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	connection, err := db.Conn(context.Background())
+	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("open existing sqlite index store: open operational database: %w", err)
 	}
+	closeFailure := func(openErr error) (*Store, error) {
+		_ = connection.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("open existing sqlite index store: %w", openErr)
+	}
+	afterOpenInfo, err := secureDatabaseInfo(databasePath)
+	if err != nil {
+		return closeFailure(err)
+	}
+	if !os.SameFile(beforeInfo, afterOpenInfo) {
+		return closeFailure(errors.New("database identity changed while opening"))
+	}
+	if err := validateSchema(context.Background(), connection); err != nil {
+		return closeFailure(err)
+	}
+	afterValidationInfo, err := secureDatabaseInfo(databasePath)
+	if err != nil {
+		return closeFailure(err)
+	}
+	if !os.SameFile(beforeInfo, afterValidationInfo) {
+		return closeFailure(errors.New("database identity changed while validating"))
+	}
+	store := &Store{
+		db:              db,
+		operationalConn: connection,
+		readOnly:        true,
+		writeToken:      make(chan struct{}, 1),
+		readers:         make(map[*BoundReader]struct{}),
+	}
+	store.writeToken <- struct{}{}
 	return store, nil
+}
+
+func secureDatabaseInfo(path string) (fs.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDatabaseFile(info, true); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+func validateDatabaseFile(info fs.FileInfo, requirePrivate bool) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("database path is a symbolic link")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("database path is not a regular file")
+	}
+	if requirePrivate {
+		return validatePrivateMode(info)
+	}
+	return nil
+}
+
+func validatePrivateMode(info fs.FileInfo) error {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return errors.New("unsafe private permissions")
+	}
+	return nil
 }
 
 func createPrivateDatabaseFile(path string) (bool, error) {
@@ -581,6 +656,11 @@ func (s *Store) Close() error {
 				s.closeErr = err
 			}
 		}
+		if s.operationalConn != nil {
+			if err := s.operationalConn.Close(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
 		if err := s.db.Close(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
@@ -595,6 +675,9 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	}
 	if strings.TrimSpace(generation.RepositoryID) == "" || strings.TrimSpace(generation.ID) == "" {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
+	}
+	if s.readOnly {
+		return errors.New("replace sqlite index: store is read-only")
 	}
 	if strings.TrimSpace(generation.ScanPolicyVersion) == "" {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
@@ -1029,7 +1112,11 @@ func (s *Store) ActiveGeneration(ctx context.Context, repositoryID string) (stri
 		return "", fmt.Errorf("read active sqlite index: %w", index.ErrInvalidGeneration)
 	}
 	var generationID sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT active_generation FROM repositories WHERE repository_id = ?`, repositoryID).Scan(&generationID)
+	queryer := schemaQuerier(s.db)
+	if s.operationalConn != nil {
+		queryer = s.operationalConn
+	}
+	err := queryer.QueryRowContext(ctx, `SELECT active_generation FROM repositories WHERE repository_id = ?`, repositoryID).Scan(&generationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", index.ErrNotFound
 	}
@@ -1055,7 +1142,13 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 	if s.closed {
 		return nil, fmt.Errorf("bind active sqlite index: store is closed")
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	var tx *sql.Tx
+	var err error
+	if s.operationalConn != nil {
+		tx, err = s.operationalConn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	} else {
+		tx, err = s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("bind active sqlite index: begin transaction: %w", err)
 	}

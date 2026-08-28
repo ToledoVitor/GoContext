@@ -286,6 +286,48 @@ func TestBuilderSemanticModesClassifyProviderFailures(t *testing.T) {
 	}
 }
 
+func TestBuilderPreservesSanitizedUnavailableAttemptCount(t *testing.T) {
+	corpus := mustBuilderCorpus(t, "scanner-v4", []source.Chunk{
+		builderChunk("chunk", "private.py", "PRIVATE_SOURCE_CANARY"),
+	})
+	for _, test := range []struct {
+		name string
+		mode index.SemanticMode
+	}{
+		{name: "preferred report", mode: index.SemanticPreferred},
+		{name: "required error", mode: index.SemanticRequired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &builderStore{activeErr: index.ErrNotFound}
+			embedder := &builderEmbedder{
+				profile: embedding.Profile{Fingerprint: "profile", Model: "model"},
+				err:     fmt.Errorf("PROVIDER_CAUSE_CANARY: %w", embedding.NewSemanticUnavailable(3)),
+			}
+			builder, err := index.NewBuilder(store, embedder, index.BuilderConfig{Mode: test.mode})
+			if err != nil {
+				t.Fatalf("NewBuilder() error = %v", err)
+			}
+
+			report, err := builder.Replace(context.Background(), "repository", corpus)
+			if test.mode == index.SemanticPreferred {
+				if err != nil || report.Semantic != index.SemanticStatusDegraded || report.Requests != 3 {
+					t.Fatalf("Replace(preferred) = report %#v, error %v; want degraded requests=3", report, err)
+				}
+			} else {
+				if !errors.Is(err, embedding.ErrSemanticUnavailable) || embedding.AttemptedRequests(err) != 3 {
+					t.Fatalf("Replace(required) error = %v requests=%d, want unavailable requests=3", err, embedding.AttemptedRequests(err))
+				}
+				if report != (index.Report{}) {
+					t.Fatalf("Replace(required) report = %#v, want zero", report)
+				}
+			}
+			if errorTreeContains(err, "PROVIDER_CAUSE_CANARY") || strings.Contains(fmt.Sprint(report), "PROVIDER_CAUSE_CANARY") {
+				t.Fatal("builder output exposed provider cause")
+			}
+		})
+	}
+}
+
 func TestBuilderSemanticGenerationPreservesCanonicalOrderAndUsage(t *testing.T) {
 	corpus := mustBuilderCorpus(t, "scanner-v4", []source.Chunk{
 		builderChunk("first", "first.py", "first text"),

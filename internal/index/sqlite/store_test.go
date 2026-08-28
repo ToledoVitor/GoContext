@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1401,6 +1402,147 @@ func TestOpenExistingNeverCreatesMissingStore(t *testing.T) {
 	}
 	if entries := directoryEntryNames(t, emptyDirectory); len(entries) != 0 {
 		t.Fatalf("OpenExisting(empty directory) created entries %v", entries)
+	}
+}
+
+func TestOpenExistingRejectsDatabaseSymlinksAndNonRegularFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic-link creation is not reliably available to unprivileged Windows tests")
+	}
+	t.Run("valid symlink", func(t *testing.T) {
+		targetDirectory := t.TempDir()
+		store := openStore(t, targetDirectory)
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close(target) error = %v", err)
+		}
+		directory := t.TempDir()
+		if err := os.Symlink(filepath.Join(targetDirectory, "index-v2.sqlite3"), filepath.Join(directory, "index-v2.sqlite3")); err != nil {
+			t.Fatalf("Symlink(database) error = %v", err)
+		}
+		if _, err := indexsqlite.OpenExisting(directory); err == nil || errors.Is(err, index.ErrNotFound) {
+			t.Fatalf("OpenExisting(database symlink) error = %v, want fatal non-absence error", err)
+		}
+	})
+	t.Run("dangling symlink", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.Symlink(filepath.Join(directory, "missing-target"), filepath.Join(directory, "index-v2.sqlite3")); err != nil {
+			t.Fatalf("Symlink(dangling database) error = %v", err)
+		}
+		if _, err := indexsqlite.OpenExisting(directory); err == nil || errors.Is(err, index.ErrNotFound) {
+			t.Fatalf("OpenExisting(dangling database symlink) error = %v, want fatal non-absence error", err)
+		}
+	})
+	t.Run("directory at database path", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.Mkdir(filepath.Join(directory, "index-v2.sqlite3"), 0o700); err != nil {
+			t.Fatalf("Mkdir(database path) error = %v", err)
+		}
+		if _, err := indexsqlite.OpenExisting(directory); err == nil || errors.Is(err, index.ErrNotFound) {
+			t.Fatalf("OpenExisting(non-regular database) error = %v, want fatal non-absence error", err)
+		}
+	})
+}
+
+func TestOpenExistingRejectsUnsafePrivateDatabaseModeWithoutMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX private mode bits are not meaningful on Windows")
+	}
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(created) error = %v", err)
+	}
+	databasePath := filepath.Join(directory, "index-v2.sqlite3")
+	if err := os.Chmod(databasePath, 0o640); err != nil {
+		t.Fatalf("Chmod(database) error = %v", err)
+	}
+
+	if _, err := indexsqlite.OpenExisting(directory); err == nil || errors.Is(err, index.ErrNotFound) {
+		t.Fatalf("OpenExisting(unsafe mode) error = %v, want fatal non-absence error", err)
+	}
+	info, err := os.Lstat(databasePath)
+	if err != nil {
+		t.Fatalf("Lstat(database) error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Fatalf("OpenExisting changed database mode to %#o, want %#o", got, 0o640)
+	}
+}
+
+func TestOpenExistingRejectsUnknownSchemaWithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "index-v2.sqlite3")
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2)`); err != nil {
+		t.Fatalf("create future schema marker error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close(future schema) error = %v", err)
+	}
+	if err := os.Chmod(databasePath, 0o600); err != nil {
+		t.Fatalf("Chmod(future schema) error = %v", err)
+	}
+	beforeBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(before) error = %v", err)
+	}
+	beforeInfo, err := os.Lstat(databasePath)
+	if err != nil {
+		t.Fatalf("Lstat(before) error = %v", err)
+	}
+
+	store, err := indexsqlite.OpenExisting(directory)
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("OpenExisting(future schema) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("OpenExisting(future schema) error = %v, want ErrReindexRequired", err)
+	}
+	afterBytes, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(after) error = %v", err)
+	}
+	afterInfo, err := os.Lstat(databasePath)
+	if err != nil {
+		t.Fatalf("Lstat(after) error = %v", err)
+	}
+	if !bytes.Equal(beforeBytes, afterBytes) || beforeInfo.Mode() != afterInfo.Mode() || beforeInfo.Size() != afterInfo.Size() || !beforeInfo.ModTime().Equal(afterInfo.ModTime()) {
+		t.Fatalf("OpenExisting(future schema) mutated database: before=%v after=%v", beforeInfo, afterInfo)
+	}
+}
+
+func TestNewStoreRejectsExistingDatabaseSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic-link creation is not reliably available to unprivileged Windows tests")
+	}
+	targetDirectory := t.TempDir()
+	target := openStore(t, targetDirectory)
+	if err := target.Close(); err != nil {
+		t.Fatalf("Close(target) error = %v", err)
+	}
+	targetPath := filepath.Join(targetDirectory, "index-v2.sqlite3")
+	before, err := os.Lstat(targetPath)
+	if err != nil {
+		t.Fatalf("Lstat(target before) error = %v", err)
+	}
+	directory := t.TempDir()
+	if err := os.Symlink(targetPath, filepath.Join(directory, "index-v2.sqlite3")); err != nil {
+		t.Fatalf("Symlink(database) error = %v", err)
+	}
+
+	if _, err := indexsqlite.NewStore(directory); err == nil {
+		t.Fatal("NewStore(database symlink) error = nil, want rejection")
+	}
+	after, err := os.Lstat(targetPath)
+	if err != nil {
+		t.Fatalf("Lstat(target after) error = %v", err)
+	}
+	if before.Mode() != after.Mode() || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("NewStore(database symlink) mutated target metadata: before=%v after=%v", before, after)
 	}
 }
 

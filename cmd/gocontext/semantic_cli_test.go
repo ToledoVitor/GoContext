@@ -98,7 +98,7 @@ func TestRunIndexSearchSemanticEndToEndUsesCanonicalSQLiteGeneration(t *testing.
 	var searchOut bytes.Buffer
 	var searchErr bytes.Buffer
 	searchArgs := append([]string{
-		"search", "--store", storeDirectory, "--index-backend", "auto", "--limit", "1",
+		"search", "--store", storeDirectory, "--index-backend", "auto", "--limit", "10",
 		"--path-prefix", "src", "--path-prefix", "lib",
 		"--language", "python", "--language", "python",
 	}, semanticArgs...)
@@ -110,8 +110,8 @@ func TestRunIndexSearchSemanticEndToEndUsesCanonicalSQLiteGeneration(t *testing.
 		!strings.Contains(searchOut.String(), "def authorize_session()") {
 		t.Fatalf("run(search semantic) stdout = %q, want canonical security chunk", searchOut.String())
 	}
-	if strings.Contains(searchOut.String(), "src/math.py") {
-		t.Fatalf("run(search semantic) stdout = %q, want limit 1", searchOut.String())
+	if strings.Contains(searchOut.String(), "tests/math.py") {
+		t.Fatalf("run(search semantic) stdout = %q, want path-prefix exclusion", searchOut.String())
 	}
 	if searchErr.Len() != 0 {
 		t.Fatalf("run(search semantic) stderr = %q, want local-loopback silence", searchErr.String())
@@ -157,7 +157,7 @@ func TestRunIndexSearchSemanticFallbackAndRequiredPreserveGeneration(t *testing.
 	if code := run(preferredArgs, &preferredOut, &preferredErr); code != 0 {
 		t.Fatalf("run(index preferred unavailable) code = %d, want 0; stderr = %q", code, preferredErr.String())
 	}
-	if got, want := preferredOut.String(), "indexado: 1 arquivos, 1 símbolos, 1 chunks\nsemântica: status=degraded vetores=0 requests=0 tokens=0\n"; got != want {
+	if got, want := preferredOut.String(), "indexado: 1 arquivos, 1 símbolos, 1 chunks\nsemântica: status=degraded vetores=0 requests=3 tokens=0\n"; got != want {
 		t.Fatalf("run(index preferred unavailable) stdout = %q, want %q", got, want)
 	}
 	if got, want := preferredErr.String(), semanticDegradedWarning; got != want {

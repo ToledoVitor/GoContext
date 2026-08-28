@@ -138,10 +138,11 @@ func publishSQLiteIndex(
 		if report.Semantic == indexdomain.SemanticStatusDegraded {
 			_, _ = fmt.Fprint(stderr, semanticDegradedWarning)
 		}
+		if buildErr != nil {
+			operationErr = errors.Join(operationErr, errSQLiteIndexMaintenance)
+		}
 		if err := writeRollbackCompanion(ctx, storeDirectory, ingested, report.GenerationID, store); err != nil {
-			operationErr = errRollbackCompanionNotReady
-		} else if buildErr != nil {
-			operationErr = errSQLiteIndexMaintenance
+			operationErr = errors.Join(operationErr, errRollbackCompanionNotReady)
 		}
 	}
 	if closeErr := store.Close(); closeErr != nil {

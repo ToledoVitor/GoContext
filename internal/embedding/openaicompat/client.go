@@ -92,13 +92,16 @@ func (client *Client) Embed(ctx context.Context, _ embedding.Purpose, texts []st
 	}
 
 	vectors := make([]embedding.Vector, len(texts))
-	completed, err := client.performBatches(operationContext, batches)
+	completed, attemptedRequests, err := client.performBatches(operationContext, batches)
 	if err != nil {
 		if ctx.Err() != nil {
 			return embedding.Batch{}, ctx.Err()
 		}
 		if errors.Is(operationContext.Err(), context.DeadlineExceeded) {
-			return embedding.Batch{}, embedding.ErrSemanticUnavailable
+			return embedding.Batch{}, embedding.NewSemanticUnavailable(attemptedRequests)
+		}
+		if errors.Is(err, embedding.ErrSemanticUnavailable) {
+			return embedding.Batch{}, embedding.NewSemanticUnavailable(attemptedRequests)
 		}
 		return embedding.Batch{}, err
 	}
@@ -131,7 +134,7 @@ func (client *Client) Embed(ctx context.Context, _ embedding.Purpose, texts []st
 	return batch, nil
 }
 
-func (client *Client) performBatches(parent context.Context, batches []encodedBatch) ([]completedBatch, error) {
+func (client *Client) performBatches(parent context.Context, batches []encodedBatch) ([]completedBatch, int, error) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -177,6 +180,7 @@ func (client *Client) performBatches(parent context.Context, batches []encodedBa
 						return
 					}
 					wire, attempts, err := client.requestWithRetry(ctx, job.encoded.payload)
+					results[job.index].requests = attempts
 					if err != nil {
 						recordError(err)
 						return
@@ -198,10 +202,14 @@ func (client *Client) performBatches(parent context.Context, batches []encodedBa
 	}
 
 	waitGroup.Wait()
-	if firstError != nil {
-		return nil, firstError
+	attemptedRequests := 0
+	for _, result := range results {
+		attemptedRequests += result.requests
 	}
-	return results, nil
+	if firstError != nil {
+		return nil, attemptedRequests, firstError
+	}
+	return results, attemptedRequests, nil
 }
 
 func (client *Client) encodeBatches(texts []string) ([]encodedBatch, error) {
