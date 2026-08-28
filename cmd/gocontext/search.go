@@ -19,10 +19,14 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	flags := flag.NewFlagSet("search", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "uso: gocontext search [--store DIR] [--limit N] <repositório> <consulta...>")
+		fmt.Fprintln(stderr, "uso: gocontext search [--store DIR] [--limit N] [opções semânticas] <repositório> <consulta...>")
+		fmt.Fprintln(stderr, "semântica: --semantic off|preferred|required --embedding-base-url URL --embedding-model MODELO --embedding-dimensions N --index-backend snapshot|sqlite|auto")
 	}
 	storeFlag := flags.String("store", "", "diretório local de snapshots")
 	limit := flags.Int("limit", defaultSearchLimit, "máximo de resultados")
+	var embeddingFlags embeddingOptions
+	backend := indexBackendSnapshot
+	addEmbeddingFlags(flags, &embeddingFlags, &backend)
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -34,6 +38,15 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if queryText == "" {
 		flags.Usage()
 		return 2
+	}
+	resolvedEmbedding, err := resolveCLIEmbeddingConfig(embeddingFlags, backend, commandRoleSearch)
+	if err != nil {
+		fmt.Fprintf(stderr, "configurar busca: %v\n", err)
+		return 2
+	}
+	if resolvedEmbedding.backend != indexBackendSnapshot {
+		fmt.Fprintln(stderr, "consultar repositório: selected index backend is not wired yet")
+		return 1
 	}
 
 	storePath, err := storeDirectory(*storeFlag)

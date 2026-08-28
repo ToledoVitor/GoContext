@@ -13,7 +13,8 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
-func TestRunSearchPrintsRankedCitationAndText(t *testing.T) {
+func TestRunSearchDefaultPrintsRankedCitationAndText(t *testing.T) {
+	clearEmbeddingEnvironment(t)
 	repository := t.TempDir()
 	storeDirectory := t.TempDir()
 	store, err := localstore.NewStore(storeDirectory)
@@ -49,20 +50,29 @@ func TestRunSearchPrintsRankedCitationAndText(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run(search) code = %d, want 0; stderr = %q", code, stderr.String())
 	}
-	for _, fragment := range []string{
-		"0.950 src/user.py:3-4 LoadUser",
-		"def load_user():\n    return user",
-	} {
-		if !strings.Contains(stdout.String(), fragment) {
-			t.Errorf("run(search) stdout = %q, want fragment %q", stdout.String(), fragment)
-		}
+	wantOutput := "0.950 src/user.py:3-4 LoadUser\ndef load_user():\n    return user\n"
+	if got := stdout.String(); got != wantOutput {
+		t.Fatalf("run(search) stdout = %q, want %q", got, wantOutput)
 	}
 	if strings.Contains(stdout.String(), "partial") || strings.Contains(stdout.String(), "src/load.py") {
 		t.Errorf("run(search) stdout = %q, want limit 1", stdout.String())
 	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{
+		"search", "--index-backend", "snapshot", "--store", storeDirectory, "--limit", "1", repository, "load", "user",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run(search explicit snapshot) code = %d, want 0; stderr = %q", code, stderr.String())
+	}
+	if got := stdout.String(); got != wantOutput {
+		t.Fatalf("run(search explicit snapshot) stdout = %q, want %q", got, wantOutput)
+	}
 }
 
 func TestRunSearchRejectsLegacySnapshotWithoutPrintingCanary(t *testing.T) {
+	clearEmbeddingEnvironment(t)
 	repository := t.TempDir()
 	storeDirectory := t.TempDir()
 	store, err := localstore.NewStore(storeDirectory)
@@ -102,6 +112,7 @@ func TestRunSearchRejectsLegacySnapshotWithoutPrintingCanary(t *testing.T) {
 }
 
 func TestRunSearchReportsNoResults(t *testing.T) {
+	clearEmbeddingEnvironment(t)
 	repository := t.TempDir()
 	storeDirectory := t.TempDir()
 	store, err := localstore.NewStore(storeDirectory)
@@ -125,6 +136,7 @@ func TestRunSearchReportsNoResults(t *testing.T) {
 }
 
 func TestRunSearchRejectsInvalidUsage(t *testing.T) {
+	clearEmbeddingEnvironment(t)
 	tests := [][]string{
 		{"search"},
 		{"search", "repository-only"},
@@ -144,6 +156,7 @@ func TestRunSearchRejectsInvalidUsage(t *testing.T) {
 }
 
 func TestRunSearchReportsMissingSnapshot(t *testing.T) {
+	clearEmbeddingEnvironment(t)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
@@ -158,6 +171,7 @@ func TestRunSearchReportsMissingSnapshot(t *testing.T) {
 }
 
 func TestRunSearchEscapesTerminalControlCharacters(t *testing.T) {
+	clearEmbeddingEnvironment(t)
 	repository := t.TempDir()
 	storeDirectory := t.TempDir()
 	store, err := localstore.NewStore(storeDirectory)
@@ -186,6 +200,83 @@ func TestRunSearchEscapesTerminalControlCharacters(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `\x1b[31mred`) {
 		t.Fatalf("run(search control characters) stdout = %q, want escaped control", stdout.String())
+	}
+}
+
+func TestRunSearchRejectsInvalidSemanticConfigurationWithoutEcho(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := run([]string{"search", "--semantic=bad\x1b[31mMODE_CANARY", t.TempDir(), "query"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("run(search invalid semantic mode) code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid semantic mode") {
+		t.Fatalf("run(search invalid semantic mode) stderr = %q, want fixed configuration category", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "MODE_CANARY") || strings.ContainsRune(stderr.String(), '\x1b') {
+		t.Fatalf("run(search invalid semantic mode) stderr exposes raw value: %q", stderr.String())
+	}
+}
+
+func TestRunSearchRejectsUnavailableBackendsWithoutSnapshotFallback(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	for _, backend := range []string{"sqlite", "auto"} {
+		t.Run(backend, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+
+			code := run([]string{"search", "--index-backend", backend, t.TempDir(), "query"}, &stdout, &stderr)
+
+			if code != 1 {
+				t.Fatalf("run(search %s not wired) code = %d, want 1; stderr = %q", backend, code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "not wired yet") {
+				t.Fatalf("run(search %s not wired) stderr = %q, want fixed operational category", backend, stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunSearchSemanticSnapshotRequiresOptInBackend(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := run([]string{
+		"search",
+		"--semantic", "required",
+		"--embedding-base-url", "https://api.example.test/v1",
+		"--embedding-model", "example-model",
+		t.TempDir(),
+		"query",
+	}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("run(search semantic snapshot) code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "--index-backend sqlite or auto") {
+		t.Fatalf("run(search semantic snapshot) stderr = %q, want opt-in backend requirement", stderr.String())
+	}
+}
+
+func TestRunSearchRejectsAPIKeyFlagWithoutEcho(t *testing.T) {
+	clearEmbeddingEnvironment(t)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	code := run([]string{"search", "--embedding-api-key=KEY_CLI_CANARY\x1b[31m", t.TempDir(), "query"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("run(search API key flag) code = %d, want 2", code)
+	}
+	if strings.Contains(stderr.String(), "KEY_CLI_CANARY") || strings.ContainsRune(stderr.String(), '\x1b') {
+		t.Fatalf("run(search API key flag) stderr exposes key: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "API_KEY") {
+		t.Fatalf("run(search API key flag) stderr exposes environment mechanism: %q", stderr.String())
 	}
 }
 

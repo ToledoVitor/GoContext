@@ -25,15 +25,28 @@ func runIndex(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	flags := flag.NewFlagSet("index", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "uso: gocontext index [--store DIR] <repositório>")
+		fmt.Fprintln(stderr, "uso: gocontext index [--store DIR] [opções semânticas] <repositório>")
+		fmt.Fprintln(stderr, "semântica: --semantic off|preferred|required --embedding-base-url URL --embedding-model MODELO --embedding-dimensions N --index-backend snapshot|sqlite")
 	}
 	storeFlag := flags.String("store", "", "diretório local de snapshots")
+	var embeddingFlags embeddingOptions
+	backend := indexBackendSnapshot
+	addEmbeddingFlags(flags, &embeddingFlags, &backend)
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
 	if flags.NArg() != 1 {
 		flags.Usage()
 		return 2
+	}
+	resolvedEmbedding, err := resolveCLIEmbeddingConfig(embeddingFlags, backend, commandRoleIndex)
+	if err != nil {
+		fmt.Fprintf(stderr, "configurar indexação: %v\n", err)
+		return 2
+	}
+	if resolvedEmbedding.backend != indexBackendSnapshot {
+		fmt.Fprintln(stderr, "indexar repositório: selected index backend is not wired yet")
+		return 1
 	}
 
 	storeDirectory, err := storeDirectory(*storeFlag)
