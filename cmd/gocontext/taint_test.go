@@ -26,7 +26,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/ToledoVitor/GoContext/internal/index"
 	indexsqlite "github.com/ToledoVitor/GoContext/internal/index/sqlite"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/filesystem"
@@ -93,6 +92,7 @@ type sqliteTaintTable struct {
 }
 
 type sqliteTaintState struct {
+	Schema sqliteTaintTable
 	Tables map[string]sqliteTaintTable
 }
 
@@ -101,6 +101,27 @@ const (
 	maxSQLiteTaintValueBytes = 1 << 20
 	maxSQLiteTaintTotalBytes = 8 << 20
 )
+
+func TestDecodeStrictTaintEmbeddingRequestRejectsNonExactEnvelope(t *testing.T) {
+	valid := `{"model":"task13-model","input":["safe"],"encoding_format":"float","dimensions":2}`
+	request, err := decodeStrictTaintEmbeddingRequest([]byte(valid))
+	if err != nil || !reflect.DeepEqual(request.Input, []string{"safe"}) {
+		t.Fatalf("decode valid request = %#v, %v", request, err)
+	}
+	invalid := []string{
+		`{"model":"task13-model","input":["safe"],"encoding_format":"float","dimensions":2,"extra":"x"}`,
+		`{"model":"task13-model","input":["safe"],"input":["safe"],"encoding_format":"float","dimensions":2}`,
+		valid + `{}`,
+		`{"model":"other","input":["safe"],"encoding_format":"float","dimensions":2}`,
+		`{"model":"task13-model","input":["safe"],"encoding_format":"base64","dimensions":2}`,
+		`{"model":"task13-model","input":["safe"],"encoding_format":"float","dimensions":3}`,
+	}
+	for _, payload := range invalid {
+		if _, err := decodeStrictTaintEmbeddingRequest([]byte(payload)); err == nil {
+			t.Fatalf("decode invalid request %q succeeded", payload)
+		}
+	}
+}
 
 func TestRunSnapshotOffTaintNeverReachesHTTPStoreOrOutput(t *testing.T) {
 	clearEmbeddingEnvironment(t)
@@ -172,8 +193,8 @@ func TestRunSQLiteOffTaintNeverReachesHTTPStoreOrOutput(t *testing.T) {
 	assertPermittedTaintChunks(t, chunks, fixture.forbidden)
 	structuredForbidden := appendCopy(fixture.forbidden, cliTaintProviderKey)
 	state := dumpSQLiteTaintState(t, storeDirectory)
-	assertSQLiteTaintState(t, state, fixture.repository, generationID, chunks, "", structuredForbidden)
-	assertRollbackTaintCompanion(t, storeDirectory, fixture.repository, generationID, chunks, structuredForbidden)
+	wantGenerationID := assertSQLiteTaintState(t, state, fixture.repository, generationID, chunks, "", structuredForbidden)
+	assertRollbackTaintCompanion(t, storeDirectory, fixture.repository, wantGenerationID, chunks, structuredForbidden)
 	assertPermittedTaintHits(t, searchHits, chunks, permittedTaintLexicalScores(), fixture.forbidden)
 	assertCLITaintSinksClean(t, fixture, []string{cliTaintProviderKey}, indexOut, indexErr, searchOut, searchErr)
 	assertTaintStoreClean(t, storeDirectory, appendCopy(fixture.forbidden, cliTaintProviderKey))
@@ -213,21 +234,18 @@ func TestRunSQLitePreferredRetriesOnlyPermittedCorpusAndFallsBackLexically(t *te
 	if len(requests) != 3 {
 		t.Fatalf("SQLite/preferred requests = %d, want three temporary attempts", len(requests))
 	}
-	assertTaintHTTPRequestsClean(t, requests, fixture.forbidden)
 	wantDocumentInputs := permittedTaintDocumentInputs()
-	for position, request := range requests {
-		inputs := decodeTaintInputs(t, request.Body)
-		if !reflect.DeepEqual(inputs, wantDocumentInputs) {
-			t.Fatalf("preferred request %d inputs = %#v, want only two permitted chunks", position, inputs)
-		}
-	}
+	assertExactTaintHTTPRequests(
+		t, requests, fixture,
+		[][]string{wantDocumentInputs, wantDocumentInputs, wantDocumentInputs}, -1,
+	)
 
 	chunks, generationID := loadSQLiteTaintChunks(t, storeDirectory, fixture.repository)
 	assertPermittedTaintChunks(t, chunks, fixture.forbidden)
 	extra := []string{cliTaintProviderKey, cliTaintProviderBody}
 	state := dumpSQLiteTaintState(t, storeDirectory)
-	assertSQLiteTaintState(t, state, fixture.repository, generationID, chunks, "", appendCopy(fixture.forbidden, extra...))
-	assertRollbackTaintCompanion(t, storeDirectory, fixture.repository, generationID, chunks, appendCopy(fixture.forbidden, extra...))
+	wantGenerationID := assertSQLiteTaintState(t, state, fixture.repository, generationID, chunks, "", appendCopy(fixture.forbidden, extra...))
+	assertRollbackTaintCompanion(t, storeDirectory, fixture.repository, wantGenerationID, chunks, appendCopy(fixture.forbidden, extra...))
 	assertPermittedTaintHits(t, searchHits, chunks, permittedTaintLexicalScores(), fixture.forbidden)
 	assertCLITaintSinksClean(t, fixture, extra, indexOut, indexErr, searchOut, searchErr)
 	assertTaintStoreClean(t, storeDirectory, appendCopy(fixture.forbidden, extra...))
@@ -262,21 +280,16 @@ func TestRunSQLiteRequiredSendsOnlyPermittedDocumentsAndExplicitQuery(t *testing
 	if len(requests) != 2 {
 		t.Fatalf("SQLite/required requests = %d, want one document and one query request", len(requests))
 	}
-	assertTaintHTTPRequestsClean(t, requests, fixture.forbidden)
-	documentInputs := decodeTaintInputs(t, requests[0].Body)
-	if !reflect.DeepEqual(documentInputs, permittedTaintDocumentInputs()) ||
-		strings.Contains(string(requests[0].Body), cliTaintQueryCanary) {
-		t.Fatalf("required document inputs = %#v, want only permitted corpus", documentInputs)
-	}
-	if queryInputs := decodeTaintInputs(t, requests[1].Body); !reflect.DeepEqual(queryInputs, []string{cliTaintQueryCanary}) {
-		t.Fatalf("required query inputs = %#v, want explicit query canary only", queryInputs)
-	}
+	assertExactTaintHTTPRequests(
+		t, requests, fixture,
+		[][]string{permittedTaintDocumentInputs(), {cliTaintQueryCanary}}, 1,
+	)
 	chunks, generationID := loadSQLiteTaintChunks(t, storeDirectory, fixture.repository)
 	assertPermittedTaintChunks(t, chunks, fixture.forbidden)
 	extra := []string{cliTaintProviderKey, cliTaintQueryCanary}
 	state := dumpSQLiteTaintState(t, storeDirectory)
-	assertSQLiteTaintState(t, state, fixture.repository, generationID, chunks, server.URL+"/v1/embeddings", appendCopy(fixture.forbidden, extra...))
-	assertRollbackTaintCompanion(t, storeDirectory, fixture.repository, generationID, chunks, appendCopy(fixture.forbidden, extra...))
+	wantGenerationID := assertSQLiteTaintState(t, state, fixture.repository, generationID, chunks, server.URL+"/v1/embeddings", appendCopy(fixture.forbidden, extra...))
+	assertRollbackTaintCompanion(t, storeDirectory, fixture.repository, wantGenerationID, chunks, appendCopy(fixture.forbidden, extra...))
 	assertPermittedTaintHits(t, searchHits, chunks, []float64{0.5, 0.4919354838709677}, fixture.forbidden)
 	assertCLITaintSinksClean(t, fixture, extra, indexOut, indexErr, searchOut, searchErr)
 	assertTaintStoreClean(t, storeDirectory, appendCopy(fixture.forbidden, cliTaintProviderKey, cliTaintQueryCanary))
@@ -307,19 +320,16 @@ func TestRunSQLiteRequiredRetryThenMalformedResponsePreservesPriorGeneration(t *
 	if len(baselineRequests) != 1 {
 		t.Fatalf("required baseline requests = %d, want one", len(baselineRequests))
 	}
-	assertTaintHTTPRequestsClean(t, baselineRequests, fixture.forbidden)
-	if inputs := decodeTaintInputs(t, baselineRequests[0].Body); !reflect.DeepEqual(inputs, permittedTaintDocumentInputs()) {
-		t.Fatalf("required baseline inputs = %#v, want exact permitted corpus", inputs)
-	}
+	assertExactTaintHTTPRequests(t, baselineRequests, fixture, [][]string{permittedTaintDocumentInputs()}, -1)
 	baselineChunks, baselineGeneration := loadSQLiteTaintChunks(t, storeDirectory, fixture.repository)
 	assertPermittedTaintChunks(t, baselineChunks, fixture.forbidden)
 	baselineState := dumpSQLiteTaintState(t, storeDirectory)
-	assertSQLiteTaintState(
+	baselineExpectedGeneration := assertSQLiteTaintState(
 		t, baselineState, fixture.repository, baselineGeneration, baselineChunks,
 		baselineServer.URL+"/v1/embeddings", structuredForbidden,
 	)
-	markerBefore := assertRollbackTaintCompanion(
-		t, storeDirectory, fixture.repository, baselineGeneration, baselineChunks, structuredForbidden,
+	companionBefore := assertRollbackTaintCompanion(
+		t, storeDirectory, fixture.repository, baselineExpectedGeneration, baselineChunks, structuredForbidden,
 	)
 
 	writeCLIFile(t, fixture.repository, "safe/allowed.py", "def unpublished_replacement():\n    return \""+cliTaintReplacement+"\"\n")
@@ -349,35 +359,36 @@ func TestRunSQLiteRequiredRetryThenMalformedResponsePreservesPriorGeneration(t *
 		t.Fatalf("required failure generation/chunks changed: generation %q -> %q", baselineGeneration, afterGeneration)
 	}
 	afterState := dumpSQLiteTaintState(t, storeDirectory)
-	assertSQLiteTaintState(
+	afterExpectedGeneration := assertSQLiteTaintState(
 		t, afterState, fixture.repository, afterGeneration, afterChunks,
 		baselineServer.URL+"/v1/embeddings", structuredForbidden,
 	)
+	if afterExpectedGeneration != baselineExpectedGeneration {
+		t.Fatalf("independent generation identity changed: %q -> %q", baselineExpectedGeneration, afterExpectedGeneration)
+	}
 	if !reflect.DeepEqual(afterState, baselineState) {
 		t.Fatalf("required failure changed complete structured SQLite state:\nbefore = %#v\nafter = %#v", baselineState, afterState)
 	}
-	markerAfter := assertRollbackTaintCompanion(
-		t, storeDirectory, fixture.repository, afterGeneration, afterChunks, structuredForbidden,
+	companionAfter := assertRollbackTaintCompanion(
+		t, storeDirectory, fixture.repository, afterExpectedGeneration, afterChunks, structuredForbidden,
 	)
-	if !bytes.Equal(markerAfter, markerBefore) {
-		t.Fatal("required retry/malformed failure changed the exact rollback marker")
+	if !bytes.Equal(companionAfter.SnapshotBytes, companionBefore.SnapshotBytes) ||
+		!bytes.Equal(companionAfter.MarkerBytes, companionBefore.MarkerBytes) {
+		t.Fatal("required retry/malformed failure changed exact rollback companion bytes")
 	}
 
 	failureRequests := failureCapture.snapshot()
 	if len(failureRequests) != 3 || failureAttempts.Load() != 3 {
 		t.Fatalf("required failure requests = %d with %d attempts, want three captured attempts", len(failureRequests), failureAttempts.Load())
 	}
-	assertTaintHTTPRequestsClean(t, failureRequests, fixture.forbidden)
 	wantFailureInputs := []string{
 		"def unpublished_replacement():\n    return \"" + cliTaintReplacement + "\"",
 		permittedTaintDocumentInputs()[1],
 	}
-	for attempt, request := range failureRequests {
-		inputs := decodeTaintInputs(t, request.Body)
-		if !reflect.DeepEqual(inputs, wantFailureInputs) {
-			t.Fatalf("failed required request %d inputs = %#v, want exact replacement permitted corpus", attempt, inputs)
-		}
-	}
+	assertExactTaintHTTPRequests(
+		t, failureRequests, fixture,
+		[][]string{wantFailureInputs, wantFailureInputs, wantFailureInputs}, -1,
+	)
 
 	rollbackCode, rollbackOut, rollbackErr, rollbackHits := runTaintSearchCommand(
 		t, "search", "--store", storeDirectory, "--index-backend", "snapshot",
@@ -385,11 +396,12 @@ func TestRunSQLiteRequiredRetryThenMalformedResponsePreservesPriorGeneration(t *
 	)
 	assertPermittedSearchOutput(t, rollbackCode, rollbackOut, rollbackErr)
 	assertPermittedTaintHits(t, rollbackHits, baselineChunks, permittedTaintLexicalScores(), structuredForbidden)
-	markerAfterRollback := assertRollbackTaintCompanion(
-		t, storeDirectory, fixture.repository, baselineGeneration, baselineChunks, structuredForbidden,
+	companionAfterRollback := assertRollbackTaintCompanion(
+		t, storeDirectory, fixture.repository, baselineExpectedGeneration, baselineChunks, structuredForbidden,
 	)
-	if !bytes.Equal(markerAfterRollback, markerBefore) {
-		t.Fatal("explicit rollback search changed the exact rollback marker")
+	if !bytes.Equal(companionAfterRollback.SnapshotBytes, companionBefore.SnapshotBytes) ||
+		!bytes.Equal(companionAfterRollback.MarkerBytes, companionBefore.MarkerBytes) {
+		t.Fatal("explicit rollback search changed exact rollback companion bytes")
 	}
 	postRollbackState := dumpSQLiteTaintState(t, storeDirectory)
 	if !reflect.DeepEqual(postRollbackState, baselineState) {
@@ -606,13 +618,8 @@ func writeMalformedTaintEmbeddings(writer http.ResponseWriter, body []byte) {
 }
 
 func decodeTaintInputsResponse(writer http.ResponseWriter, body []byte) []string {
-	if len(body) == 0 {
-		return []string{}
-	}
-	var request struct {
-		Input []string `json:"input"`
-	}
-	if err := json.Unmarshal(body, &request); err != nil {
+	request, err := decodeStrictTaintEmbeddingRequest(body)
+	if err != nil {
 		http.Error(writer, "invalid synthetic request", http.StatusBadRequest)
 		return nil
 	}
@@ -675,12 +682,22 @@ type taintSnapshot struct {
 	Chunks         []source.Chunk `json:"chunks"`
 }
 
+type taintSnapshotArtifact struct {
+	Bytes  []byte
+	Corpus source.Corpus
+}
+
+type taintRollbackCompanion struct {
+	SnapshotBytes []byte
+	MarkerBytes   []byte
+}
+
 func assertSnapshotTaintArtifact(
 	t *testing.T,
 	storeDirectory, repository string,
 	wantChunks []source.Chunk,
 	forbidden []string,
-) source.Corpus {
+) taintSnapshotArtifact {
 	t.Helper()
 	repositoryID := canonicalPath(t, repository)
 	path := filepath.Join(storeDirectory, repositoryHash(repositoryID)+".json")
@@ -710,7 +727,7 @@ func assertSnapshotTaintArtifact(
 	if !reflect.DeepEqual(loaded, wantChunks) {
 		t.Fatalf("strict snapshot Load() = %#v, want exact current permitted chunks", loaded)
 	}
-	return corpus
+	return taintSnapshotArtifact{Bytes: payload, Corpus: corpus}
 }
 
 func assertRollbackTaintCompanion(
@@ -718,10 +735,10 @@ func assertRollbackTaintCompanion(
 	storeDirectory, repository, generationID string,
 	wantChunks []source.Chunk,
 	forbidden []string,
-) []byte {
+) taintRollbackCompanion {
 	t.Helper()
 	repositoryID := canonicalPath(t, repository)
-	corpus := assertSnapshotTaintArtifact(t, storeDirectory, repository, wantChunks, forbidden)
+	snapshot := assertSnapshotTaintArtifact(t, storeDirectory, repository, wantChunks, forbidden)
 	path := rollbackMarkerPath(storeDirectory, repositoryID)
 	payload := readPrivateRegularTaintArtifact(t, path, maxRollbackMarkerSize)
 	checkCLITaintBytes(t, "strict rollback marker payload", payload, forbidden)
@@ -741,7 +758,7 @@ func assertRollbackTaintCompanion(
 		Version:          rollbackMarkerSchemaVersion,
 		RepositoryHash:   repositoryHash(repositoryID),
 		ScanPolicy:       ingest.ScanPolicyVersion,
-		CorpusRevision:   corpus.Revision,
+		CorpusRevision:   snapshot.Corpus.Revision,
 		ActiveGeneration: generationID,
 	}
 	if marker != want {
@@ -753,7 +770,7 @@ func assertRollbackTaintCompanion(
 			t.Fatalf("readRollbackMarker() = %#v, %v; want exact %#v", validated, err, want)
 		}
 	}
-	return payload
+	return taintRollbackCompanion{SnapshotBytes: snapshot.Bytes, MarkerBytes: payload}
 }
 
 func readPrivateRegularTaintArtifact(t *testing.T, path string, maxBytes int64) []byte {
@@ -883,12 +900,14 @@ func dumpSQLiteTaintState(t *testing.T, storeDirectory string) sqliteTaintState 
 		table string
 		query string
 	}{
+		{table: "sqlite_schema", query: `SELECT * FROM sqlite_schema ORDER BY type, name, tbl_name, rootpage`},
+		{table: "schema_version", query: `SELECT * FROM schema_version ORDER BY version`},
 		{table: "repositories", query: `SELECT * FROM repositories ORDER BY repository_id`},
 		{table: "generations", query: `SELECT * FROM generations ORDER BY repository_id, generation_id`},
 		{table: "chunks", query: `SELECT * FROM chunks ORDER BY repository_id, generation_id, ordinal, chunk_id`},
 		{table: "vectors", query: `SELECT * FROM vectors ORDER BY repository_id, generation_id, chunk_id`},
 	}
-	state := sqliteTaintState{Tables: make(map[string]sqliteTaintTable, len(queries))}
+	state := sqliteTaintState{Tables: make(map[string]sqliteTaintTable, len(queries)-1)}
 	totalBytes := 0
 	for _, tableQuery := range queries {
 		rows, err := database.QueryContext(context.Background(), tableQuery.query)
@@ -948,7 +967,11 @@ func dumpSQLiteTaintState(t *testing.T, storeDirectory string) sqliteTaintState 
 			_ = database.Close()
 			t.Fatalf("finish rows(%s) errors = %v, %v", tableQuery.table, rowsErr, closeErr)
 		}
-		state.Tables[tableQuery.table] = table
+		if tableQuery.table == "sqlite_schema" {
+			state.Schema = table
+		} else {
+			state.Tables[tableQuery.table] = table
+		}
 	}
 	if err := database.Close(); err != nil {
 		t.Fatalf("Close(read-only SQLite dump) error = %v", err)
@@ -963,11 +986,13 @@ func assertSQLiteTaintState(
 	chunks []source.Chunk,
 	profileEndpoint string,
 	forbidden []string,
-) {
+) string {
 	t.Helper()
 	assertNoCLITaintValue(t, "complete structured SQLite state", state, forbidden)
+	assertSQLiteTaintSchema(t, state.Schema)
 	wantColumns := map[string][]string{
-		"repositories": {"repository_id", "active_generation"},
+		"schema_version": {"version"},
+		"repositories":   {"repository_id", "active_generation"},
 		"generations": {
 			"repository_id", "generation_id", "corpus_revision", "content_digest", "scan_policy_version",
 			"profile_fingerprint", "profile_model", "dimensions", "metric", "vector_digest", "manifest_digest",
@@ -979,7 +1004,7 @@ func assertSQLiteTaintState(
 		"vectors": {"repository_id", "generation_id", "chunk_id", "encoding_version", "dimensions", "values_blob"},
 	}
 	if len(state.Tables) != len(wantColumns) {
-		t.Fatalf("SQLite tables = %#v, want exactly four complete application tables", state.Tables)
+		t.Fatalf("SQLite tables = %#v, want every complete application table", state.Tables)
 	}
 	for tableName, columns := range wantColumns {
 		table, present := state.Tables[tableName]
@@ -987,10 +1012,29 @@ func assertSQLiteTaintState(
 			t.Fatalf("SQLite table %s columns = %#v, want %#v", tableName, table.Columns, columns)
 		}
 	}
+	versionTable := state.Tables["schema_version"]
+	if !reflect.DeepEqual(versionTable.Rows, [][]any{{int64(2)}}) {
+		t.Fatalf("schema_version rows = %#v, want exact v2 singleton", versionTable.Rows)
+	}
 
 	repositoryID := canonicalPath(t, repository)
-	if !validTaintSHA256(generationID) {
-		t.Fatalf("generation ID = %q, want lowercase SHA-256", generationID)
+	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, chunks)
+	if err != nil {
+		t.Fatalf("NewCorpus(SQLite state) error = %v", err)
+	}
+	semantic := profileEndpoint != ""
+	var profileFingerprint, profileModel any
+	dimensions := int64(0)
+	if semantic {
+		profileFingerprint = expectedTaintProfileFingerprint(profileEndpoint)
+		profileModel = "task13-model"
+		dimensions = 2
+	}
+	wantGenerationID := expectedTaintGenerationID(
+		ingest.ScanPolicyVersion, corpus.Revision, semantic, taintStringValue(profileFingerprint),
+	)
+	if generationID != wantGenerationID {
+		t.Fatalf("observed generation ID = %q, want independently derived %q", generationID, wantGenerationID)
 	}
 	repositories := state.Tables["repositories"]
 	if len(repositories.Rows) != 2 {
@@ -1005,8 +1049,8 @@ func assertSQLiteTaintState(
 		switch {
 		case repositoryValue == repositoryID:
 			indexedRepositoryRows++
-			if row[1] != generationID {
-				t.Fatalf("active generation = %#v, want %q", row[1], generationID)
+			if row[1] != wantGenerationID {
+				t.Fatalf("active generation = %#v, want %q", row[1], wantGenerationID)
 			}
 		case strings.HasPrefix(repositoryValue, "gocontext:store-identity:v1:"):
 			identityRows++
@@ -1021,46 +1065,23 @@ func assertSQLiteTaintState(
 		t.Fatalf("repository row classes = indexed %d identity %d, want one each", indexedRepositoryRows, identityRows)
 	}
 
-	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, chunks)
-	if err != nil {
-		t.Fatalf("NewCorpus(SQLite state) error = %v", err)
-	}
 	generations := state.Tables["generations"]
 	if len(generations.Rows) != 1 {
 		t.Fatalf("generation rows = %#v, want exactly one active generation and no inactive/orphan state", generations.Rows)
 	}
 	generation := sqliteRowMap(generations, generations.Rows[0])
-	semantic := profileEndpoint != ""
-	var profileFingerprint, profileModel any
-	dimensions := int64(0)
-	if semantic {
-		profileFingerprint = expectedTaintProfileFingerprint(profileEndpoint)
-		profileModel = "task13-model"
-		dimensions = 2
-	}
 	contentDigest := expectedTaintContentDigest(chunks)
 	vectorDigest := expectedTaintVectorDigest(chunks, semantic)
-	manifestDigest, err := index.GenerationManifestDigest(index.GenerationManifest{
-		RepositoryID:       repositoryID,
-		GenerationID:       generationID,
-		CorpusRevision:     corpus.Revision,
-		ContentDigest:      contentDigest,
-		ScanPolicyVersion:  ingest.ScanPolicyVersion,
-		ProfileFingerprint: taintStringValue(profileFingerprint),
-		ProfileModel:       taintStringValue(profileModel),
-		Dimensions:         int(dimensions),
-		Metric:             index.VectorMetricCosine,
-		VectorDigest:       vectorDigest,
-	})
-	if err != nil {
-		t.Fatalf("GenerationManifestDigest(exact expected state) error = %v", err)
-	}
+	manifestDigest := expectedTaintManifestDigest(
+		repositoryID, wantGenerationID, corpus.Revision, contentDigest, ingest.ScanPolicyVersion,
+		taintStringValue(profileFingerprint), taintStringValue(profileModel), int(dimensions), vectorDigest,
+	)
 	wantGeneration := map[string]any{
-		"repository_id": repositoryID, "generation_id": generationID,
+		"repository_id": repositoryID, "generation_id": wantGenerationID,
 		"corpus_revision": corpus.Revision, "content_digest": contentDigest,
 		"scan_policy_version": ingest.ScanPolicyVersion,
 		"profile_fingerprint": profileFingerprint, "profile_model": profileModel,
-		"dimensions": dimensions, "metric": string(index.VectorMetricCosine),
+		"dimensions": dimensions, "metric": "cosine",
 		"vector_digest": vectorDigest, "manifest_digest": manifestDigest,
 	}
 	if !reflect.DeepEqual(generation, wantGeneration) {
@@ -1075,7 +1096,7 @@ func assertSQLiteTaintState(
 		stored := sqliteRowMap(chunkTable, row)
 		chunk := chunks[ordinal]
 		want := map[string]any{
-			"repository_id": repositoryID, "generation_id": generationID, "chunk_id": chunk.ID,
+			"repository_id": repositoryID, "generation_id": wantGenerationID, "chunk_id": chunk.ID,
 			"ordinal": int64(ordinal), "text": chunk.Text, "language": string(chunk.Language),
 			"symbol_name": chunk.SymbolName, "path": chunk.Reference.Path,
 			"start_line": int64(chunk.Reference.StartLine), "end_line": int64(chunk.Reference.EndLine),
@@ -1104,11 +1125,66 @@ func assertSQLiteTaintState(
 			t.Fatalf("unexpected vector chunk ID = %q", chunkID)
 		}
 		want := map[string]any{
-			"repository_id": repositoryID, "generation_id": generationID, "chunk_id": chunkID,
+			"repository_id": repositoryID, "generation_id": wantGenerationID, "chunk_id": chunkID,
 			"encoding_version": int64(1), "dimensions": int64(2), "values_blob": expectedBlob,
 		}
 		if !reflect.DeepEqual(stored, want) {
 			t.Fatalf("vector row = %#v, want exact %#v", stored, want)
+		}
+	}
+	return wantGenerationID
+}
+
+func assertSQLiteTaintSchema(t *testing.T, schema sqliteTaintTable) {
+	t.Helper()
+	wantColumns := []string{"type", "name", "tbl_name", "rootpage", "sql"}
+	if !reflect.DeepEqual(schema.Columns, wantColumns) {
+		t.Fatalf("sqlite_schema columns = %#v, want %#v", schema.Columns, wantColumns)
+	}
+	type object struct {
+		kind, table string
+		automatic   bool
+	}
+	want := map[string]object{
+		"schema_version":                  {kind: "table", table: "schema_version"},
+		"repositories":                    {kind: "table", table: "repositories"},
+		"generations":                     {kind: "table", table: "generations"},
+		"chunks":                          {kind: "table", table: "chunks"},
+		"vectors":                         {kind: "table", table: "vectors"},
+		"sqlite_autoindex_repositories_1": {kind: "index", table: "repositories", automatic: true},
+		"sqlite_autoindex_generations_1":  {kind: "index", table: "generations", automatic: true},
+		"sqlite_autoindex_chunks_1":       {kind: "index", table: "chunks", automatic: true},
+		"sqlite_autoindex_chunks_2":       {kind: "index", table: "chunks", automatic: true},
+		"sqlite_autoindex_vectors_1":      {kind: "index", table: "vectors", automatic: true},
+	}
+	if len(schema.Rows) != len(want) {
+		t.Fatalf("sqlite_schema objects = %#v, want exact tables and automatic indexes", schema.Rows)
+	}
+	seen := make(map[string]struct{}, len(schema.Rows))
+	for _, row := range schema.Rows {
+		stored := sqliteRowMap(schema, row)
+		name, nameOK := stored["name"].(string)
+		kind, kindOK := stored["type"].(string)
+		table, tableOK := stored["tbl_name"].(string)
+		rootPage, rootOK := stored["rootpage"].(int64)
+		expected, allowed := want[name]
+		if !nameOK || !kindOK || !tableOK || !rootOK || rootPage <= 0 || !allowed ||
+			kind != expected.kind || table != expected.table {
+			t.Fatalf("unexpected sqlite_schema object = %#v", stored)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			t.Fatalf("duplicate sqlite_schema object %q", name)
+		}
+		seen[name] = struct{}{}
+		if expected.automatic {
+			if stored["sql"] != nil {
+				t.Fatalf("automatic index %q SQL = %#v, want NULL", name, stored["sql"])
+			}
+			continue
+		}
+		sqlText, ok := stored["sql"].(string)
+		if !ok || !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sqlText)), "CREATE TABLE") {
+			t.Fatalf("table %q SQL = %#v, want explicit CREATE TABLE", name, stored["sql"])
 		}
 	}
 }
@@ -1172,6 +1248,42 @@ func expectedTaintContentDigest(chunks []source.Chunk) string {
 		writeTaintCanonicalInteger(digest, int64(chunk.Reference.StartLine))
 		writeTaintCanonicalInteger(digest, int64(chunk.Reference.EndLine))
 	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func expectedTaintGenerationID(policyVersion, revision string, semantic bool, fingerprint string) string {
+	digest := sha256.New()
+	space := "lexical-only"
+	if semantic {
+		space = "semantic"
+	}
+	for _, value := range []string{"generation-v1", policyVersion, revision, space} {
+		writeTaintCanonicalString(digest, value)
+	}
+	if semantic {
+		writeTaintCanonicalString(digest, fingerprint)
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func expectedTaintManifestDigest(
+	repositoryID, generationID, corpusRevision, contentDigest, scanPolicyVersion,
+	profileFingerprint, profileModel string,
+	dimensions int,
+	vectorDigest string,
+) string {
+	semanticState := "lexical-only"
+	if profileFingerprint != "" || profileModel != "" || dimensions != 0 {
+		semanticState = "semantic"
+	}
+	digest := sha256.New()
+	for _, value := range []string{
+		"generation-manifest-v1", repositoryID, generationID, corpusRevision, contentDigest,
+		scanPolicyVersion, semanticState, profileFingerprint, profileModel, "cosine", vectorDigest,
+	} {
+		writeTaintCanonicalString(digest, value)
+	}
+	writeTaintCanonicalInteger(digest, int64(dimensions))
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
@@ -1282,8 +1394,22 @@ func permittedTaintLexicalScores() []float64 {
 	return []float64{0.8999999999999999, 0.6}
 }
 
-func assertTaintHTTPRequestsClean(t *testing.T, requests []taintHTTPRequest, forbidden []string) {
+func assertExactTaintHTTPRequests(
+	t *testing.T,
+	requests []taintHTTPRequest,
+	fixture cliTaintFixture,
+	wantInputs [][]string,
+	queryRequest int,
+) {
 	t.Helper()
+	if len(requests) != len(wantInputs) || queryRequest >= len(requests) {
+		t.Fatalf("HTTP requests/expectations/query index = %d/%d/%d", len(requests), len(wantInputs), queryRequest)
+	}
+	forbidden := appendCopy(
+		fixture.forbidden,
+		fixture.repository, canonicalPath(t, fixture.repository), "safe/allowed.py", "safe/allowed.ts",
+	)
+	metadataForbidden := appendCopy(forbidden, cliTaintQueryCanary)
 	for index, request := range requests {
 		if request.Method != http.MethodPost || request.URLString != "/v1/embeddings" ||
 			request.Path != "/v1/embeddings" || request.RequestURI != "/v1/embeddings" || request.RawQuery != "" ||
@@ -1304,19 +1430,80 @@ func assertTaintHTTPRequestsClean(t *testing.T, requests []taintHTTPRequest, for
 		if address == nil || !address.IsLoopback() {
 			t.Fatalf("request %d host = %q, want numeric loopback", index, request.Host)
 		}
-		assertNoCLITaintValue(t, fmt.Sprintf("HTTP request %d", index), request, forbidden)
+		metadata := struct {
+			Method, URLString, Path, RequestURI, RawQuery, Host string
+			Header, Trailer                                     http.Header
+			TransferEncoding                                    []string
+			ContentLength                                       int64
+			BodyOverflow, BodyTruncated                         bool
+			ReadError, CloseError                               string
+		}{
+			Method: request.Method, URLString: request.URLString, Path: request.Path,
+			RequestURI: request.RequestURI, RawQuery: request.RawQuery, Host: request.Host,
+			Header: request.Header, Trailer: request.Trailer,
+			TransferEncoding: request.TransferEncoding, ContentLength: request.ContentLength,
+			BodyOverflow: request.BodyOverflow, BodyTruncated: request.BodyTruncated,
+			ReadError: request.ReadError, CloseError: request.CloseError,
+		}
+		assertNoCLITaintValue(t, fmt.Sprintf("HTTP request %d metadata", index), metadata, metadataForbidden)
+
+		decoded, err := decodeStrictTaintEmbeddingRequest(request.Body)
+		if err != nil {
+			t.Fatalf("decode HTTP request %d error = %v", index, err)
+		}
+		if !reflect.DeepEqual(decoded.Input, wantInputs[index]) {
+			t.Fatalf("HTTP request %d inputs = %#v, want exact ordered %#v", index, decoded.Input, wantInputs[index])
+		}
+		envelope := struct {
+			Model, EncodingFormat string
+			Dimensions            int
+		}{decoded.Model, decoded.EncodingFormat, decoded.Dimensions}
+		assertNoCLITaintValue(t, fmt.Sprintf("HTTP request %d non-input JSON fields", index), envelope, metadataForbidden)
+
+		if index != queryRequest {
+			checkCLITaintBytes(t, fmt.Sprintf("HTTP request %d body", index), request.Body, metadataForbidden)
+			continue
+		}
+		if !reflect.DeepEqual(decoded.Input, []string{cliTaintQueryCanary}) {
+			t.Fatalf("HTTP request %d is designated query egress but inputs = %#v", index, decoded.Input)
+		}
+		allowedJSON, err := json.Marshal(cliTaintQueryCanary)
+		if err != nil || bytes.Count(request.Body, allowedJSON) != 1 {
+			t.Fatalf("HTTP query request contains %d exact query elements; marshal error %v", bytes.Count(request.Body, allowedJSON), err)
+		}
+		location := bytes.Index(request.Body, allowedJSON)
+		redacted := make([]byte, 0, len(request.Body)-len(allowedJSON))
+		redacted = append(redacted, request.Body[:location]...)
+		redacted = append(redacted, request.Body[location+len(allowedJSON):]...)
+		checkCLITaintBytes(t, "HTTP query request outside exact input element", redacted, metadataForbidden)
 	}
 }
 
-func decodeTaintInputs(t *testing.T, body []byte) []string {
-	t.Helper()
-	var request struct {
-		Input []string `json:"input"`
+type taintEmbeddingRequest struct {
+	Model          string   `json:"model"`
+	Input          []string `json:"input"`
+	EncodingFormat string   `json:"encoding_format"`
+	Dimensions     int      `json:"dimensions"`
+}
+
+func decodeStrictTaintEmbeddingRequest(body []byte) (taintEmbeddingRequest, error) {
+	if !hasExactTaintJSONFields(body, []string{"model", "input", "encoding_format", "dimensions"}) {
+		return taintEmbeddingRequest{}, errors.New("invalid synthetic request envelope")
 	}
-	if err := json.Unmarshal(body, &request); err != nil {
-		t.Fatalf("decode captured request error = %v", err)
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var request taintEmbeddingRequest
+	if err := decoder.Decode(&request); err != nil {
+		return taintEmbeddingRequest{}, errors.New("invalid synthetic request envelope")
 	}
-	return request.Input
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return taintEmbeddingRequest{}, errors.New("invalid synthetic request envelope")
+	}
+	if request.Model != "task13-model" || request.EncodingFormat != "float" ||
+		request.Dimensions != 2 || len(request.Input) == 0 {
+		return taintEmbeddingRequest{}, errors.New("invalid synthetic request envelope")
+	}
+	return request, nil
 }
 
 func assertCLITaintSinksClean(t *testing.T, fixture cliTaintFixture, extra []string, values ...string) {
@@ -1364,54 +1551,27 @@ func assertTaintStoreClean(t *testing.T, storeDirectory string, forbidden []stri
 
 func assertNoCLITaintValue(t *testing.T, label string, value any, forbidden []string) {
 	t.Helper()
-	assertNoCLITaintReflect(t, label, reflect.ValueOf(value), forbidden)
+	result := taintcheck.ScanValue(value, forbidden)
+	if !result.Complete {
+		t.Fatalf("%s structured taint inspection exceeded a bound", label)
+	}
+	if result.Found {
+		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, result.Match.Canary, result.Match.Encoding)
+	}
 	checkCLITaintBytes(t, label+" debug", []byte(fmt.Sprintf("%#v", value)), forbidden)
 	if payload, err := json.Marshal(value); err == nil {
 		checkCLITaintBytes(t, label+" JSON", payload, forbidden)
 	}
 }
 
-func assertNoCLITaintReflect(t *testing.T, label string, value reflect.Value, forbidden []string) {
-	t.Helper()
-	if !value.IsValid() {
-		return
-	}
-	if value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
-		if !value.IsNil() {
-			assertNoCLITaintReflect(t, label, value.Elem(), forbidden)
-		}
-		return
-	}
-	if value.Kind() == reflect.String {
-		checkCLITaintBytes(t, label+" string", []byte(value.String()), forbidden)
-		return
-	}
-	if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
-		checkCLITaintBytes(t, label+" bytes", value.Bytes(), forbidden)
-		return
-	}
-	switch value.Kind() {
-	case reflect.Struct:
-		for index := 0; index < value.NumField(); index++ {
-			assertNoCLITaintReflect(t, label, value.Field(index), forbidden)
-		}
-	case reflect.Slice, reflect.Array:
-		for index := 0; index < value.Len(); index++ {
-			assertNoCLITaintReflect(t, label, value.Index(index), forbidden)
-		}
-	case reflect.Map:
-		iterator := value.MapRange()
-		for iterator.Next() {
-			assertNoCLITaintReflect(t, label, iterator.Key(), forbidden)
-			assertNoCLITaintReflect(t, label, iterator.Value(), forbidden)
-		}
-	}
-}
-
 func checkCLITaintBytes(t *testing.T, label string, payload []byte, forbidden []string) {
 	t.Helper()
-	if match, found := taintcheck.Find(payload, forbidden); found {
-		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, match.Canary, match.Encoding)
+	result := taintcheck.Scan(payload, forbidden)
+	if !result.Complete {
+		t.Fatalf("%s taint inspection exceeded a bound", label)
+	}
+	if result.Found {
+		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, result.Match.Canary, result.Match.Encoding)
 	}
 }
 

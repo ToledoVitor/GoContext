@@ -258,7 +258,13 @@ func assertAggregateOnlyReport(t *testing.T, report ingest.ScanReport) {
 
 func assertNoTaintValue(t *testing.T, label string, value any, forbidden []string) {
 	t.Helper()
-	assertNoTaintReflect(t, label, reflect.ValueOf(value), forbidden)
+	result := taintcheck.ScanValue(value, forbidden)
+	if !result.Complete {
+		t.Fatalf("%s structured taint inspection exceeded a bound", label)
+	}
+	if result.Found {
+		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, result.Match.Canary, result.Match.Encoding)
+	}
 	debug := []byte(fmt.Sprintf("%#v", value))
 	checkTaintBytes(t, label+" debug", debug, forbidden)
 	if payload, err := json.Marshal(value); err == nil {
@@ -266,46 +272,13 @@ func assertNoTaintValue(t *testing.T, label string, value any, forbidden []strin
 	}
 }
 
-func assertNoTaintReflect(t *testing.T, label string, value reflect.Value, forbidden []string) {
-	t.Helper()
-	if !value.IsValid() {
-		return
-	}
-	if value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
-		if !value.IsNil() {
-			assertNoTaintReflect(t, label, value.Elem(), forbidden)
-		}
-		return
-	}
-	if value.Kind() == reflect.String {
-		checkTaintBytes(t, label+" string", []byte(value.String()), forbidden)
-		return
-	}
-	if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
-		checkTaintBytes(t, label+" bytes", value.Bytes(), forbidden)
-		return
-	}
-	switch value.Kind() {
-	case reflect.Struct:
-		for index := 0; index < value.NumField(); index++ {
-			assertNoTaintReflect(t, label, value.Field(index), forbidden)
-		}
-	case reflect.Slice, reflect.Array:
-		for index := 0; index < value.Len(); index++ {
-			assertNoTaintReflect(t, label, value.Index(index), forbidden)
-		}
-	case reflect.Map:
-		iterator := value.MapRange()
-		for iterator.Next() {
-			assertNoTaintReflect(t, label, iterator.Key(), forbidden)
-			assertNoTaintReflect(t, label, iterator.Value(), forbidden)
-		}
-	}
-}
-
 func checkTaintBytes(t *testing.T, label string, payload []byte, forbidden []string) {
 	t.Helper()
-	if match, found := taintcheck.Find(payload, forbidden); found {
-		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, match.Canary, match.Encoding)
+	result := taintcheck.Scan(payload, forbidden)
+	if !result.Complete {
+		t.Fatalf("%s taint inspection exceeded a bound", label)
+	}
+	if result.Found {
+		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, result.Match.Canary, result.Match.Encoding)
 	}
 }
