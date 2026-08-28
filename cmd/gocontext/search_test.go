@@ -486,8 +486,6 @@ func TestRunSearchAutoOffUsesPersistedSQLiteGeneration(t *testing.T) {
 
 func TestRunSearchExactSQLiteScaleWarningBoundaryAndDefaultSnapshotSilence(t *testing.T) {
 	clearEmbeddingEnvironment(t)
-	repository := t.TempDir()
-	repositoryID := canonicalPath(t, repository)
 	storeDirectory := t.TempDir()
 	store, err := indexsqlite.NewStore(storeDirectory)
 	if err != nil {
@@ -495,19 +493,19 @@ func TestRunSearchExactSQLiteScaleWarningBoundaryAndDefaultSnapshotSilence(t *te
 	}
 	defer store.Close()
 
-	var active string
 	for _, count := range []int{20_000, 20_001} {
+		repository := t.TempDir()
+		repositoryID := canonicalPath(t, repository)
 		chunks := makeScaleWarningChunks(count)
 		corpus := mustCLICorpus(t, chunks)
 		generationID := fmt.Sprintf("scale-generation-%d", count)
 		if err := store.Replace(context.Background(), indexdomain.Generation{
-			RepositoryID: repositoryID, ID: generationID, BaseGeneration: active,
+			RepositoryID: repositoryID, ID: generationID,
 			CorpusRevision: corpus.Revision, ScanPolicyVersion: corpus.PolicyVersion,
 			Chunks: corpus.Chunks, Metric: indexdomain.VectorMetricCosine,
 		}); err != nil {
 			t.Fatalf("Replace(%d chunks) error = %v", count, err)
 		}
-		active = generationID
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -527,6 +525,8 @@ func TestRunSearchExactSQLiteScaleWarningBoundaryAndDefaultSnapshotSilence(t *te
 		}
 	}
 
+	repository := t.TempDir()
+	repositoryID := canonicalPath(t, repository)
 	snapshotStore, err := localstore.NewStore(storeDirectory)
 	if err != nil {
 		t.Fatalf("NewStore(snapshot) error = %v", err)
