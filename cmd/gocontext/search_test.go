@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
@@ -33,7 +36,7 @@ func TestRunSearchPrintsRankedCitationAndText(t *testing.T) {
 			Reference:  source.Reference{Path: "src/load.py", StartLine: 1, EndLine: 2},
 		},
 	}
-	if err := store.Replace(context.Background(), canonicalPath(t, repository), chunks); err != nil {
+	if err := store.Replace(context.Background(), canonicalPath(t, repository), mustCLICorpus(t, chunks)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
 
@@ -59,6 +62,45 @@ func TestRunSearchPrintsRankedCitationAndText(t *testing.T) {
 	}
 }
 
+func TestRunSearchRejectsLegacySnapshotWithoutPrintingCanary(t *testing.T) {
+	repository := t.TempDir()
+	storeDirectory := t.TempDir()
+	store, err := localstore.NewStore(storeDirectory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	repositoryID := canonicalPath(t, repository)
+	if err := store.Replace(context.Background(), repositoryID, mustCLICorpus(t, nil)); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	entries, err := os.ReadDir(storeDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("snapshot entries = %d, want 1", len(entries))
+	}
+	legacy := `{"version":1,"repository_id":"legacy","chunks":[{"id":"legacy","text":"LEGACY_SEARCH_CANARY","language":"python","reference":{"Path":"legacy-secret.py","StartLine":1,"EndLine":1}}]}`
+	if err := os.WriteFile(filepath.Join(storeDirectory, entries[0].Name()), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("WriteFile(legacy) error = %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{"search", "--store", storeDirectory, repository, "canary"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run(search legacy) code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "requires reindex") {
+		t.Errorf("run(search legacy) stderr = %q, want reindex requirement", stderr.String())
+	}
+	for _, output := range []string{stdout.String(), stderr.String()} {
+		if strings.Contains(output, "LEGACY_SEARCH_CANARY") || strings.Contains(output, "legacy-secret.py") {
+			t.Errorf("run(search legacy) output exposes legacy canary: %q", output)
+		}
+	}
+}
+
 func TestRunSearchReportsNoResults(t *testing.T) {
 	repository := t.TempDir()
 	storeDirectory := t.TempDir()
@@ -66,7 +108,7 @@ func TestRunSearchReportsNoResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	if err := store.Replace(context.Background(), canonicalPath(t, repository), nil); err != nil {
+	if err := store.Replace(context.Background(), canonicalPath(t, repository), mustCLICorpus(t, nil)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
 
@@ -128,7 +170,7 @@ func TestRunSearchEscapesTerminalControlCharacters(t *testing.T) {
 		Language:  source.LanguagePython,
 		Reference: source.Reference{Path: "unsafe.py", StartLine: 1, EndLine: 1},
 	}}
-	if err := store.Replace(context.Background(), canonicalPath(t, repository), chunks); err != nil {
+	if err := store.Replace(context.Background(), canonicalPath(t, repository), mustCLICorpus(t, chunks)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
 
@@ -145,4 +187,13 @@ func TestRunSearchEscapesTerminalControlCharacters(t *testing.T) {
 	if !strings.Contains(stdout.String(), `\x1b[31mred`) {
 		t.Fatalf("run(search control characters) stdout = %q, want escaped control", stdout.String())
 	}
+}
+
+func mustCLICorpus(t *testing.T, chunks []source.Chunk) source.Corpus {
+	t.Helper()
+	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, chunks)
+	if err != nil {
+		t.Fatalf("NewCorpus() error = %v", err)
+	}
+	return corpus
 }

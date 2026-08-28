@@ -76,6 +76,30 @@ func TestRunIndexReportsOperationalError(t *testing.T) {
 	}
 }
 
+func TestRunIndexAbortsBeforeCreatingSnapshotWhenScanPolicyFails(t *testing.T) {
+	repository := t.TempDir()
+	storeDirectory := t.TempDir()
+	writeCLIFile(t, repository, "valid.py", "print('must not be stored')\n")
+	writeCLIFile(t, repository, "bad\u200b.py", "print('invalid path')\n")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := run([]string{"index", "--store", storeDirectory, repository}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run(index invalid path) code = %d, want 1", code)
+	}
+	entries, err := os.ReadDir(storeDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(store) error = %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("store entries = %v, want none after scan failure", entries)
+	}
+	if strings.Contains(stderr.String(), "bad\u200b.py") || strings.Contains(stderr.String(), "invalid path") {
+		t.Fatalf("run(index invalid path) stderr exposes source data: %q", stderr.String())
+	}
+}
+
 func writeCLIFile(t *testing.T, root, relativePath, content string) {
 	t.Helper()
 	filePath := filepath.Join(root, relativePath)

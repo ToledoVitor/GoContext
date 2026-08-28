@@ -63,7 +63,7 @@ func indexRepository(ctx context.Context, repositoryPath, storeDirectory string)
 		return indexStats{}, err
 	}
 
-	files, err := filesystem.NewScanner().Scan(ctx, repositoryID)
+	scanResult, err := filesystem.NewScanner().Scan(ctx, repositoryID)
 	if err != nil {
 		return indexStats{}, err
 	}
@@ -71,8 +71,8 @@ func indexRepository(ctx context.Context, repositoryPath, storeDirectory string)
 	parser := lineparser.NewParser()
 	chunker := symbolchunker.NewChunker()
 	chunks := make([]source.Chunk, 0)
-	stats := indexStats{files: len(files)}
-	for _, file := range files {
+	stats := indexStats{files: len(scanResult.Files)}
+	for _, file := range scanResult.Files {
 		symbols, err := parser.Parse(ctx, file)
 		if err != nil {
 			return indexStats{}, fmt.Errorf("parse %q: %w", file.Reference.Path, err)
@@ -85,12 +85,16 @@ func indexRepository(ctx context.Context, repositoryPath, storeDirectory string)
 		stats.chunks += len(fileChunks)
 		chunks = append(chunks, fileChunks...)
 	}
+	corpus, err := source.NewCorpus(scanResult.PolicyVersion, chunks)
+	if err != nil {
+		return indexStats{}, err
+	}
 
 	store, err := localstore.NewStore(storeDirectory)
 	if err != nil {
 		return indexStats{}, err
 	}
-	if err := store.Replace(ctx, repositoryID, chunks); err != nil {
+	if err := store.Replace(ctx, repositoryID, corpus); err != nil {
 		return indexStats{}, err
 	}
 	return stats, nil

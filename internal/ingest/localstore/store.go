@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	snapshotVersion = 1
+	snapshotVersion = 2
 	maxSnapshotSize = 64 << 20
 )
 
@@ -30,6 +30,7 @@ var (
 	ErrInvalidRepositoryID = errors.New("invalid repository ID")
 	ErrInvalidChunk        = errors.New("invalid chunk")
 	ErrSnapshotTooLarge    = errors.New("repository snapshot too large")
+	ErrReindexRequired     = errors.New("repository snapshot requires reindex")
 )
 
 // Store keeps one versioned JSON snapshot per repository.
@@ -38,9 +39,11 @@ type Store struct {
 }
 
 type snapshot struct {
-	Version      int            `json:"version"`
-	RepositoryID string         `json:"repository_id"`
-	Chunks       []source.Chunk `json:"chunks"`
+	Version        int            `json:"version"`
+	RepositoryID   string         `json:"repository_id"`
+	PolicyVersion  string         `json:"policy_version"`
+	CorpusRevision string         `json:"corpus_revision"`
+	Chunks         []source.Chunk `json:"chunks"`
 }
 
 // NewStore creates or opens a private local snapshot directory.
@@ -72,7 +75,7 @@ func NewStore(directory string) (*Store, error) {
 }
 
 // Replace atomically replaces chunks belonging to one repository snapshot.
-func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []source.Chunk) error {
+func (s *Store) Replace(ctx context.Context, repositoryID string, corpus source.Corpus) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("replace repository snapshot: %w", err)
 	}
@@ -80,14 +83,16 @@ func (s *Store) Replace(ctx context.Context, repositoryID string, chunks []sourc
 		return fmt.Errorf("replace repository snapshot: %w", err)
 	}
 	targetName := snapshotName(repositoryID)
-	if err := validateChunks(chunks); err != nil {
+	if err := validateCorpus(corpus); err != nil {
 		return fmt.Errorf("replace repository snapshot %q: %w", targetName, err)
 	}
 
 	payload, err := json.Marshal(snapshot{
-		Version:      snapshotVersion,
-		RepositoryID: repositoryID,
-		Chunks:       chunks,
+		Version:        snapshotVersion,
+		RepositoryID:   repositoryID,
+		PolicyVersion:  corpus.PolicyVersion,
+		CorpusRevision: corpus.Revision,
+		Chunks:         corpus.Chunks,
 	})
 	if err != nil {
 		return fmt.Errorf("encode repository snapshot: %w", err)
@@ -187,13 +192,21 @@ func (s *Store) Load(ctx context.Context, repositoryID string) ([]source.Chunk, 
 	if err := json.Unmarshal(payload, &stored); err != nil {
 		return nil, fmt.Errorf("decode repository snapshot %q: %w", targetName, err)
 	}
-	if stored.Version != snapshotVersion || stored.RepositoryID != repositoryID {
+	if stored.Version != snapshotVersion {
+		return nil, fmt.Errorf("decode repository snapshot %q: %w", targetName, ErrReindexRequired)
+	}
+	if stored.RepositoryID != repositoryID {
 		return nil, fmt.Errorf("decode repository snapshot %q: metadata mismatch", targetName)
 	}
-	if err := validateChunks(stored.Chunks); err != nil {
-		return nil, fmt.Errorf("decode repository snapshot %q: %w", targetName, err)
+	corpus := source.Corpus{
+		PolicyVersion: stored.PolicyVersion,
+		Revision:      stored.CorpusRevision,
+		Chunks:        stored.Chunks,
 	}
-	return stored.Chunks, nil
+	if err := validateCorpus(corpus); err != nil {
+		return nil, fmt.Errorf("decode repository snapshot %q: %w", targetName, ErrReindexRequired)
+	}
+	return append([]source.Chunk(nil), stored.Chunks...), nil
 }
 
 func validateRepositoryID(repositoryID string) error {
@@ -213,6 +226,20 @@ func validateChunks(chunks []source.Chunk) error {
 			return fmt.Errorf("%w: chunk %d duplicates an earlier ID", ErrInvalidChunk, index)
 		}
 		seen[chunk.ID] = struct{}{}
+	}
+	return nil
+}
+
+func validateCorpus(corpus source.Corpus) error {
+	if corpus.PolicyVersion != ingest.ScanPolicyVersion {
+		return ErrInvalidChunk
+	}
+	if err := validateChunks(corpus.Chunks); err != nil {
+		return err
+	}
+	validated, err := source.NewCorpus(corpus.PolicyVersion, corpus.Chunks)
+	if err != nil || validated.Revision != corpus.Revision {
+		return ErrInvalidChunk
 	}
 	return nil
 }

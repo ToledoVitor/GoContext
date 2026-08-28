@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
@@ -19,7 +20,7 @@ func TestStoreAtomicallyReplacesAndLoadsSnapshot(t *testing.T) {
 		t.Fatalf("NewStore() error = %v", err)
 	}
 
-	first := []source.Chunk{sampleChunk("first", "first.py", "FIRST = 1")}
+	first := mustCorpus(t, []source.Chunk{sampleChunk("first", "first.py", "FIRST = 1")})
 	if err := store.Replace(context.Background(), "owner/repository", first); err != nil {
 		t.Fatalf("first Replace() error = %v", err)
 	}
@@ -27,11 +28,11 @@ func TestStoreAtomicallyReplacesAndLoadsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Load() error = %v", err)
 	}
-	if !reflect.DeepEqual(loaded, first) {
-		t.Fatalf("first Load() = %#v, want %#v", loaded, first)
+	if !reflect.DeepEqual(loaded, first.Chunks) {
+		t.Fatalf("first Load() = %#v, want %#v", loaded, first.Chunks)
 	}
 
-	second := []source.Chunk{sampleChunk("second", "second.ts", "export const SECOND = 2")}
+	second := mustCorpus(t, []source.Chunk{sampleChunk("second", "second.ts", "export const SECOND = 2")})
 	if err := store.Replace(context.Background(), "owner/repository", second); err != nil {
 		t.Fatalf("second Replace() error = %v", err)
 	}
@@ -39,8 +40,8 @@ func TestStoreAtomicallyReplacesAndLoadsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Load() error = %v", err)
 	}
-	if !reflect.DeepEqual(loaded, second) {
-		t.Fatalf("second Load() = %#v, want %#v", loaded, second)
+	if !reflect.DeepEqual(loaded, second.Chunks) {
+		t.Fatalf("second Load() = %#v, want %#v", loaded, second.Chunks)
 	}
 }
 
@@ -49,8 +50,8 @@ func TestStoreKeepsRepositoriesIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	first := []source.Chunk{sampleChunk("first", "first.py", "FIRST = 1")}
-	second := []source.Chunk{sampleChunk("second", "second.py", "SECOND = 2")}
+	first := mustCorpus(t, []source.Chunk{sampleChunk("first", "first.py", "FIRST = 1")})
+	second := mustCorpus(t, []source.Chunk{sampleChunk("second", "second.py", "SECOND = 2")})
 
 	if err := store.Replace(context.Background(), "repository-one", first); err != nil {
 		t.Fatalf("Replace(repository-one) error = %v", err)
@@ -67,8 +68,8 @@ func TestStoreKeepsRepositoriesIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(repository-two) error = %v", err)
 	}
-	if !reflect.DeepEqual(loadedFirst, first) || !reflect.DeepEqual(loadedSecond, second) {
-		t.Fatalf("isolated loads = %#v and %#v, want %#v and %#v", loadedFirst, loadedSecond, first, second)
+	if !reflect.DeepEqual(loadedFirst, first.Chunks) || !reflect.DeepEqual(loadedSecond, second.Chunks) {
+		t.Fatalf("isolated loads = %#v and %#v, want %#v and %#v", loadedFirst, loadedSecond, first.Chunks, second.Chunks)
 	}
 }
 
@@ -83,16 +84,18 @@ func TestStoreReportsMissingAndRejectsInvalidInput(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "load repository snapshot") {
 		t.Errorf("Load(missing) error = %q, want operation context", err)
 	}
-	if err := store.Replace(context.Background(), "", nil); !errors.Is(err, localstore.ErrInvalidRepositoryID) {
+	if err := store.Replace(context.Background(), "", source.Corpus{}); !errors.Is(err, localstore.ErrInvalidRepositoryID) {
 		t.Fatalf("Replace(empty ID) error = %v, want ErrInvalidRepositoryID", err)
 	}
-	if err := store.Replace(context.Background(), "repo", []source.Chunk{{ID: "invalid"}}); !errors.Is(err, localstore.ErrInvalidChunk) {
+	invalid := source.Corpus{PolicyVersion: ingest.ScanPolicyVersion, Revision: "invalid", Chunks: []source.Chunk{{ID: "invalid"}}}
+	if err := store.Replace(context.Background(), "repo", invalid); !errors.Is(err, localstore.ErrInvalidChunk) {
 		t.Fatalf("Replace(invalid chunk) error = %v, want ErrInvalidChunk", err)
 	} else if !strings.Contains(err.Error(), "replace repository snapshot") {
 		t.Errorf("Replace(invalid chunk) error = %q, want operation context", err)
 	}
 	duplicate := sampleChunk("same", "app.py", "A = 1")
-	if err := store.Replace(context.Background(), "repo", []source.Chunk{duplicate, duplicate}); !errors.Is(err, localstore.ErrInvalidChunk) {
+	invalid = source.Corpus{PolicyVersion: ingest.ScanPolicyVersion, Revision: "invalid", Chunks: []source.Chunk{duplicate, duplicate}}
+	if err := store.Replace(context.Background(), "repo", invalid); !errors.Is(err, localstore.ErrInvalidChunk) {
 		t.Fatalf("Replace(duplicate chunks) error = %v, want ErrInvalidChunk", err)
 	}
 }
@@ -105,7 +108,7 @@ func TestStoreRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := store.Replace(ctx, "repo", nil); !errors.Is(err, context.Canceled) {
+	if err := store.Replace(ctx, "repo", source.Corpus{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Replace(canceled) error = %v, want context.Canceled", err)
 	}
 	if _, err := store.Load(ctx, "repo"); !errors.Is(err, context.Canceled) {
@@ -133,8 +136,57 @@ func TestNewStoreCreatesNestedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore(nested) error = %v", err)
 	}
-	if err := store.Replace(context.Background(), "repo", nil); err != nil {
+	if err := store.Replace(context.Background(), "repo", mustCorpus(t, nil)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
+	}
+}
+
+func TestStoreRejectsLegacySnapshotWithoutReturningCanary(t *testing.T) {
+	directory := t.TempDir()
+	store, err := localstore.NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if err := store.Replace(context.Background(), "repo", mustCorpus(t, nil)); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("snapshot entries = %d, want 1", len(entries))
+	}
+	legacy := `{"version":1,"repository_id":"repo","chunks":[{"id":"legacy","text":"LEGACY_CANARY","language":"python","reference":{"Path":"secret.py","StartLine":1,"EndLine":1}}]}`
+	if err := os.WriteFile(filepath.Join(directory, entries[0].Name()), []byte(legacy), 0o600); err != nil {
+		t.Fatalf("WriteFile(legacy) error = %v", err)
+	}
+
+	loaded, err := store.Load(context.Background(), "repo")
+	if !errors.Is(err, localstore.ErrReindexRequired) {
+		t.Fatalf("Load(legacy) error = %v, want ErrReindexRequired", err)
+	}
+	if loaded != nil {
+		t.Fatalf("Load(legacy) = %#v, want nil", loaded)
+	}
+	if strings.Contains(err.Error(), "LEGACY_CANARY") || strings.Contains(err.Error(), "secret.py") {
+		t.Fatalf("Load(legacy) error exposes legacy data: %q", err)
+	}
+}
+
+func TestStoreRejectsCorpusWhosePolicyOrRevisionWasNotValidated(t *testing.T) {
+	store, err := localstore.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	chunk := sampleChunk("chunk", "app.py", "VALUE = 1")
+	for _, corpus := range []source.Corpus{
+		{PolicyVersion: "scanner-v1", Revision: "legacy", Chunks: []source.Chunk{chunk}},
+		{PolicyVersion: ingest.ScanPolicyVersion, Revision: "forged", Chunks: []source.Chunk{chunk}},
+	} {
+		if err := store.Replace(context.Background(), "repo", corpus); !errors.Is(err, localstore.ErrInvalidChunk) {
+			t.Errorf("Replace(%#v) error = %v, want ErrInvalidChunk", corpus, err)
+		}
 	}
 }
 
@@ -145,4 +197,13 @@ func sampleChunk(id, path, text string) source.Chunk {
 		Language:  source.LanguagePython,
 		Reference: source.Reference{Path: path, StartLine: 1, EndLine: 1},
 	}
+}
+
+func mustCorpus(t *testing.T, chunks []source.Chunk) source.Corpus {
+	t.Helper()
+	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, chunks)
+	if err != nil {
+		t.Fatalf("NewCorpus() error = %v", err)
+	}
+	return corpus
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/ingest/localstore"
 	"github.com/ToledoVitor/GoContext/internal/search"
 	"github.com/ToledoVitor/GoContext/internal/search/lexical"
@@ -20,7 +21,7 @@ func TestSearcherRanksByTermCoverageAndSourceFields(t *testing.T) {
 		chunk("partial", "services/load.py", 1, "Load", "def load():\n    pass"),
 		chunk("unmatched", "services/health.py", 1, "Health", "def health():\n    return True"),
 	}
-	if err := store.Replace(context.Background(), "repo", chunks); err != nil {
+	if err := store.Replace(context.Background(), "repo", mustLexicalCorpus(t, chunks)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
 	searcher, err := lexical.NewSearcher(store)
@@ -58,7 +59,7 @@ func TestSearcherSplitsCamelCaseAndSnakeCase(t *testing.T) {
 		chunk("camel", "src/service.ts", 1, "loadUserProfile", "export function loadUserProfile() {}"),
 		chunk("snake", "src/load_user.py", 1, "other", "VALUE = true"),
 	}
-	if err := store.Replace(context.Background(), "repo", chunks); err != nil {
+	if err := store.Replace(context.Background(), "repo", mustLexicalCorpus(t, chunks)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
 	searcher, err := lexical.NewSearcher(store)
@@ -86,7 +87,7 @@ func TestSearcherUsesDeterministicTieBreakersAndLimit(t *testing.T) {
 		chunk("a-late", "a.py", 8, "", "token"),
 		chunk("a-first", "a.py", 2, "", "token"),
 	}
-	if err := store.Replace(context.Background(), "repo", chunks); err != nil {
+	if err := store.Replace(context.Background(), "repo", mustLexicalCorpus(t, chunks)); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}
 	searcher, err := lexical.NewSearcher(store)
@@ -161,6 +162,15 @@ func newStore(t *testing.T) *localstore.Store {
 		t.Fatalf("NewStore() error = %v", err)
 	}
 	return store
+}
+
+func mustLexicalCorpus(t *testing.T, chunks []source.Chunk) source.Corpus {
+	t.Helper()
+	corpus, err := source.NewCorpus(ingest.ScanPolicyVersion, chunks)
+	if err != nil {
+		t.Fatalf("NewCorpus() error = %v", err)
+	}
+	return corpus
 }
 
 func chunk(id, path string, startLine int, symbolName, text string) source.Chunk {
