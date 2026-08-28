@@ -3,13 +3,18 @@ package lineparser
 import "context"
 
 const javaScriptCancellationStride = 4 << 10
-const javaScriptMaximumParenDepth = 256
+const javaScriptMaximumDelimiterDepth = 256
 
-type javaScriptParenContext uint8
+type javaScriptDelimiterKind uint8
 
 const (
-	javaScriptExpressionParen javaScriptParenContext = iota
+	javaScriptExpressionParen javaScriptDelimiterKind = iota
 	javaScriptControlHeaderParen
+	javaScriptBracket
+	javaScriptGenericBrace
+	javaScriptControlBlockBrace
+	javaScriptTemplateInterpolationBrace
+	javaScriptJSXExpressionBrace
 )
 
 // javaScriptLexicalState tracks only the lexical context needed to decide
@@ -18,23 +23,20 @@ const (
 // template forms or malformed unterminated literals.
 type javaScriptLexicalState struct {
 	blockComment          bool
-	blockDepth            int
-	bracketDepth          int
 	canStartRegex         bool
-	parenContexts         [javaScriptMaximumParenDepth]javaScriptParenContext
-	parenDepth            int
+	delimiters            [javaScriptMaximumDelimiterDepth]javaScriptDelimiterKind
+	delimiterDepth        int
 	pendingControlParen   bool
+	pendingControlBlock   bool
 	stringQuote           byte
 	templateRaw           bool
 	templateInterpolation bool
-	templateBraceDepth    int
 	jsxDepth              int
 	jsxInTag              bool
 	jsxClosingTag         bool
 	jsxQuote              byte
 	jsxEscaped            bool
 	jsxExpression         bool
-	jsxExpressionDepth    int
 	uncertain             bool
 }
 
@@ -45,7 +47,7 @@ func newJavaScriptLexicalState() *javaScriptLexicalState {
 func (state *javaScriptLexicalState) atTopLevel() bool {
 	return !state.uncertain && !state.blockComment && state.stringQuote == 0 &&
 		!state.templateRaw && !state.templateInterpolation && state.jsxDepth == 0 &&
-		state.blockDepth == 0 && state.bracketDepth == 0 && state.parenDepth == 0
+		state.delimiterDepth == 0
 }
 
 func (state *javaScriptLexicalState) trustworthy() bool {
@@ -86,9 +88,11 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 				continue
 			}
 			if character == '$' && index+1 < len(line) && line[index+1] == '{' {
+				if !state.pushDelimiter(javaScriptTemplateInterpolationBrace) {
+					return nil
+				}
 				state.templateRaw = false
 				state.templateInterpolation = true
-				state.templateBraceDepth = 1
 				state.canStartRegex = true
 				index++
 				continue
@@ -158,7 +162,7 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 						continue
 					}
 				}
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				if state.canStartRegex || atLineStart {
 					regex = true
 					regexCharacterClass = false
@@ -167,11 +171,11 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 				state.canStartRegex = true
 
 			case '\'', '"':
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				state.stringQuote = character
 
 			case '`':
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				if state.templateInterpolation {
 					state.uncertain = true
 					return nil
@@ -179,7 +183,7 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 				state.templateRaw = true
 
 			case '<':
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				if state.canStartRegex && startsJavaScriptJSX(line, index) {
 					if state.jsxExpression {
 						state.uncertain = true
@@ -191,73 +195,81 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 				state.canStartRegex = true
 
 			case '{':
-				state.pendingControlParen = false
-				if state.templateInterpolation {
-					state.templateBraceDepth++
-				} else if state.jsxExpression {
-					state.jsxExpressionDepth++
-				} else {
-					state.blockDepth++
+				delimiter := javaScriptGenericBrace
+				if state.pendingControlBlock {
+					delimiter = javaScriptControlBlockBrace
+				}
+				state.clearPendingControlContext()
+				if !state.pushDelimiter(delimiter) {
+					return nil
 				}
 				state.canStartRegex = true
 
 			case '}':
-				state.pendingControlParen = false
-				if state.templateInterpolation {
-					state.templateBraceDepth--
-					if state.templateBraceDepth == 0 {
-						state.templateInterpolation = false
-						state.templateRaw = true
-					}
-				} else if state.jsxExpression {
-					state.jsxExpressionDepth--
-					if state.jsxExpressionDepth == 0 {
-						state.jsxExpression = false
-					}
-				} else if state.blockDepth > 0 {
-					state.blockDepth--
-				} else {
-					state.uncertain = true
+				state.clearPendingControlContext()
+				delimiter, valid := state.popBrace()
+				if !valid {
 					return nil
 				}
-				state.canStartRegex = false
+				switch delimiter {
+				case javaScriptTemplateInterpolationBrace:
+					state.templateInterpolation = false
+					state.templateRaw = true
+					state.canStartRegex = false
+				case javaScriptJSXExpressionBrace:
+					state.jsxExpression = false
+					state.canStartRegex = false
+				case javaScriptControlBlockBrace:
+					state.canStartRegex = true
+				default:
+					state.canStartRegex = false
+				}
 
 			case '(':
 				controlHeader := state.pendingControlParen
-				state.pendingControlParen = false
-				if !state.pushParen(controlHeader) {
+				state.clearPendingControlContext()
+				delimiter := javaScriptExpressionParen
+				if controlHeader {
+					delimiter = javaScriptControlHeaderParen
+				}
+				if !state.pushDelimiter(delimiter) {
 					return nil
 				}
 				state.canStartRegex = true
 
 			case ')':
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				paren, valid := state.popParen()
 				if !valid {
 					return nil
 				}
-				state.canStartRegex = paren == javaScriptControlHeaderParen
+				if paren == javaScriptControlHeaderParen {
+					state.canStartRegex = true
+					state.pendingControlBlock = true
+				} else {
+					state.canStartRegex = false
+				}
 
 			case '[':
-				state.pendingControlParen = false
-				state.bracketDepth++
+				state.clearPendingControlContext()
+				if !state.pushDelimiter(javaScriptBracket) {
+					return nil
+				}
 				state.canStartRegex = true
 
 			case ']':
-				state.pendingControlParen = false
-				if state.bracketDepth == 0 {
-					state.uncertain = true
+				state.clearPendingControlContext()
+				if !state.popExactDelimiter(javaScriptBracket) {
 					return nil
 				}
-				state.bracketDepth--
 				state.canStartRegex = false
 
 			case ',', ';', ':', '?', '=', '!', '~', '+', '-', '*', '%', '&', '|', '^', '>':
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				state.canStartRegex = true
 
 			case '.':
-				state.pendingControlParen = false
+				state.clearPendingControlContext()
 				state.canStartRegex = false
 
 			default:
@@ -273,10 +285,11 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 					}
 					token := line[index:end]
 					state.pendingControlParen = javaScriptControlHeaderKeyword(token)
+					state.pendingControlBlock = javaScriptControlBlockKeyword(token)
 					state.canStartRegex = javaScriptKeywordAllowsExpression(token)
 					index = end - 1
 				} else if character >= '0' && character <= '9' {
-					state.pendingControlParen = false
+					state.clearPendingControlContext()
 					end := index + 1
 					for end < len(line) && isJavaScriptNumberPart(line[end]) {
 						if end%javaScriptCancellationStride == 0 {
@@ -289,7 +302,7 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 					state.canStartRegex = false
 					index = end - 1
 				} else {
-					state.pendingControlParen = false
+					state.clearPendingControlContext()
 					state.canStartRegex = true
 				}
 			}
@@ -305,27 +318,56 @@ func (state *javaScriptLexicalState) consume(ctx context.Context, line string) e
 	return ctx.Err()
 }
 
-func (state *javaScriptLexicalState) pushParen(controlHeader bool) bool {
-	if state.parenDepth == len(state.parenContexts) {
+func (state *javaScriptLexicalState) clearPendingControlContext() {
+	state.pendingControlParen = false
+	state.pendingControlBlock = false
+}
+
+func (state *javaScriptLexicalState) pushDelimiter(delimiter javaScriptDelimiterKind) bool {
+	if state.delimiterDepth == len(state.delimiters) {
 		state.uncertain = true
 		return false
 	}
-	context := javaScriptExpressionParen
-	if controlHeader {
-		context = javaScriptControlHeaderParen
-	}
-	state.parenContexts[state.parenDepth] = context
-	state.parenDepth++
+	state.delimiters[state.delimiterDepth] = delimiter
+	state.delimiterDepth++
 	return true
 }
 
-func (state *javaScriptLexicalState) popParen() (javaScriptParenContext, bool) {
-	if state.parenDepth == 0 {
+func (state *javaScriptLexicalState) popDelimiter() (javaScriptDelimiterKind, bool) {
+	if state.delimiterDepth == 0 {
 		state.uncertain = true
 		return javaScriptExpressionParen, false
 	}
-	state.parenDepth--
-	return state.parenContexts[state.parenDepth], true
+	state.delimiterDepth--
+	return state.delimiters[state.delimiterDepth], true
+}
+
+func (state *javaScriptLexicalState) popExactDelimiter(expected javaScriptDelimiterKind) bool {
+	delimiter, valid := state.popDelimiter()
+	if !valid || delimiter != expected {
+		state.uncertain = true
+		return false
+	}
+	return true
+}
+
+func (state *javaScriptLexicalState) popParen() (javaScriptDelimiterKind, bool) {
+	delimiter, valid := state.popDelimiter()
+	if !valid || delimiter != javaScriptExpressionParen && delimiter != javaScriptControlHeaderParen {
+		state.uncertain = true
+		return javaScriptExpressionParen, false
+	}
+	return delimiter, true
+}
+
+func (state *javaScriptLexicalState) popBrace() (javaScriptDelimiterKind, bool) {
+	delimiter, valid := state.popDelimiter()
+	if !valid || delimiter != javaScriptGenericBrace && delimiter != javaScriptControlBlockBrace &&
+		delimiter != javaScriptTemplateInterpolationBrace && delimiter != javaScriptJSXExpressionBrace {
+		state.uncertain = true
+		return javaScriptGenericBrace, false
+	}
+	return delimiter, true
 }
 
 func startsJavaScriptJSX(line string, index int) bool {
@@ -367,9 +409,7 @@ func (state *javaScriptLexicalState) consumeJSXCharacter(line string, index *int
 		case '\'', '"':
 			state.jsxQuote = character
 		case '{':
-			state.jsxExpression = true
-			state.jsxExpressionDepth = 1
-			state.canStartRegex = true
+			state.startJSXExpression()
 		case '/':
 			if *index+1 < len(line) && line[*index+1] == '>' {
 				state.jsxDepth--
@@ -390,9 +430,7 @@ func (state *javaScriptLexicalState) consumeJSXCharacter(line string, index *int
 
 	switch character {
 	case '{':
-		state.jsxExpression = true
-		state.jsxExpressionDepth = 1
-		state.canStartRegex = true
+		state.startJSXExpression()
 	case '<':
 		if *index+1 >= len(line) {
 			return
@@ -411,6 +449,14 @@ func (state *javaScriptLexicalState) consumeJSXCharacter(line string, index *int
 			state.jsxClosingTag = false
 		}
 	}
+}
+
+func (state *javaScriptLexicalState) startJSXExpression() {
+	if !state.pushDelimiter(javaScriptJSXExpressionBrace) {
+		return
+	}
+	state.jsxExpression = true
+	state.canStartRegex = true
 }
 
 func (state *javaScriptLexicalState) finishJSXIfClosed() {
@@ -457,6 +503,15 @@ func javaScriptKeywordAllowsExpression(keyword string) bool {
 func javaScriptControlHeaderKeyword(keyword string) bool {
 	switch keyword {
 	case "catch", "for", "if", "switch", "while", "with":
+		return true
+	default:
+		return false
+	}
+}
+
+func javaScriptControlBlockKeyword(keyword string) bool {
+	switch keyword {
+	case "do", "else", "finally", "try":
 		return true
 	default:
 		return false

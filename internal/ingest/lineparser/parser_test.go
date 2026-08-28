@@ -386,6 +386,30 @@ func TestParserJavaScriptRegexAfterControlHeaderDoesNotCorruptTemplateState(t *t
 	assertSymbols(t, symbols, want)
 }
 
+func TestParserJavaScriptRegexAfterControlBlockDoesNotCorruptTemplateState(t *testing.T) {
+	lines := []string{
+		"if (ready) {} /`/.test(value)",
+		"const source = `first",
+		"function fake() {}",
+		"`",
+		"function real() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/control-block-regex.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "real", Kind: "function", Signature: lines[4], Reference: source.Reference{Path: "src/control-block-regex.js", StartLine: 5, EndLine: 5}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
 func TestParserJavaScriptIgnoresDeclarationTextInsideMultilineJSX(t *testing.T) {
 	lines := []string{
 		"<section data-label=\"</section>\">",
@@ -454,6 +478,119 @@ func TestParserJavaScriptRejectsMalformedArrowBodyStarters(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParserJavaScriptArrowBodyUsesConservativeStarterSubset(t *testing.T) {
+	invalidLines := []string{
+		"const lessThan = () => < value",
+		"const inBody = () => in value",
+		"const instanceBody = () => instanceof Type",
+		"const extendsBody = () => extends Type",
+		"const positive = () => +",
+		"const negated = () => !",
+		"const inverted = () => ~",
+		"const constructed = () => new",
+		"const typed = () => typeof",
+		"const deleted = () => delete",
+		"const awaited = async () => await",
+		"const functionBody = () => function",
+		"const classBody = () => class",
+		"const superBody = () => super",
+		"const regexBody = () => /unterminated",
+		"const jsxBody = () => <Tag",
+	}
+	for _, line := range invalidLines {
+		t.Run("invalid "+line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/invalid-starter.jsx", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(symbols) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want none", line, symbols)
+			}
+		})
+	}
+
+	validLines := []struct {
+		line string
+		name string
+	}{
+		{line: "const positive = () => +value", name: "positive"},
+		{line: "const negated = () => !ready", name: "negated"},
+		{line: "const inverted = () => ~mask", name: "inverted"},
+		{line: "const constructed = () => new Type()", name: "constructed"},
+		{line: "const typed = () => typeof value", name: "typed"},
+		{line: "const deleted = () => delete target.value", name: "deleted"},
+		{line: "const awaited = async () => await load()", name: "awaited"},
+		{line: "const functionBody = () => function() {}", name: "functionBody"},
+		{line: "const classBody = () => class {}", name: "classBody"},
+		{line: "const truthy = () => true", name: "truthy"},
+		{line: "const self = () => this", name: "self"},
+		{line: "const regexBody = () => /closed/.test(value)", name: "regexBody"},
+		{line: "const jsxBody = () => <Tag />", name: "jsxBody"},
+	}
+	for _, test := range validLines {
+		t.Run("valid "+test.name, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/valid-starter.jsx", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(test.line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			want := []source.Symbol{{
+				Name: test.name, Kind: "function", Signature: test.line,
+				Reference: source.Reference{Path: "src/valid-starter.jsx", StartLine: 1, EndLine: 1},
+			}}
+			assertSymbols(t, symbols, want)
+		})
+	}
+}
+
+func TestParserJavaScriptDelimiterOrderMustBeProperlyNested(t *testing.T) {
+	invalidLines := []string{
+		"const crossedBracket = () => ([)]",
+		"const crossedBrace = () => ({)}",
+	}
+	for _, line := range invalidLines {
+		t.Run(line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/crossed.js", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(symbols) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want crossed delimiters to fail closed", line, symbols)
+			}
+		})
+	}
+
+	line := "const nested = () => ([{ value: [call()] }])"
+	file := source.File{
+		Reference: source.Reference{Path: "src/nested.js", StartLine: 1, EndLine: 1},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(line + "\n"),
+	}
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{{
+		Name: "nested", Kind: "function", Signature: line,
+		Reference: source.Reference{Path: "src/nested.js", StartLine: 1, EndLine: 1},
+	}}
+	assertSymbols(t, symbols, want)
 }
 
 func TestParserJavaScriptRejectsCandidateThatMakesLexicalStateUncertain(t *testing.T) {

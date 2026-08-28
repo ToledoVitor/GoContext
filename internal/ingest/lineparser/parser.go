@@ -211,18 +211,91 @@ func validJavaScriptArrowTail(value string) bool {
 		strings.HasPrefix(body, "/*") {
 		return false
 	}
-	first := body[0]
-	if !isJavaScriptIdentifierStart(first) && !(first >= '0' && first <= '9') &&
-		!strings.ContainsRune("'\"`([{/<+-!~", rune(first)) {
+	return validJavaScriptArrowBodyStarter(body)
+}
+
+// validJavaScriptArrowBodyStarter deliberately recognizes a small expression
+// prefix subset. The lexical pass validates delimiters and literals; this
+// guard prevents statement/binary keywords and incomplete unary constructs
+// from becoming invented function boundaries without implementing an AST.
+func validJavaScriptArrowBodyStarter(body string) bool {
+	value := strings.TrimLeft(body, " \t\r\n")
+	for value != "" {
+		first := value[0]
+		switch {
+		case first == '+' || first == '-' || first == '!' || first == '~':
+			value = strings.TrimLeft(value[1:], " \t\r\n")
+			continue
+		case first == '<':
+			return completeJavaScriptJSXExpression(value)
+		case first == '/' || first == '\'' || first == '"' || first == '`' ||
+			first == '(' || first == '[' || first == '{':
+			return true
+		case first >= '0' && first <= '9':
+			return true
+		case isJavaScriptIdentifierStart(first):
+			keyword, rest := leadingJavaScriptIdentifier(value)
+			switch keyword {
+			case "await", "delete", "new", "typeof", "void", "yield":
+				value = strings.TrimLeft(rest, " \t\r\n")
+				continue
+			case "function":
+				return validJavaScriptFunctionSyntax(value, false)
+			case "class":
+				return validJavaScriptClassExpressionSyntax(value)
+			case "false", "null", "this", "true":
+				return true
+			default:
+				return validJavaScriptIdentifier(keyword)
+			}
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func validJavaScriptClassExpressionSyntax(value string) bool {
+	if !strings.HasPrefix(value, "class") {
 		return false
 	}
-	keyword, _ := leadingJavaScriptIdentifier(body)
-	switch keyword {
-	case "break", "case", "catch", "const", "continue", "debugger", "default", "do", "else", "export", "finally", "for", "if", "let", "return", "switch", "throw", "try", "var", "while", "yield":
-		return false
-	default:
+	remainder := strings.TrimLeft(value[len("class"):], " \t\r\n")
+	if strings.HasPrefix(remainder, "{") {
 		return true
 	}
+
+	name, rest := leadingJavaScriptIdentifier(remainder)
+	if !validJavaScriptIdentifier(name) {
+		return false
+	}
+	remainder = strings.TrimLeft(rest, " \t\r\n")
+	if hasJavaScriptKeywordPrefix(remainder, "extends") {
+		remainder = strings.TrimLeft(remainder[len("extends"):], " \t\r\n")
+		base, tail := leadingJavaScriptIdentifier(remainder)
+		if !validJavaScriptIdentifier(base) {
+			return false
+		}
+		remainder = strings.TrimLeft(tail, " \t\r\n")
+		for strings.HasPrefix(remainder, ".") {
+			member, tail := leadingJavaScriptIdentifier(remainder[1:])
+			if !validJavaScriptIdentifier(member) {
+				return false
+			}
+			remainder = strings.TrimLeft(tail, " \t\r\n")
+		}
+	}
+	return strings.HasPrefix(remainder, "{")
+}
+
+func completeJavaScriptJSXExpression(value string) bool {
+	if !startsJavaScriptJSX(value, 0) {
+		return false
+	}
+	state := newJavaScriptLexicalState()
+	if err := state.consume(context.Background(), value); err != nil {
+		return false
+	}
+	return state.atTopLevel()
 }
 
 func validJavaScriptParameterList(value string) (string, bool) {
