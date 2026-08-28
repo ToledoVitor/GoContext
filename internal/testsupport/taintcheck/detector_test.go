@@ -83,6 +83,97 @@ func TestScanDetectsExactShortCanaryAfterBase64AssignmentDelimiter(t *testing.T)
 	}
 }
 
+func TestScanSeparatesBase64AlphabetsAtOppositeAlphabetSuffix(t *testing.T) {
+	const canary = ".env"
+	encodings := []struct {
+		name   string
+		encode func([]byte) string
+		suffix string
+	}{
+		{name: "standard padded", encode: base64.StdEncoding.EncodeToString, suffix: "-safe"},
+		{name: "standard raw", encode: base64.RawStdEncoding.EncodeToString, suffix: "-safe"},
+		{name: "URL padded", encode: base64.URLEncoding.EncodeToString, suffix: "+safe"},
+		{name: "URL raw", encode: base64.RawURLEncoding.EncodeToString, suffix: "+safe"},
+	}
+	wrappers := []struct {
+		name string
+		wrap func(string, string) string
+	}{
+		{name: "mixed opposite-alphabet run", wrap: func(encoded, suffix string) string { return encoded + suffix }},
+		{name: "invalid leading padding", wrap: func(encoded, suffix string) string { return "bad===" + encoded + suffix }},
+		{name: "invalid trailing padding", wrap: func(encoded, suffix string) string { return encoded + "===" + suffix }},
+	}
+
+	for prefixLength := 0; prefixLength < 3; prefixLength++ {
+		prefix := []byte{0xfb, 0xef}[:prefixLength:prefixLength]
+		payload := append(append([]byte(nil), prefix...), []byte(canary)...)
+		near := append(append([]byte(nil), prefix...), []byte(".enw")...)
+		for _, encoding := range encodings {
+			for _, wrapper := range wrappers {
+				t.Run(fmt.Sprintf("%s/prefix-%d/%s", encoding.name, prefixLength, wrapper.name), func(t *testing.T) {
+					wrapped := wrapper.wrap(encoding.encode(payload), encoding.suffix)
+					result := Scan([]byte(wrapped), []string{canary})
+					if !result.Complete || !result.Found || result.Match.Canary != canary {
+						t.Fatalf("Scan(%q) = %#v; want complete encoded-canary match", wrapped, result)
+					}
+					nearWrapped := wrapper.wrap(encoding.encode(near), encoding.suffix)
+					nearResult := Scan([]byte(nearWrapped), []string{canary})
+					if !nearResult.Complete || nearResult.Found {
+						t.Fatalf("Scan(near %q) = %#v; want complete no-match", nearWrapped, nearResult)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBase64AlphabetPassesShareAndEnforceWorkLimits(t *testing.T) {
+	const canary = ".env"
+	common := []byte("c2FmZQ==")
+	exactLimits := base64ScanLimits{
+		maxTokenBytes:      len(common),
+		maxTokenCount:      1,
+		maxTotalTokenBytes: len(common),
+		maxSteps:           2 * len(common),
+	}
+	_, found, complete, work := findBase64TokensWithLimits(common, [][]byte{[]byte(canary)}, exactLimits)
+	if !complete || found || work.tokenCount != 1 || work.totalTokenBytes != len(common) || work.steps != 2*len(common) {
+		t.Fatalf("shared exact-budget scan = found %t complete %t work %#v; want one deduplicated token and two bounded passes", found, complete, work)
+	}
+
+	t.Run("step budget", func(t *testing.T) {
+		limits := exactLimits
+		limits.maxSteps--
+		_, found, complete, work := findBase64TokensWithLimits(common, [][]byte{[]byte(canary)}, limits)
+		if complete || found || work.steps != limits.maxSteps {
+			t.Fatalf("step-bounded scan = found %t complete %t work %#v; want incomplete at %d steps", found, complete, work, limits.maxSteps)
+		}
+	})
+
+	twoTokens := []byte("QQ==!Qg==")
+	for name, limits := range map[string]base64ScanLimits{
+		"token count": {
+			maxTokenBytes: len(twoTokens), maxTokenCount: 1,
+			maxTotalTokenBytes: len(twoTokens), maxSteps: 2 * len(twoTokens),
+		},
+		"aggregate bytes": {
+			maxTokenBytes: len(twoTokens), maxTokenCount: 2,
+			maxTotalTokenBytes: 7, maxSteps: 2 * len(twoTokens),
+		},
+		"token length": {
+			maxTokenBytes: 3, maxTokenCount: 2,
+			maxTotalTokenBytes: len(twoTokens), maxSteps: 2 * len(twoTokens),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, found, complete, _ := findBase64TokensWithLimits(twoTokens, [][]byte{[]byte(canary)}, limits)
+			if complete || found {
+				t.Fatalf("%s bounded scan = found %t complete %t; want fail-closed incomplete", name, found, complete)
+			}
+		})
+	}
+}
+
 func TestScanDetectsContextIndependentHexAndEscapedDebugSubsequences(t *testing.T) {
 	const canary = "SYNTHETIC_DEBUG_DETECTOR_CANARY_TASK13"
 	prefixed := append([]byte("prefix"), []byte(canary)...)

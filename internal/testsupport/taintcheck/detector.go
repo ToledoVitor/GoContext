@@ -14,6 +14,7 @@ const (
 	maxEncodedTokenBytes      = 1 << 20
 	maxEncodedTokenCount      = 1 << 20
 	maxTotalEncodedTokenBytes = maxEncodedScanBytes
+	maxBase64ScanSteps        = 2 * maxEncodedScanBytes
 
 	EncodingRaw          = "raw"
 	EncodingBase64       = "base64"
@@ -91,39 +92,133 @@ func findRaw(payload []byte, canaries [][]byte, encoding string) (Match, bool) {
 }
 
 func findBase64Tokens(payload []byte, canaries [][]byte) (Match, bool, bool) {
-	tokenCount := 0
-	totalTokenBytes := 0
+	match, found, complete, _ := findBase64TokensWithLimits(payload, canaries, base64ScanLimits{
+		maxTokenBytes:      maxEncodedTokenBytes,
+		maxTokenCount:      maxEncodedTokenCount,
+		maxTotalTokenBytes: maxTotalEncodedTokenBytes,
+		maxSteps:           maxBase64ScanSteps,
+	})
+	return match, found, complete
+}
+
+type base64ScanLimits struct {
+	maxTokenBytes      int
+	maxTokenCount      int
+	maxTotalTokenBytes int
+	maxSteps           int
+}
+
+// findBase64TokensWithLimits charges both lexical passes to one ledger. Exact
+// token spans common to both alphabets are decoded and charged only once.
+func findBase64TokensWithLimits(
+	payload []byte,
+	canaries [][]byte,
+	limits base64ScanLimits,
+) (Match, bool, bool, base64ScanWork) {
+	work := base64ScanWork{
+		limits: limits,
+		seen:   make(map[base64TokenSpan]struct{}),
+	}
+	passes := []base64LexicalPass{
+		{alphabet: standardBase64AlphabetByte, encoding: base64.StdEncoding, label: EncodingBase64},
+		{alphabet: urlBase64AlphabetByte, encoding: base64.URLEncoding, label: EncodingBase64URL},
+	}
+	for _, pass := range passes {
+		match, found, complete := findBase64TokensForPass(payload, canaries, pass, &work)
+		if !complete || found {
+			return match, found, complete, work
+		}
+	}
+	return Match{}, false, true, work
+}
+
+type base64LexicalPass struct {
+	alphabet func(byte) bool
+	encoding *base64.Encoding
+	label    string
+}
+
+type base64ScanWork struct {
+	tokenCount      int
+	totalTokenBytes int
+	steps           int
+	limits          base64ScanLimits
+	seen            map[base64TokenSpan]struct{}
+}
+
+type base64TokenSpan struct {
+	start int
+	end   int
+}
+
+func findBase64TokensForPass(
+	payload []byte,
+	canaries [][]byte,
+	pass base64LexicalPass,
+	work *base64ScanWork,
+) (Match, bool, bool) {
 	for offset := 0; offset < len(payload); {
-		if !base64AlphabetByte(payload[offset]) {
+		if !work.takeStep() {
+			return Match{}, false, false
+		}
+		if !pass.alphabet(payload[offset]) {
 			offset++
 			continue
 		}
-		end := offset + 1
-		for end < len(payload) && base64AlphabetByte(payload[end]) {
-			end++
+		start := offset
+		offset++
+		for offset < len(payload) && pass.alphabet(payload[offset]) {
+			if !work.takeStep() {
+				return Match{}, false, false
+			}
+			offset++
 		}
-		end = base64PaddedTokenEnd(payload, offset, end)
-		tokenCount++
-		totalTokenBytes += end - offset
-		if tokenCount > maxEncodedTokenCount || end-offset > maxEncodedTokenBytes ||
-			totalTokenBytes > maxTotalEncodedTokenBytes {
+		end := base64PaddedTokenEnd(payload, start, offset, pass.alphabet)
+		duplicate, withinLimits := work.takeToken(start, end)
+		if !withinLimits {
 			return Match{}, false, false
 		}
-		for _, decoded := range decodeWholeBase64Token(payload[offset:end]) {
-			encoding := EncodingBase64
-			if decoded.url {
-				encoding = EncodingBase64URL
-			}
-			if match, found := findRaw(decoded.payload, canaries, encoding); found {
+		if duplicate {
+			continue
+		}
+		decoded, valid := decodeWholeBase64Token(payload[start:end], pass.encoding)
+		if valid {
+			if match, found := findRaw(decoded, canaries, pass.label); found {
 				return match, true, true
 			}
 		}
-		offset = end
 	}
 	return Match{}, false, true
 }
 
-func base64PaddedTokenEnd(payload []byte, start, coreEnd int) int {
+func (work *base64ScanWork) takeStep() bool {
+	if work.steps >= work.limits.maxSteps {
+		return false
+	}
+	work.steps++
+	return true
+}
+
+func (work *base64ScanWork) takeToken(start, end int) (bool, bool) {
+	length := end - start
+	if length > work.limits.maxTokenBytes {
+		return false, false
+	}
+	span := base64TokenSpan{start: start, end: end}
+	if _, present := work.seen[span]; present {
+		return true, true
+	}
+	work.seen[span] = struct{}{}
+	work.tokenCount++
+	work.totalTokenBytes += length
+	if work.tokenCount > work.limits.maxTokenCount ||
+		work.totalTokenBytes > work.limits.maxTotalTokenBytes {
+		return false, false
+	}
+	return false, true
+}
+
+func base64PaddedTokenEnd(payload []byte, start, coreEnd int, alphabet func(byte) bool) int {
 	requiredPadding := (4 - (coreEnd-start)%4) % 4
 	if requiredPadding < 1 || requiredPadding > 2 || coreEnd+requiredPadding > len(payload) {
 		return coreEnd
@@ -134,68 +229,32 @@ func base64PaddedTokenEnd(payload []byte, start, coreEnd int) int {
 		}
 	}
 	paddedEnd := coreEnd + requiredPadding
-	if paddedEnd < len(payload) && (base64AlphabetByte(payload[paddedEnd]) || payload[paddedEnd] == '=') {
+	if paddedEnd < len(payload) && (alphabet(payload[paddedEnd]) || payload[paddedEnd] == '=') {
 		return coreEnd
 	}
 	return paddedEnd
 }
 
-type decodedBase64 struct {
-	payload []byte
-	url     bool
-}
-
-func decodeWholeBase64Token(token []byte) []decodedBase64 {
+func decodeWholeBase64Token(token []byte, encoding *base64.Encoding) ([]byte, bool) {
 	core, padding, valid := splitBase64Padding(token)
 	if !valid || len(core) < 2 || len(core)%4 == 1 {
-		return nil
+		return nil, false
 	}
 	requiredPadding := (4 - len(core)%4) % 4
 	if requiredPadding == 3 || (padding != 0 && padding != requiredPadding) {
-		return nil
+		return nil, false
 	}
 	padded := make([]byte, len(core)+requiredPadding)
 	copy(padded, core)
 	for index := len(core); index < len(padded); index++ {
 		padded[index] = '='
 	}
-
-	variants := []struct {
-		padded *base64.Encoding
-		raw    *base64.Encoding
-		url    bool
-	}{
-		{padded: base64.StdEncoding, raw: base64.RawStdEncoding},
-		{padded: base64.URLEncoding, raw: base64.RawURLEncoding, url: true},
+	buffer := make([]byte, encoding.DecodedLen(len(padded)))
+	count, err := encoding.Decode(buffer, padded)
+	if err != nil {
+		return nil, false
 	}
-	decoded := make([]decodedBase64, 0, len(variants)*2)
-	for _, variant := range variants {
-		for _, candidate := range []struct {
-			encoding *base64.Encoding
-			payload  []byte
-		}{
-			{encoding: variant.padded, payload: padded},
-			{encoding: variant.raw, payload: core},
-		} {
-			buffer := make([]byte, candidate.encoding.DecodedLen(len(candidate.payload)))
-			count, err := candidate.encoding.Decode(buffer, candidate.payload)
-			if err != nil {
-				continue
-			}
-			buffer = buffer[:count]
-			duplicate := false
-			for _, prior := range decoded {
-				if prior.url == variant.url && bytes.Equal(prior.payload, buffer) {
-					duplicate = true
-					break
-				}
-			}
-			if !duplicate {
-				decoded = append(decoded, decodedBase64{payload: buffer, url: variant.url})
-			}
-		}
-	}
-	return decoded
+	return buffer[:count], true
 }
 
 func splitBase64Padding(token []byte) ([]byte, int, bool) {
@@ -215,10 +274,14 @@ func splitBase64Padding(token []byte) ([]byte, int, bool) {
 	return token[:first], padding, true
 }
 
-func base64AlphabetByte(value byte) bool {
+func standardBase64AlphabetByte(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
-		value >= '0' && value <= '9' || value == '+' || value == '/' ||
-		value == '-' || value == '_'
+		value >= '0' && value <= '9' || value == '+' || value == '/'
+}
+
+func urlBase64AlphabetByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9' || value == '-' || value == '_'
 }
 
 func findHexTokens(payload []byte, canaries [][]byte) (Match, bool, bool) {
