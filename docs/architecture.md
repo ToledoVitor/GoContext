@@ -136,7 +136,7 @@ Erros carregam etapa, caminho relativo quando seguro e causa original. Arquivo i
 - testes explícitos de symlink escape, arquivos secretos e prompt injection.
 - teste taint instrumenta parser, chunker, embedder, transporte, store e logs; bytes excluídos devem aparecer em zero sinks.
 
-Prova taint ponta a ponta e validação profissional permanecem pendentes nas Tasks 13/14. Quando autorizada, a validação começa por inventário e benchmark lexical offline; código profissional não vai a provider externo e Ollama loopback é o único modo semântico permitido. Relatórios guardarão somente agregados sanitizados. Ver [plano de validação](plans/2026-08-27-tivita-professional-repository-validation.md).
+Prova taint ponta a ponta da Task 13 e primeiro inventário/baseline lexical profissional da Task 14 estão concluídos. Código profissional não foi a provider externo; somente agregados sanitizados foram versionados em relatório separado da lista nominal de raízes. Baseline mede exact-symbol e deixa conceito/framework/cross-layer como `not-evaluated`; não autoriza promoção semântica. Ollama loopback segue único modo semântico permitido nesse corpus e ainda exige gate local. Ver [plano de validação](plans/2026-08-27-tivita-professional-repository-validation.md).
 
 ## Não decisões desta etapa
 

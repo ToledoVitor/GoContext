@@ -21,9 +21,9 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 
 **Pronto quando:** fixtures retornam símbolos, linhas e chunks determinísticos; escapes por symlink falham; bytes hard-denied não chegam a nenhum estágio ou log.
 
-Scanner, relatório, snapshots seguros e chunking preliminar estão entregues. Parser estrutural e prova taint completa continuam pendentes; o line parser atual não é apresentado como parser final.
+Scanner, relatório, snapshots seguros, chunking preliminar e prova taint ponta a ponta estão entregues. Parser estrutural continua pendente; o line parser atual não é apresentado como parser final.
 
-## M2 — Índice e busca local (núcleo entregue; gates finais pendentes)
+## M2 — Índice e busca local (núcleo entregue; validação ampla pendente)
 
 - gate de compatibilidade do driver SQLite puro Go;
 - gerações SQLite atômicas por repositório e reindexação completa;
@@ -38,7 +38,7 @@ Scanner, relatório, snapshots seguros e chunking preliminar estão entregues. P
 
 **Pronto quando:** consultas exatas e conceituais encontram fixtures sem serviço de índice externo; modo default não abre rede; falha temporária semântica preserva busca lexical e referências canônicas.
 
-Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. A promoção do marco aguarda Task 13 (prova taint) e Task 14 (validação profissional local e gaps reais de parser). Nenhuma validação profissional foi executada ou reivindicada nesta etapa.
+Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. Task 13 concluiu prova taint e Task 14 concluiu primeiro inventário/baseline lexical profissional aggregate-only. Promoção ampla ainda aguarda gold set humano local para categorias conceituais, framework, erro, configuração, cross-layer e evidência negativa; elas permanecem `not-evaluated`.
 
 ## M3 — Perguntas fundamentadas
 
@@ -62,4 +62,4 @@ Esses comportamentos do núcleo estão entregues com `source.Reference` canônic
 
 React/TypeScript para navegação e histórico, atualização incremental, ANN, reranker, banco vetorial externo, mais linguagens, métricas de recuperação e adapters adicionais. Só entram após uso real indicar prioridade.
 
-O primeiro ciclo de uso real em repositórios profissionais autorizados permanece Task 14 e só ocorre após os gates de segurança. Inventário descobre stacks e gaps; benchmark compara lexical/offline com híbrido via Ollama loopback. Código, paths e queries profissionais não entram em relatórios nem providers externos. Suporte novo nasce de gaps priorizados e fixtures sintéticas ou suficientemente minimizadas.
+Primeiro ciclo de uso real em três repositórios profissionais autorizados passou os gates da Task 14 e concluiu inventário/baseline lexical aggregate-only, sem rede. Resultado sanitizado separado prioriza JavaScript/JSX e gold set humano local; categorias não exact-symbol continuam `not-evaluated`. Híbrido via Ollama loopback permanece futuro e condicionado ao gate local. Código, paths e queries profissionais não entram em relatórios nem providers externos.
