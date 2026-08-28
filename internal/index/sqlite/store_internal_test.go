@@ -1028,6 +1028,192 @@ func TestConcurrentNewStoreSerializesThePrivateStagingNamespace(t *testing.T) {
 	}
 }
 
+func TestOpenExistingWaitsForFirstCreatorAndOpensPublishedStore(t *testing.T) {
+	directory := t.TempDir()
+	creatorEntered := make(chan struct{})
+	releaseCreator := make(chan struct{})
+	creatorResult := make(chan error, 1)
+	go func() {
+		store, err := newStore(directory, storeOpenHooks{
+			beforeFreshIdentityInsert: func(string) error {
+				close(creatorEntered)
+				<-releaseCreator
+				return nil
+			},
+		})
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		creatorResult <- err
+	}()
+	<-creatorEntered
+
+	type openResult struct {
+		store *Store
+		err   error
+	}
+	openerResult := make(chan openResult, 1)
+	go func() {
+		store, err := OpenExisting(directory)
+		openerResult <- openResult{store: store, err: err}
+	}()
+
+	select {
+	case result := <-openerResult:
+		if result.store != nil {
+			_ = result.store.Close()
+		}
+		close(releaseCreator)
+		<-creatorResult
+		t.Fatalf("OpenExisting() returned before first creator published: %v", result.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseCreator)
+	if err := <-creatorResult; err != nil {
+		t.Fatalf("newStore(first creator) error = %v", err)
+	}
+	select {
+	case result := <-openerResult:
+		if result.err != nil || result.store == nil {
+			t.Fatalf("OpenExisting(after publication) = (%v, %v), want usable store", result.store, result.err)
+		}
+		if _, err := result.store.ActiveGeneration(context.Background(), "missing-repository"); !errors.Is(err, index.ErrNotFound) {
+			_ = result.store.Close()
+			t.Fatalf("ActiveGeneration(missing) error = %v, want ErrNotFound", err)
+		}
+		if err := result.store.Close(); err != nil {
+			t.Fatalf("Close(opened store) error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenExisting() remained blocked after first creator published")
+	}
+}
+
+func TestOpenExistingWaitsForAbortedFirstCreatorAndReturnsAbsenceWithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	creatorEntered := make(chan struct{})
+	releaseCreator := make(chan struct{})
+	creatorResult := make(chan error, 1)
+	go func() {
+		store, err := newStore(directory, storeOpenHooks{
+			beforeFreshIdentityInsert: func(string) error {
+				close(creatorEntered)
+				<-releaseCreator
+				return errors.New("private creator abort canary")
+			},
+		})
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		creatorResult <- err
+	}()
+	<-creatorEntered
+
+	openerResult := make(chan error, 1)
+	go func() {
+		store, err := OpenExisting(directory)
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		openerResult <- err
+	}()
+	select {
+	case err := <-openerResult:
+		close(releaseCreator)
+		<-creatorResult
+		t.Fatalf("OpenExisting() returned before first creator aborted: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseCreator)
+	if err := <-creatorResult; !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("newStore(aborted creator) error = %v, want ErrReindexRequired", err)
+	}
+	select {
+	case err := <-openerResult:
+		if !errors.Is(err, index.ErrNotFound) {
+			t.Fatalf("OpenExisting(after aborted creator) error = %v, want ErrNotFound", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenExisting() remained blocked after first creator aborted")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(after aborted creator) error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != storeNamespaceLockName {
+		t.Fatalf("entries after aborted creator and opener = %v, want only stable namespace lock", entries)
+	}
+}
+
+func TestOpenExistingContextCancellationInterruptsNamespaceLockWait(t *testing.T) {
+	directory := t.TempDir()
+	creatorEntered := make(chan struct{})
+	releaseCreator := make(chan struct{})
+	creatorResult := make(chan error, 1)
+	go func() {
+		store, err := newStore(directory, storeOpenHooks{
+			beforeFreshIdentityInsert: func(string) error {
+				close(creatorEntered)
+				<-releaseCreator
+				return nil
+			},
+		})
+		if store != nil {
+			err = errors.Join(err, store.Close())
+		}
+		creatorResult <- err
+	}()
+	<-creatorEntered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	openerWaiting := make(chan struct{})
+	type openResult struct {
+		store *Store
+		err   error
+	}
+	openerResult := make(chan openResult, 1)
+	go func() {
+		store, err := openExistingContext(ctx, directory, openExistingHooks{
+			namespaceLock: storeNamespaceLockHooks{
+				beforeProcessWait: func(string) { close(openerWaiting) },
+			},
+		})
+		openerResult <- openResult{store: store, err: err}
+	}()
+	<-openerWaiting
+	cancel()
+	select {
+	case result := <-openerResult:
+		if result.store != nil {
+			_ = result.store.Close()
+			t.Fatal("OpenExistingContext(canceled wait) returned store, want nil")
+		}
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("OpenExistingContext(canceled wait) error = %v, want context.Canceled", result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenExistingContext() did not return after cancellation")
+	}
+
+	close(releaseCreator)
+	if err := <-creatorResult; err != nil {
+		t.Fatalf("newStore(first creator) error = %v", err)
+	}
+	reopened, err := OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting(after canceled waiter) error = %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close(reopened) error = %v", err)
+	}
+	processStoreLocks.Lock()
+	remainingProcessLocks := len(processStoreLocks.entries)
+	processStoreLocks.Unlock()
+	if remainingProcessLocks != 0 {
+		t.Fatalf("process namespace lock entries after cancellation = %d, want 0", remainingProcessLocks)
+	}
+}
+
 func TestStoreNamespaceLockIsStablePrivateSerializationArtifact(t *testing.T) {
 	directory := t.TempDir()
 	store, err := NewStore(directory)
@@ -1052,6 +1238,170 @@ func TestStoreNamespaceLockIsStablePrivateSerializationArtifact(t *testing.T) {
 	afterInfo, err := os.Lstat(lockPath)
 	if err != nil || !os.SameFile(beforeInfo, afterInfo) {
 		t.Fatalf("namespace lock identity changed across reopen: before=%v after=%v error=%v", beforeInfo, afterInfo, err)
+	}
+}
+
+func TestOpenExistingRejectsUntrustedNamespaceLocksWithoutStoreMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func(*testing.T, string)
+		verify func(*testing.T, string)
+	}{
+		{
+			name: "symlinked",
+			setup: func(t *testing.T, path string) {
+				if runtime.GOOS == "windows" {
+					t.Skip("symbolic-link creation is not reliably available to unprivileged Windows tests")
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(lock) error = %v", err)
+				}
+				if err := os.Symlink(filepath.Base(storeIdentitySidecar), path); err != nil {
+					t.Fatalf("Symlink(lock) error = %v", err)
+				}
+			},
+			verify: func(t *testing.T, path string) {
+				if target, err := os.Readlink(path); err != nil || target != filepath.Base(storeIdentitySidecar) {
+					t.Fatalf("Readlink(lock) = (%q, %v), want unchanged identity-sidecar target", target, err)
+				}
+			},
+		},
+		{
+			name: "permissive",
+			setup: func(t *testing.T, path string) {
+				if runtime.GOOS == "windows" {
+					t.Skip("POSIX private mode bits are not meaningful on Windows")
+				}
+				if err := os.Chmod(path, 0o640); err != nil {
+					t.Fatalf("Chmod(lock) error = %v", err)
+				}
+			},
+			verify: func(t *testing.T, path string) {
+				info, err := os.Lstat(path)
+				if err != nil || info.Mode().Perm() != 0o640 {
+					t.Fatalf("Lstat(lock) = (%v, %v), want unchanged 0640 mode", info, err)
+				}
+			},
+		},
+		{
+			name: "non-regular",
+			setup: func(t *testing.T, path string) {
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(lock) error = %v", err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("Mkdir(lock) error = %v", err)
+				}
+			},
+			verify: func(t *testing.T, path string) {
+				info, err := os.Lstat(path)
+				if err != nil || !info.IsDir() {
+					t.Fatalf("Lstat(lock) = (%v, %v), want unchanged directory", info, err)
+				}
+			},
+		},
+		{
+			name: "non-empty",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("lock canary"), 0o600); err != nil {
+					t.Fatalf("WriteFile(lock) error = %v", err)
+				}
+			},
+			verify: func(t *testing.T, path string) {
+				contents, err := os.ReadFile(path)
+				if err != nil || string(contents) != "lock canary" {
+					t.Fatalf("ReadFile(lock) = (%q, %v), want unchanged canary", contents, err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			directory := t.TempDir()
+			store, err := NewStore(directory)
+			if err != nil {
+				t.Fatalf("NewStore(fixture) error = %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close(fixture) error = %v", err)
+			}
+			databasePath := filepath.Join(directory, databaseName)
+			sidecarPath := filepath.Join(directory, storeIdentitySidecar)
+			beforeDatabase, err := os.ReadFile(databasePath)
+			if err != nil {
+				t.Fatalf("ReadFile(database before) error = %v", err)
+			}
+			beforeSidecar, err := os.ReadFile(sidecarPath)
+			if err != nil {
+				t.Fatalf("ReadFile(sidecar before) error = %v", err)
+			}
+			lockPath := filepath.Join(directory, storeNamespaceLockName)
+			tt.setup(t, lockPath)
+
+			opened, openErr := OpenExisting(directory)
+			if opened != nil {
+				_ = opened.Close()
+				t.Fatal("OpenExisting(untrusted lock) returned store, want nil")
+			}
+			if !errors.Is(openErr, index.ErrReindexRequired) {
+				t.Fatalf("OpenExisting(untrusted lock) error = %v, want ErrReindexRequired", openErr)
+			}
+			afterDatabase, databaseErr := os.ReadFile(databasePath)
+			afterSidecar, sidecarErr := os.ReadFile(sidecarPath)
+			if databaseErr != nil || sidecarErr != nil || !bytes.Equal(beforeDatabase, afterDatabase) || !bytes.Equal(beforeSidecar, afterSidecar) {
+				t.Fatalf("OpenExisting(untrusted lock) mutated ready pair: databaseEqual=%v sidecarEqual=%v errors=(%v,%v)", bytes.Equal(beforeDatabase, afterDatabase), bytes.Equal(beforeSidecar, afterSidecar), databaseErr, sidecarErr)
+			}
+			tt.verify(t, lockPath)
+		})
+	}
+}
+
+func TestOpenExistingRejectsNamespaceLockReplacedWhileOpening(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore(fixture) error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(fixture) error = %v", err)
+	}
+	databasePath := filepath.Join(directory, databaseName)
+	sidecarPath := filepath.Join(directory, storeIdentitySidecar)
+	beforeDatabase, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatalf("ReadFile(database before) error = %v", err)
+	}
+	beforeSidecar, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("ReadFile(sidecar before) error = %v", err)
+	}
+
+	opened, openErr := openExisting(directory, openExistingHooks{
+		namespaceLock: storeNamespaceLockHooks{
+			afterFileOpen: func(path string) error {
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+				file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+				if err != nil {
+					return err
+				}
+				return file.Close()
+			},
+		},
+	})
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("openExisting(replaced lock) returned store, want nil")
+	}
+	if !errors.Is(openErr, index.ErrReindexRequired) {
+		t.Fatalf("openExisting(replaced lock) error = %v, want ErrReindexRequired", openErr)
+	}
+	afterDatabase, databaseErr := os.ReadFile(databasePath)
+	afterSidecar, sidecarErr := os.ReadFile(sidecarPath)
+	if databaseErr != nil || sidecarErr != nil || !bytes.Equal(beforeDatabase, afterDatabase) || !bytes.Equal(beforeSidecar, afterSidecar) {
+		t.Fatalf("openExisting(replaced lock) mutated ready pair: databaseEqual=%v sidecarEqual=%v errors=(%v,%v)", bytes.Equal(beforeDatabase, afterDatabase), bytes.Equal(beforeSidecar, afterSidecar), databaseErr, sidecarErr)
 	}
 }
 

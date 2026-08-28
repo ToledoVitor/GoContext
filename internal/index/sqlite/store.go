@@ -413,15 +413,29 @@ func newWriterStore(db *sql.DB, identity string) *Store {
 // without the stable namespace lock are rejected for reindexing rather than
 // silently admitted outside the cooperating-process serialization protocol.
 func OpenExisting(directory string) (*Store, error) {
-	return openExisting(directory, openExistingHooks{})
+	return OpenExistingContext(context.Background(), directory)
+}
+
+// OpenExistingContext is OpenExisting with cancellation for namespace-lock and
+// database-readiness waits. It has the same non-creating absence semantics.
+func OpenExistingContext(ctx context.Context, directory string) (*Store, error) {
+	return openExistingContext(ctx, directory, openExistingHooks{})
 }
 
 type openExistingHooks struct {
 	beforeOperationalConnection func(string) error
 	afterOperationalConnection  func(string) error
+	namespaceLock               storeNamespaceLockHooks
 }
 
 func openExisting(directory string, hooks openExistingHooks) (returnedStore *Store, returnedErr error) {
+	return openExistingContext(context.Background(), directory, hooks)
+}
+
+func openExistingContext(ctx context.Context, directory string, hooks openExistingHooks) (returnedStore *Store, returnedErr error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("open existing sqlite index store: %w", openExistingFailure(err))
+	}
 	if strings.TrimSpace(directory) == "" {
 		return nil, fmt.Errorf("open existing sqlite index store: directory is empty")
 	}
@@ -446,7 +460,13 @@ func openExisting(directory string, hooks openExistingHooks) (returnedStore *Sto
 	databasePath := filepath.Join(canonical, databaseName)
 	beforeInfo, err := os.Lstat(databasePath)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("open existing sqlite index store: %w", index.ErrNotFound)
+		lockInfo, lockErr := os.Lstat(filepath.Join(canonical, storeNamespaceLockName))
+		if errors.Is(lockErr, fs.ErrNotExist) {
+			return nil, fmt.Errorf("open existing sqlite index store: %w", index.ErrNotFound)
+		}
+		if lockErr != nil || validateStoreNamespaceLockInfo(lockInfo) != nil {
+			return nil, formatStoreIdentityError("open existing sqlite index store")
+		}
 	} else if err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: inspect database: %w", err)
 	}
@@ -454,11 +474,16 @@ func openExisting(directory string, hooks openExistingHooks) (returnedStore *Sto
 	if err != nil || !canonicalDirectoryInfo.IsDir() || validatePrivateMode(canonicalDirectoryInfo) != nil {
 		return nil, errors.New("open existing sqlite index store: unsafe private directory")
 	}
-	if err := validateDatabaseFile(beforeInfo, true); err != nil {
-		return nil, fmt.Errorf("open existing sqlite index store: %w", err)
+	if beforeInfo != nil {
+		if err := validateDatabaseFile(beforeInfo, true); err != nil {
+			return nil, fmt.Errorf("open existing sqlite index store: %w", err)
+		}
 	}
-	namespaceLock, err := acquireStoreNamespaceLock(canonical, false)
+	namespaceLock, err := acquireStoreNamespaceLockContextWithHooks(ctx, canonical, false, hooks.namespaceLock)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("open existing sqlite index store: %w", openExistingFailure(err))
+		}
 		return nil, formatStoreIdentityError("open existing sqlite index store")
 	}
 	defer func() {
@@ -482,6 +507,9 @@ func openExisting(directory string, hooks openExistingHooks) (returnedStore *Sto
 		}
 	}()
 	beforeInfo, err = os.Lstat(databasePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("open existing sqlite index store: %w", index.ErrNotFound)
+	}
 	if err != nil || validateDatabaseFile(beforeInfo, true) != nil {
 		return nil, formatStoreIdentityError("open existing sqlite index store")
 	}
@@ -503,7 +531,7 @@ func openExisting(directory string, hooks openExistingHooks) (returnedStore *Sto
 			)
 		}
 	}
-	connection, err := db.Conn(context.Background())
+	connection, err := db.Conn(ctx)
 	if err != nil {
 		closeErr := db.Close()
 		return nil, fmt.Errorf("open existing sqlite index store: %w", openExistingFailure(err, closeErr))
@@ -525,10 +553,10 @@ func openExisting(directory string, hooks openExistingHooks) (returnedStore *Sto
 	if !os.SameFile(beforeInfo, afterOpenInfo) {
 		return closeFailure(errors.New("database identity changed while opening"))
 	}
-	if err := validateSchema(context.Background(), connection); err != nil {
+	if err := validateSchema(ctx, connection); err != nil {
 		return closeFailure(err)
 	}
-	if err := verifyStoreIdentity(context.Background(), connection, storeIdentity); err != nil {
+	if err := verifyStoreIdentity(ctx, connection, storeIdentity); err != nil {
 		return closeFailure(invalidStoreIdentity())
 	}
 	afterValidationInfo, err := secureDatabaseInfo(databasePath)

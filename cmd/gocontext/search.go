@@ -135,7 +135,7 @@ func searchSQLite(
 	config resolvedEmbeddingConfig,
 	stderr io.Writer,
 ) ([]searchdomain.Hit, error) {
-	store, err := indexsqlite.OpenExisting(storePath)
+	store, err := indexsqlite.OpenExistingContext(ctx, storePath)
 	if err != nil {
 		if errors.Is(err, index.ErrNotFound) {
 			return searchMissingSQLite(ctx, storePath, query, config, stderr)

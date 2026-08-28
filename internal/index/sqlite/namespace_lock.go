@@ -1,11 +1,13 @@
 package sqlite
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 const storeNamespaceLockName = ".index-v2.lock"
@@ -34,51 +36,86 @@ type storeNamespaceLock struct {
 }
 
 type processStoreLock struct {
-	mutex sync.Mutex
+	token chan struct{}
 	refs  int
 }
 
+type storeNamespaceLockHooks struct {
+	beforeProcessWait func(string)
+	afterFileOpen     func(string) error
+	beforeFileLock    func(string) error
+}
+
 func acquireStoreNamespaceLock(directory string, allowCreate bool) (*storeNamespaceLock, error) {
+	return acquireStoreNamespaceLockContext(context.Background(), directory, allowCreate)
+}
+
+func acquireStoreNamespaceLockContext(ctx context.Context, directory string, allowCreate bool) (*storeNamespaceLock, error) {
+	return acquireStoreNamespaceLockContextWithHooks(ctx, directory, allowCreate, storeNamespaceLockHooks{})
+}
+
+func acquireStoreNamespaceLockContextWithHooks(
+	ctx context.Context,
+	directory string,
+	allowCreate bool,
+	hooks storeNamespaceLockHooks,
+) (*storeNamespaceLock, error) {
 	path := filepath.Join(directory, storeNamespaceLockName)
-	processEntry := acquireProcessStoreLock(path)
-	fail := func(file *os.File) (*storeNamespaceLock, error) {
+	processEntry, err := acquireProcessStoreLock(ctx, path, hooks.beforeProcessWait)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(file *os.File, operationErr error) (*storeNamespaceLock, error) {
 		if file != nil {
 			_ = file.Close()
 		}
 		releaseProcessStoreLock(path, processEntry)
+		if errors.Is(operationErr, context.Canceled) || errors.Is(operationErr, context.DeadlineExceeded) {
+			return nil, operationErr
+		}
 		return nil, errStoreNamespaceLockFailed
 	}
 
 	file, created, err := openStoreNamespaceLock(path, allowCreate)
 	if err != nil {
-		return fail(nil)
+		return fail(nil, err)
 	}
 	fileInfo, err := file.Stat()
 	if err != nil || validateStoreNamespaceLockInfo(fileInfo) != nil {
-		return fail(file)
+		return fail(file, err)
+	}
+	if hooks.afterFileOpen != nil {
+		if err := hooks.afterFileOpen(path); err != nil {
+			return fail(file, err)
+		}
 	}
 	pathInfo, err := os.Lstat(path)
 	if err != nil || validateStoreNamespaceLockInfo(pathInfo) != nil || !os.SameFile(fileInfo, pathInfo) {
-		return fail(file)
+		return fail(file, err)
 	}
-	if err := lockStoreNamespaceFile(file); err != nil {
-		return fail(file)
+	if hooks.beforeFileLock != nil {
+		if err := hooks.beforeFileLock(path); err != nil {
+			return fail(file, err)
+		}
+	}
+	if err := lockStoreNamespaceFile(ctx, file); err != nil {
+		return fail(file, err)
 	}
 	lockedPathInfo, err := os.Lstat(path)
 	if err != nil || validateStoreNamespaceLockInfo(lockedPathInfo) != nil || !os.SameFile(fileInfo, lockedPathInfo) {
 		_ = unlockStoreNamespaceFile(file)
-		return fail(file)
+		return fail(file, err)
 	}
 	// A fresh creator may be adopting a lock left by an earlier failed attempt.
 	// Flush it again before the ready pair can depend on its survival.
 	if created || allowCreate {
 		if err := file.Sync(); err != nil {
 			_ = unlockStoreNamespaceFile(file)
-			return fail(file)
+			return fail(file, err)
 		}
 		if err := syncStoreDirectory(directory); err != nil {
 			_ = unlockStoreNamespaceFile(file)
-			return fail(file)
+			return fail(file, err)
 		}
 	}
 	return &storeNamespaceLock{
@@ -150,25 +187,57 @@ func (lock *storeNamespaceLock) isHeld() bool {
 	return lock != nil && lock.held
 }
 
-func acquireProcessStoreLock(path string) *processStoreLock {
+func acquireProcessStoreLock(ctx context.Context, path string, beforeWait func(string)) (*processStoreLock, error) {
 	processStoreLocks.Lock()
 	entry := processStoreLocks.entries[path]
 	if entry == nil {
-		entry = &processStoreLock{}
+		entry = &processStoreLock{token: make(chan struct{}, 1)}
+		entry.token <- struct{}{}
 		processStoreLocks.entries[path] = entry
 	}
 	entry.refs++
 	processStoreLocks.Unlock()
-	entry.mutex.Lock()
-	return entry
+	if beforeWait != nil {
+		beforeWait(path)
+	}
+	select {
+	case <-ctx.Done():
+		releaseProcessStoreLockReference(path, entry)
+		return nil, ctx.Err()
+	case <-entry.token:
+		if err := ctx.Err(); err != nil {
+			entry.token <- struct{}{}
+			releaseProcessStoreLockReference(path, entry)
+			return nil, err
+		}
+		return entry, nil
+	}
 }
 
 func releaseProcessStoreLock(path string, entry *processStoreLock) {
-	entry.mutex.Unlock()
+	entry.token <- struct{}{}
+	releaseProcessStoreLockReference(path, entry)
+}
+
+func releaseProcessStoreLockReference(path string, entry *processStoreLock) {
 	processStoreLocks.Lock()
 	entry.refs--
 	if entry.refs == 0 {
 		delete(processStoreLocks.entries, path)
 	}
 	processStoreLocks.Unlock()
+}
+
+// Context-aware platform waiters retry the atomic OS lock operation against
+// this already-open, validated inode. They never poll for lock-path or database
+// publication, and acquisition is followed by the same pathname identity check.
+func waitForStoreNamespaceLockRetry(ctx context.Context) error {
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
