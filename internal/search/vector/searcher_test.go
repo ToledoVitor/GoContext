@@ -140,6 +140,42 @@ func TestSearcherPreflightClassifiesIndexErrorsWithoutLeakingCauses(t *testing.T
 	}
 }
 
+func TestSearcherClassifiesMissingAndStaleIndexesAsVectorUnavailable(t *testing.T) {
+	for _, sentinel := range []error{index.ErrNotFound, index.ErrReindexRequired} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Run("Describe", func(t *testing.T) {
+				backend := &fakeIndex{describeFn: func(context.Context, string) (vector.Metadata, error) {
+					return vector.Metadata{}, fmt.Errorf("PRIVATE_INDEX_CANARY: %w", sentinel)
+				}}
+				_, err := mustSearcher(t, &fakeEmbedder{profile: testProfile()}, backend).Search(context.Background(), validQuery())
+				assertUnavailableIndexError(t, err, sentinel)
+			})
+
+			t.Run("Search", func(t *testing.T) {
+				metadata := testMetadata()
+				backend := &fakeIndex{
+					metadata: metadata,
+					searchFn: func(context.Context, vector.IndexQuery) ([]vector.Candidate, error) {
+						return nil, fmt.Errorf("PRIVATE_INDEX_CANARY: %w", sentinel)
+					},
+				}
+				_, err := mustSearcher(t, validEmbedder(metadata), backend).Search(context.Background(), validQuery())
+				assertUnavailableIndexError(t, err, sentinel)
+			})
+		})
+	}
+}
+
+func assertUnavailableIndexError(t *testing.T, err, original error) {
+	t.Helper()
+	if !errors.Is(err, original) || !errors.Is(err, vector.ErrVectorUnavailable) {
+		t.Fatalf("Search() error = %v, want both %v and ErrVectorUnavailable", err, original)
+	}
+	if strings.Contains(err.Error(), "PRIVATE_INDEX_CANARY") {
+		t.Fatalf("Search() error exposes index cause: %v", err)
+	}
+}
+
 func TestSearcherRejectsMalformedOrIncompatibleMetadataBeforeEmbedding(t *testing.T) {
 	valid := testMetadata()
 	malformed := []struct {

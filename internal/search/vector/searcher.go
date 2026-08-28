@@ -135,13 +135,18 @@ func classifyBackendError(ctx context.Context, err error) error {
 		ErrVectorIntegrity,
 		context.Canceled,
 		context.DeadlineExceeded,
-		index.ErrNotFound,
-		index.ErrReindexRequired,
-		ErrVectorUnavailable,
-		ErrIncompatibleSpace,
-		ErrGenerationChanged,
 	}
 	for _, sentinel := range known {
+		if errors.Is(err, sentinel) {
+			return fmt.Errorf("search vector index: %w", sentinel)
+		}
+	}
+	for _, sentinel := range []error{index.ErrNotFound, index.ErrReindexRequired} {
+		if errors.Is(err, sentinel) {
+			return fmt.Errorf("search vector index: %w", errors.Join(sentinel, ErrVectorUnavailable))
+		}
+	}
+	for _, sentinel := range []error{ErrVectorUnavailable, ErrIncompatibleSpace, ErrGenerationChanged} {
 		if errors.Is(err, sentinel) {
 			return fmt.Errorf("search vector index: %w", sentinel)
 		}
