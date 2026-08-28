@@ -31,9 +31,14 @@ type evalOutputOperations struct {
 	syncFile      func(*os.File) error
 	beforePublish func() error
 	publish       func(*evalOutput, string) error
-	afterPublish  func() error
+	afterPublish  func(string) error
 	unlink        func(*evalOutput, string) error
 	syncDir       func(*os.File) error
+}
+
+type evalReportIdentity struct {
+	info os.FileInfo
+	size int64
 }
 
 type evalFileOperations struct {
@@ -115,11 +120,15 @@ func (output *evalOutput) writeWithOperations(payload []byte, maxBytes int64, op
 	cleanupTemporary := true
 	defer func() {
 		_ = file.Close()
-		if cleanupTemporary {
+		if cleanupTemporary && !output.visible {
 			_ = unix.Unlinkat(int(output.parent.file.Fd()), temporary, 0)
 		}
 	}()
-	if err := operations.writeFile(file, payload); err != nil || file.Chmod(0o600) != nil || operations.syncFile(file) != nil || file.Close() != nil {
+	if err := operations.writeFile(file, payload); err != nil || file.Chmod(0o600) != nil || operations.syncFile(file) != nil {
+		return errEvalOutput
+	}
+	report, err := captureEvalReportIdentity(file, int64(len(payload)))
+	if err != nil || file.Close() != nil {
 		return errEvalOutput
 	}
 	if operations.beforePublish != nil {
@@ -135,26 +144,98 @@ func (output *evalOutput) writeWithOperations(payload []byte, maxBytes int64, op
 	}
 	output.visible = true
 	if operations.afterPublish != nil {
-		if err := operations.afterPublish(); err != nil {
+		if err := operations.afterPublish(temporary); err != nil {
 			return errEvalOutputIndeterminate
 		}
 	}
 	if err := output.revalidate(); err != nil {
 		return errEvalOutputIndeterminate
 	}
-	if err := operations.unlink(output, temporary); err != nil {
-		cleanupTemporary = false
+	if err := output.validateReportLink(output.target, report, 2); err != nil {
 		return errEvalOutputIndeterminate
 	}
-	cleanupTemporary = false
-	if err := output.revalidate(); err != nil {
+	if err := output.validateReportLink(temporary, report, 2); err != nil {
 		return errEvalOutputIndeterminate
 	}
+	// Make the target link durable before considering removal of the only
+	// descriptor-relative recovery name.
 	if err := operations.syncDir(output.parent.file); err != nil {
 		return errEvalOutputIndeterminate
 	}
 	if err := output.revalidate(); err != nil {
 		return errEvalOutputIndeterminate
+	}
+	if err := output.validateReportLink(output.target, report, 2); err != nil {
+		return errEvalOutputIndeterminate
+	}
+	if err := output.validateReportLink(temporary, report, 2); err != nil {
+		return errEvalOutputIndeterminate
+	}
+	if err := operations.unlink(output, temporary); err != nil {
+		return errEvalOutputIndeterminate
+	}
+	cleanupTemporary = false
+	if err := output.revalidate(); err != nil || output.validateReportLink(output.target, report, 1) != nil {
+		return errEvalOutputIndeterminate
+	}
+	if err := operations.syncDir(output.parent.file); err != nil {
+		return errEvalOutputIndeterminate
+	}
+	// This final descriptor-relative reopen is the success boundary. It
+	// protects cooperating-process operation, but cannot prevent a hostile
+	// same-UID process from racing a mutation immediately after the check.
+	if err := output.revalidate(); err != nil || output.validateReportLink(output.target, report, 1) != nil {
+		return errEvalOutputIndeterminate
+	}
+	return nil
+}
+
+func captureEvalReportIdentity(file *os.File, size int64) (*evalReportIdentity, error) {
+	if file == nil {
+		return nil, errEvalOutput
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errEvalOutput
+	}
+	report := &evalReportIdentity{info: info, size: size}
+	if err := validateOpenEvalReport(file, report, 1); err != nil {
+		return nil, err
+	}
+	return report, nil
+}
+
+func (output *evalOutput) validateReportLink(name string, expected *evalReportIdentity, links uint64) error {
+	if output == nil || output.parent == nil || output.parent.file == nil || name == "" || expected == nil || expected.info == nil {
+		return errEvalOutput
+	}
+	descriptor, err := unix.Openat(int(output.parent.file.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return errEvalOutput
+	}
+	file := os.NewFile(uintptr(descriptor), name)
+	validationErr := validateOpenEvalReport(file, expected, links)
+	closeErr := file.Close()
+	if validationErr != nil || closeErr != nil {
+		return errEvalOutput
+	}
+	return nil
+}
+
+func validateOpenEvalReport(file *os.File, expected *evalReportIdentity, links uint64) error {
+	if file == nil || expected == nil || expected.info == nil || links == 0 {
+		return errEvalOutput
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() != expected.size || !os.SameFile(info, expected.info) {
+		return errEvalOutput
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return errEvalOutput
+	}
+	if uint32(stat.Mode)&0o7777 != 0o600 || stat.Uid != uint32(os.Geteuid()) || uint64(stat.Nlink) != links {
+		return errEvalOutput
 	}
 	return nil
 }

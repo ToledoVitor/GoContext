@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest/filesystem"
@@ -59,6 +60,176 @@ func TestEvalOutputPublicationNeverOverwritesCollision(t *testing.T) {
 	if err != nil || string(payload) != "preserve" {
 		t.Fatalf("target/error = %q/%v", payload, err)
 	}
+	assertNoEvalTemporaryFiles(t, directory)
+}
+
+func TestEvalOutputRejectsTargetMutationAfterPublicationWithoutRemovingRecoveryLink(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(target string) error
+		want    string
+		recover bool
+		entries int
+	}{
+		{
+			name: "target unlinked",
+			mutate: func(target string) error {
+				return os.Remove(target)
+			},
+			recover: true,
+			entries: 1,
+		},
+		{
+			name: "target replaced with same-size private file",
+			mutate: func(target string) error {
+				if err := os.Remove(target); err != nil {
+					return err
+				}
+				return os.WriteFile(target, []byte("tampered-report\n"), 0o600)
+			},
+			want:    "tampered-report\n",
+			recover: true,
+			entries: 2,
+		},
+		{
+			name: "target permissions widened",
+			mutate: func(target string) error {
+				return os.Chmod(target, 0o644)
+			},
+			want:    "complete-report\n",
+			entries: 2,
+		},
+		{
+			name: "target content size changes",
+			mutate: func(target string) error {
+				file, err := os.OpenFile(target, os.O_WRONLY|os.O_APPEND, 0)
+				if err != nil {
+					return err
+				}
+				if _, err := file.WriteString("x"); err != nil {
+					_ = file.Close()
+					return err
+				}
+				return file.Close()
+			},
+			want:    "complete-report\nx",
+			entries: 2,
+		},
+		{
+			name: "target gains unexpected hard link",
+			mutate: func(target string) error {
+				return os.Link(target, filepath.Join(filepath.Dir(target), "unexpected-link"))
+			},
+			want:    "complete-report\n",
+			entries: 3,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := secureEvalOutputDirectory(t)
+			target := filepath.Join(directory, "report.json")
+			output, err := prepareEvalOutput(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("complete-report\n")
+			err = output.writeWithOperations(payload, 1024, evalOutputOperations{
+				afterPublish: func(string) error { return test.mutate(target) },
+			})
+			if !errors.Is(err, errEvalOutputIndeterminate) || !output.visible {
+				t.Fatalf("write error/visible = %v/%v", err, output.visible)
+			}
+			if err := output.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if test.want != "" {
+				visible, readErr := os.ReadFile(target)
+				if readErr != nil || string(visible) != test.want {
+					t.Fatalf("target/error = %q/%v", visible, readErr)
+				}
+			}
+			if test.recover && !directoryContainsPrivatePayload(t, directory, payload) {
+				t.Fatal("no recovery link retains the complete report")
+			}
+			assertEvalDirectoryEntryCount(t, directory, test.entries)
+		})
+	}
+}
+
+func TestEvalOutputRejectsTargetOwnerChangeAfterPublicationWhenPrivileged(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("changing file ownership safely requires an isolated privileged test process")
+	}
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "report.json")
+	output, err := prepareEvalOutput(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = output.writeWithOperations([]byte("complete-report\n"), 1024, evalOutputOperations{
+		afterPublish: func(string) error { return os.Chown(target, 65534, -1) },
+	})
+	if !errors.Is(err, errEvalOutputIndeterminate) || !output.visible {
+		t.Fatalf("write error/visible = %v/%v", err, output.visible)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertEvalDirectoryEntryCount(t, directory, 2)
+}
+
+func TestEvalOutputRejectsTemporaryReplacementAfterPublicationAndPreservesTarget(t *testing.T) {
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "report.json")
+	output, err := prepareEvalOutput(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("complete-report\n")
+	err = output.writeWithOperations(payload, 1024, evalOutputOperations{
+		afterPublish: func(temporary string) error {
+			temporaryPath := filepath.Join(directory, temporary)
+			if err := os.Remove(temporaryPath); err != nil {
+				return err
+			}
+			return os.WriteFile(temporaryPath, []byte("tampered-report\n"), 0o600)
+		},
+	})
+	if !errors.Is(err, errEvalOutputIndeterminate) || !output.visible {
+		t.Fatalf("write error/visible = %v/%v", err, output.visible)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	visible, err := os.ReadFile(target)
+	if err != nil || string(visible) != string(payload) {
+		t.Fatalf("target/error = %q/%v", visible, err)
+	}
+}
+
+func TestEvalOutputSuccessfulPublicationLeavesOnePrivateReportLink(t *testing.T) {
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "report.json")
+	output, err := prepareEvalOutput(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("complete-report\n")
+	if err := output.Write(payload, 1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() != int64(len(payload)) {
+		t.Fatalf("target info/error = %#v/%v", info, err)
+	}
+	visible, err := os.ReadFile(target)
+	if err != nil || string(visible) != string(payload) {
+		t.Fatalf("target/error = %q/%v", visible, err)
+	}
+	assertNoEvalTemporaryFiles(t, directory)
 }
 
 func TestEvalOutputPreservesVisibleReportOnDurabilityAmbiguity(t *testing.T) {
@@ -83,6 +254,40 @@ func TestEvalOutputPreservesVisibleReportOnDurabilityAmbiguity(t *testing.T) {
 	if _, err := prepareEvalOutput(target); !errors.Is(err, errEvalOutput) {
 		t.Fatalf("second prepare error = %v", err)
 	}
+	assertEvalDirectoryEntryCount(t, directory, 2)
+}
+
+func TestEvalOutputReopensTargetImmediatelyBeforeSuccess(t *testing.T) {
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "report.json")
+	output, err := prepareEvalOutput(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncCalls := 0
+	err = output.writeWithOperations([]byte("complete-report\n"), 1024, evalOutputOperations{
+		syncDir: func(directory *os.File) error {
+			syncCalls++
+			if syncCalls != 2 {
+				return directory.Sync()
+			}
+			if err := os.Remove(target); err != nil {
+				return err
+			}
+			return os.WriteFile(target, []byte("tampered-report\n"), 0o600)
+		},
+	})
+	if !errors.Is(err, errEvalOutputIndeterminate) || !output.visible || syncCalls != 2 {
+		t.Fatalf("write error/visible/sync calls = %v/%v/%d", err, output.visible, syncCalls)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	visible, err := os.ReadFile(target)
+	if err != nil || string(visible) != "tampered-report\n" {
+		t.Fatalf("target/error = %q/%v", visible, err)
+	}
+	assertEvalDirectoryEntryCount(t, directory, 1)
 }
 
 func TestEvalOutputRejectsParentPathRetargetBeforePublication(t *testing.T) {
@@ -247,7 +452,7 @@ func TestEvalOutputPreservesCommittedReportWhenTrustChangesAfterVisibility(t *te
 			payload := []byte("committed-report\n")
 			var visiblePath string
 			err = output.writeWithOperations(payload, 1024, evalOutputOperations{
-				afterPublish: func() error {
+				afterPublish: func(string) error {
 					var mutateErr error
 					visiblePath, mutateErr = test.mutate(base, root, directory)
 					return mutateErr
@@ -277,4 +482,48 @@ func secureEvalOutputDirectory(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return directory
+}
+
+func assertNoEvalTemporaryFiles(t *testing.T, directory string) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".gocontext-eval-") {
+			t.Fatalf("temporary report remains: %s", entry.Name())
+		}
+	}
+}
+
+func directoryContainsPrivatePayload(t *testing.T, directory string, want []byte) bool {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		info, statErr := os.Stat(path)
+		payload, readErr := os.ReadFile(path)
+		if statErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o600 && readErr == nil && string(payload) == string(want) {
+			return true
+		}
+	}
+	return false
+}
+
+func assertEvalDirectoryEntryCount(t *testing.T, directory string, want int) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != want {
+		t.Fatalf("directory entry count = %d, want %d", len(entries), want)
+	}
 }
