@@ -97,13 +97,15 @@ func (p *Parser) Parse(ctx context.Context, file source.File) ([]source.Symbol, 
 
 		line := strings.TrimSuffix(rawLine, "\r")
 		lineStartsAtTopLevel := true
+		lineRemainsTrustworthy := true
 		if file.Language == source.LanguageJavaScript {
 			lineStartsAtTopLevel = javaScriptState.atTopLevel()
 			if err := javaScriptState.consume(ctx, line); err != nil {
 				return nil, err
 			}
+			lineRemainsTrustworthy = javaScriptState.trustworthy()
 		}
-		if !lineStartsAtTopLevel || line == "" || line != strings.TrimLeft(line, " \t") {
+		if !lineStartsAtTopLevel || !lineRemainsTrustworthy || line == "" || line != strings.TrimLeft(line, " \t") {
 			continue
 		}
 
@@ -205,7 +207,22 @@ func validJavaScriptArrowTail(value string) bool {
 		return false
 	}
 	body := strings.TrimSpace(tail[len("=>"):])
-	return body != "" && !strings.HasPrefix(body, "//") && !strings.HasPrefix(body, "/*")
+	if body == "" || strings.HasPrefix(body, "=>") || strings.HasPrefix(body, "//") ||
+		strings.HasPrefix(body, "/*") {
+		return false
+	}
+	first := body[0]
+	if !isJavaScriptIdentifierStart(first) && !(first >= '0' && first <= '9') &&
+		!strings.ContainsRune("'\"`([{/<+-!~", rune(first)) {
+		return false
+	}
+	keyword, _ := leadingJavaScriptIdentifier(body)
+	switch keyword {
+	case "break", "case", "catch", "const", "continue", "debugger", "default", "do", "else", "export", "finally", "for", "if", "let", "return", "switch", "throw", "try", "var", "while", "yield":
+		return false
+	default:
+		return true
+	}
 }
 
 func validJavaScriptParameterList(value string) (string, bool) {

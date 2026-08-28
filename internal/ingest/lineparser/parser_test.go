@@ -255,7 +255,7 @@ func TestParserJavaScriptFindsOnlySyntacticTopLevelDeclarations(t *testing.T) {
 }
 
 func TestParserJavaScriptValidatesCompleteFunctionParameters(t *testing.T) {
-	lines := []string{
+	invalidLines := []string{
 		"function directOpen(",
 		"function directReserved(return) {}",
 		"function directStrict(interface) {}",
@@ -276,6 +276,25 @@ func TestParserJavaScriptValidatesCompleteFunctionParameters(t *testing.T) {
 		"function bodyless()",
 		"const bodylessExpression = function()",
 		"const bodylessArrow = () =>",
+	}
+	for _, line := range invalidLines {
+		t.Run(line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/invalid-parameters.js", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(symbols) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want none", line, symbols)
+			}
+		})
+	}
+
+	validLines := []string{
 		"function direct(value, other) {}",
 		"const anonymous = function(value) {}",
 		"const namedBinding = function named(value) {}",
@@ -283,9 +302,9 @@ func TestParserJavaScriptValidatesCompleteFunctionParameters(t *testing.T) {
 		"const rest = (...values) => values.length",
 	}
 	file := source.File{
-		Reference: source.Reference{Path: "src/parameters.js", StartLine: 1, EndLine: len(lines)},
+		Reference: source.Reference{Path: "src/parameters.js", StartLine: 1, EndLine: len(validLines)},
 		Language:  source.LanguageJavaScript,
-		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+		Content:   []byte(strings.Join(validLines, "\n") + "\n"),
 	}
 
 	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
@@ -294,11 +313,11 @@ func TestParserJavaScriptValidatesCompleteFunctionParameters(t *testing.T) {
 	}
 
 	want := []source.Symbol{
-		{Name: "direct", Kind: "function", Signature: lines[20], Reference: source.Reference{Path: "src/parameters.js", StartLine: 21, EndLine: 21}},
-		{Name: "anonymous", Kind: "function", Signature: lines[21], Reference: source.Reference{Path: "src/parameters.js", StartLine: 22, EndLine: 22}},
-		{Name: "namedBinding", Kind: "function", Signature: lines[22], Reference: source.Reference{Path: "src/parameters.js", StartLine: 23, EndLine: 23}},
-		{Name: "arrow", Kind: "function", Signature: lines[23], Reference: source.Reference{Path: "src/parameters.js", StartLine: 24, EndLine: 24}},
-		{Name: "rest", Kind: "function", Signature: lines[24], Reference: source.Reference{Path: "src/parameters.js", StartLine: 25, EndLine: 25}},
+		{Name: "direct", Kind: "function", Signature: validLines[0], Reference: source.Reference{Path: "src/parameters.js", StartLine: 1, EndLine: 1}},
+		{Name: "anonymous", Kind: "function", Signature: validLines[1], Reference: source.Reference{Path: "src/parameters.js", StartLine: 2, EndLine: 2}},
+		{Name: "namedBinding", Kind: "function", Signature: validLines[2], Reference: source.Reference{Path: "src/parameters.js", StartLine: 3, EndLine: 3}},
+		{Name: "arrow", Kind: "function", Signature: validLines[3], Reference: source.Reference{Path: "src/parameters.js", StartLine: 4, EndLine: 4}},
+		{Name: "rest", Kind: "function", Signature: validLines[4], Reference: source.Reference{Path: "src/parameters.js", StartLine: 5, EndLine: 5}},
 	}
 	assertSymbols(t, symbols, want)
 }
@@ -339,6 +358,124 @@ func TestParserJavaScriptRegexLiteralsDoNotCorruptLexicalState(t *testing.T) {
 			assertSymbols(t, symbols, want)
 		})
 	}
+}
+
+func TestParserJavaScriptRegexAfterControlHeaderDoesNotCorruptTemplateState(t *testing.T) {
+	lines := []string{
+		"const groupedDivision = (total) / divisor",
+		"call(value) / divisor",
+		"if (check(ready)) /`/.test(value)",
+		"const source = `first",
+		"function fake() {}",
+		"`",
+		"function real() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/control-regex.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "real", Kind: "function", Signature: lines[6], Reference: source.Reference{Path: "src/control-regex.js", StartLine: 7, EndLine: 7}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptIgnoresDeclarationTextInsideMultilineJSX(t *testing.T) {
+	lines := []string{
+		"<section data-label=\"</section>\">",
+		"{ready ? 'function expressionText() {}' : null}",
+		"const fake = () => <span />",
+		"</section>",
+		"function real() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/multiline.jsx", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "real", Kind: "function", Signature: lines[4], Reference: source.Reference{Path: "src/multiline.jsx", StartLine: 5, EndLine: 5}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptRejectsMalformedArrowBodyStarters(t *testing.T) {
+	validLines := []string{
+		"const expressionBody = () => value",
+		"const blockBody = () => { return value }",
+		"const jsxBody = () => <span />",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/arrows.jsx", StartLine: 1, EndLine: len(validLines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(validLines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "expressionBody", Kind: "function", Signature: validLines[0], Reference: source.Reference{Path: "src/arrows.jsx", StartLine: 1, EndLine: 1}},
+		{Name: "blockBody", Kind: "function", Signature: validLines[1], Reference: source.Reference{Path: "src/arrows.jsx", StartLine: 2, EndLine: 2}},
+		{Name: "jsxBody", Kind: "function", Signature: validLines[2], Reference: source.Reference{Path: "src/arrows.jsx", StartLine: 3, EndLine: 3}},
+	}
+	assertSymbols(t, symbols, want)
+
+	invalidLines := []string{
+		"const doubleArrow = () => =>",
+		"const closeParen = () => )",
+		"const throwBody = () => throw value",
+	}
+	for _, line := range invalidLines {
+		t.Run(line, func(t *testing.T) {
+			invalidFile := source.File{
+				Reference: source.Reference{Path: "src/invalid-arrow.js", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(line + "\n"),
+			}
+			got, parseErr := lineparser.NewParser().Parse(context.Background(), invalidFile)
+			if parseErr != nil {
+				t.Fatalf("Parse() error = %v", parseErr)
+			}
+			if len(got) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want none", line, got)
+			}
+		})
+	}
+}
+
+func TestParserJavaScriptRejectsCandidateThatMakesLexicalStateUncertain(t *testing.T) {
+	lines := []string{
+		"const validRegex = () => /closed/.test(value)",
+		"const unterminatedRegex = () => /unterminated",
+		"function inventedAfterMalformedRegex() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/uncertain.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "validRegex", Kind: "function", Signature: lines[0], Reference: source.Reference{Path: "src/uncertain.js", StartLine: 1, EndLine: 1}},
+	}
+	assertSymbols(t, symbols, want)
 }
 
 func TestParserRejectsUnsupportedLanguageAndInvalidReference(t *testing.T) {
