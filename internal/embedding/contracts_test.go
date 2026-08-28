@@ -1,9 +1,11 @@
 package embedding_test
 
 import (
+	"context"
 	"errors"
 	"math"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/embedding"
@@ -131,6 +133,141 @@ func TestValidateBatchRejectsInvalidShapeAndValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateBatchContextMatchesLegacyContract(t *testing.T) {
+	validProfile := embedding.Profile{Fingerprint: "profile", Model: "model"}
+	tests := []struct {
+		name     string
+		batch    embedding.Batch
+		expected int
+		want     error
+	}{
+		{
+			name: "valid",
+			batch: embedding.Batch{
+				Profile:     validProfile,
+				Dimensions:  2,
+				Vectors:     []embedding.Vector{{1, 0}},
+				Requests:    1,
+				UsageTokens: 1,
+			},
+			expected: 1,
+		},
+		{
+			name: "negative usage remains outside the embedding shape contract",
+			batch: embedding.Batch{
+				Profile:     validProfile,
+				Dimensions:  2,
+				Vectors:     []embedding.Vector{{1, 0}},
+				Requests:    1,
+				UsageTokens: -1,
+			},
+			expected: 1,
+		},
+		{
+			name: "invalid metadata",
+			batch: embedding.Batch{
+				Profile:    validProfile,
+				Dimensions: 2,
+				Vectors:    []embedding.Vector{{1, 0}},
+			},
+			expected: 1,
+			want:     embedding.ErrInvalidBatch,
+		},
+		{
+			name: "invalid vector",
+			batch: embedding.Batch{
+				Profile:    validProfile,
+				Dimensions: 2,
+				Vectors:    []embedding.Vector{{0, 0}},
+				Requests:   1,
+			},
+			expected: 1,
+			want:     embedding.ErrInvalidVector,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			legacyErr := embedding.ValidateBatch(test.batch, test.expected)
+			contextErr := embedding.ValidateBatchContext(context.Background(), test.batch, test.expected)
+
+			if !sameValidationOutcome(legacyErr, test.want) {
+				t.Fatalf("ValidateBatch() error = %v, want %v", legacyErr, test.want)
+			}
+			if !sameValidationOutcome(contextErr, test.want) {
+				t.Fatalf("ValidateBatchContext() error = %v, want %v", contextErr, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateBatchContextCancelsDuringSingleHugeVector(t *testing.T) {
+	const dimensions = 1 << 20
+	vector := make(embedding.Vector, dimensions)
+	vector[0] = 1
+	ctx := newValidationCancelContext(32)
+	batch := embedding.Batch{
+		Profile:    embedding.Profile{Fingerprint: "profile", Model: "model"},
+		Dimensions: dimensions,
+		Vectors:    []embedding.Vector{vector},
+		Requests:   1,
+	}
+
+	err := embedding.ValidateBatchContext(ctx, batch, 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ValidateBatchContext() error = %v, want context.Canceled", err)
+	}
+	if calls := ctx.errCalls(); calls < 32 {
+		t.Fatalf("context Err() calls = %d, want cancellation threshold reached", calls)
+	}
+}
+
+func sameValidationOutcome(got, want error) bool {
+	if want == nil {
+		return got == nil
+	}
+	return errors.Is(got, want)
+}
+
+type validationCancelContext struct {
+	context.Context
+	mu       sync.Mutex
+	cancelAt int
+	calls    int
+	done     chan struct{}
+	once     sync.Once
+}
+
+func newValidationCancelContext(cancelAt int) *validationCancelContext {
+	return &validationCancelContext{
+		Context:  context.Background(),
+		cancelAt: cancelAt,
+		done:     make(chan struct{}),
+	}
+}
+
+func (c *validationCancelContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *validationCancelContext) Err() error {
+	c.mu.Lock()
+	c.calls++
+	canceled := c.calls >= c.cancelAt
+	c.mu.Unlock()
+	if !canceled {
+		return nil
+	}
+	c.once.Do(func() { close(c.done) })
+	return context.Canceled
+}
+
+func (c *validationCancelContext) errCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 func cloneBatch(batch embedding.Batch) embedding.Batch {

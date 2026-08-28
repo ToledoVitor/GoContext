@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"math"
 	"reflect"
 	"strings"
 
@@ -214,13 +213,13 @@ func (b *Builder) Replace(ctx context.Context, repositoryID string, corpus sourc
 		}
 		return Report{}, ErrSemanticFailure
 	}
-	if err := validateEmbeddingBatchContext(ctx, batch, len(chunks)); err != nil {
+	if err := embedding.ValidateBatchContext(ctx, batch, len(chunks)); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return Report{}, fmt.Errorf("build index generation: %w", err)
 		}
 		return Report{}, ErrSemanticIntegrity
 	}
-	if batch.Profile != profile {
+	if batch.Profile != profile || batch.UsageTokens < 0 {
 		return Report{}, ErrSemanticIntegrity
 	}
 	if err := ctx.Err(); err != nil {
@@ -342,43 +341,6 @@ func cloneChunksContext(ctx context.Context, chunks []source.Chunk) ([]source.Ch
 		copy(clone[offset:end], chunks[offset:end])
 	}
 	return clone, ctx.Err()
-}
-
-func validateEmbeddingBatchContext(ctx context.Context, batch embedding.Batch, expected int) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if batch.Profile.Fingerprint == "" || batch.Profile.Model == "" || batch.Dimensions <= 0 ||
-		batch.Requests <= 0 || batch.UsageTokens < 0 || len(batch.Vectors) != expected {
-		return embedding.ErrInvalidBatch
-	}
-	for vectorPosition, vector := range batch.Vectors {
-		if vectorPosition%builderContextStride == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		if len(vector) != batch.Dimensions {
-			return embedding.ErrInvalidVector
-		}
-		nonZero := false
-		for componentPosition, value := range vector {
-			if componentPosition%builderContextStride == 0 {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-			}
-			component := float64(value)
-			if math.IsNaN(component) || math.IsInf(component, 0) {
-				return embedding.ErrInvalidVector
-			}
-			nonZero = nonZero || value != 0
-		}
-		if !nonZero {
-			return embedding.ErrInvalidVector
-		}
-	}
-	return ctx.Err()
 }
 
 func copyVectorContext(ctx context.Context, vector embedding.Vector) (embedding.Vector, error) {

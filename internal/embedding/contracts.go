@@ -16,6 +16,8 @@ var (
 	ErrInvalidVector = errors.New("invalid embedding vector")
 )
 
+const validateBatchContextStride = 256
+
 // Purpose identifies how an embedding will be used.
 type Purpose string
 
@@ -50,17 +52,36 @@ type Embedder interface {
 
 // ValidateBatch verifies embedding metadata, shape, and values.
 func ValidateBatch(batch Batch, expected int) error {
+	return ValidateBatchContext(context.Background(), batch, expected)
+}
+
+// ValidateBatchContext verifies embedding metadata, shape, and values while
+// allowing cancellation to interrupt validation of large batches or vectors.
+func ValidateBatchContext(ctx context.Context, batch Batch, expected int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if batch.Profile.Fingerprint == "" || batch.Profile.Model == "" || batch.Dimensions <= 0 || batch.Requests <= 0 || len(batch.Vectors) != expected {
 		return ErrInvalidBatch
 	}
 
-	for _, vector := range batch.Vectors {
+	for vectorPosition, vector := range batch.Vectors {
+		if vectorPosition%validateBatchContextStride == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if len(vector) != batch.Dimensions {
 			return ErrInvalidVector
 		}
 
 		nonZero := false
-		for _, value := range vector {
+		for componentPosition, value := range vector {
+			if componentPosition%validateBatchContextStride == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			component := float64(value)
 			if math.IsNaN(component) || math.IsInf(component, 0) {
 				return ErrInvalidVector
@@ -72,5 +93,5 @@ func ValidateBatch(batch Batch, expected int) error {
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
