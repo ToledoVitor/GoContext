@@ -26,6 +26,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "index":
 		return runIndex(context.Background(), args[1:], stdout, stderr)
+	case "search":
+		return runSearch(context.Background(), args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		printUsage(stdout)
 		return 0
@@ -40,4 +42,5 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, "uso: gocontext <comando> [opções]")
 	fmt.Fprintln(writer, "comandos:")
 	fmt.Fprintln(writer, "  index    indexa repositório local")
+	fmt.Fprintln(writer, "  search   consulta snapshot local")
 }
