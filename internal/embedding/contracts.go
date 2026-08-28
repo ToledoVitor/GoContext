@@ -8,6 +8,8 @@ import (
 )
 
 var (
+	// ErrSemanticUnavailable reports an exhausted temporary embedding failure.
+	ErrSemanticUnavailable = errors.New("semantic embedding unavailable")
 	// ErrInvalidBatch reports invalid embedding batch metadata or shape.
 	ErrInvalidBatch = errors.New("invalid embedding batch")
 	// ErrInvalidVector reports an invalid vector dimension or value.

@@ -2,6 +2,7 @@
 package openaicompat
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +38,7 @@ var (
 	errInvalidMaxInFlight   = errors.New("embedding max in-flight cannot be negative")
 	errInvalidTimeout       = errors.New("embedding timeout cannot be negative")
 	errInvalidMaxRetries    = errors.New("embedding max retries cannot be negative")
+	errNonLoopbackPeer      = errors.New("embedding HTTP peer is not loopback")
 )
 
 // Config configures an OpenAI-compatible embedding client.
@@ -57,6 +60,8 @@ type Client struct {
 	endpoint   *url.URL
 	profile    embedding.Profile
 	httpClient *http.Client
+	now        func() time.Time
+	sleep      func(context.Context, time.Duration) error
 }
 
 // New validates config and creates an OpenAI-compatible embedding client.
@@ -82,11 +87,15 @@ func New(config Config) (*Client, error) {
 		return nil, err
 	}
 
+	dialContext := (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	if baseURL.Scheme == "http" {
+		dialContext = requireLoopbackPeer(dialContext)
+	}
 	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:           dialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -98,6 +107,8 @@ func New(config Config) (*Client, error) {
 		config:   config,
 		endpoint: &endpoint,
 		profile:  profile,
+		now:      time.Now,
+		sleep:    sleepContext,
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   config.Timeout,
@@ -106,6 +117,35 @@ func New(config Config) (*Client, error) {
 			},
 		},
 	}, nil
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+type dialContextFunc func(context.Context, string, string) (net.Conn, error)
+
+func requireLoopbackPeer(dial dialContextFunc) dialContextFunc {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		connection, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+
+		remote, ok := connection.RemoteAddr().(*net.TCPAddr)
+		if !ok || remote.IP == nil || !remote.IP.IsLoopback() {
+			_ = connection.Close()
+			return nil, errNonLoopbackPeer
+		}
+		return connection, nil
+	}
 }
 
 // Profile returns the compatibility profile produced by this client.
@@ -129,6 +169,9 @@ func normalizeBaseURL(raw string) (*url.URL, error) {
 	if parsed.RawPath != "" || (parsed.Path != "/v1" && parsed.Path != "/v1/") {
 		return nil, errInvalidBaseURL
 	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return nil, errInvalidBaseURL
+	}
 
 	hostname := parsed.Hostname()
 	ip := net.ParseIP(hostname)
@@ -144,12 +187,23 @@ func normalizeBaseURL(raw string) (*url.URL, error) {
 		hostname = strings.ToLower(hostname)
 	}
 
+	normalizedPort := ""
+	if rawPort := parsed.Port(); rawPort != "" {
+		port, err := strconv.ParseUint(rawPort, 10, 16)
+		if err != nil || port == 0 {
+			return nil, errInvalidBaseURL
+		}
+		if !((scheme == "https" && port == 443) || (scheme == "http" && port == 80)) {
+			normalizedPort = strconv.FormatUint(port, 10)
+		}
+	}
+
 	host := hostname
 	if strings.Contains(hostname, ":") {
 		host = "[" + hostname + "]"
 	}
-	if port := parsed.Port(); port != "" {
-		host += ":" + port
+	if normalizedPort != "" {
+		host += ":" + normalizedPort
 	}
 
 	return &url.URL{

@@ -46,6 +46,18 @@ func TestConfigAcceptsSafeEndpointsAndNormalizesEmbeddingsURL(t *testing.T) {
 			wantBaseURL:  "http://[::1]:11434/v1",
 			wantEndpoint: "http://[::1]:11434/v1/embeddings",
 		},
+		{
+			name:         "canonical non-default port",
+			baseURL:      "https://API.Example.com:008443/v1",
+			wantBaseURL:  "https://api.example.com:8443/v1",
+			wantEndpoint: "https://api.example.com:8443/v1/embeddings",
+		},
+		{
+			name:         "canonical default HTTPS port",
+			baseURL:      "https://api.example.com:443/v1",
+			wantBaseURL:  "https://api.example.com/v1",
+			wantEndpoint: "https://api.example.com/v1/embeddings",
+		},
 	}
 
 	for _, test := range tests {
@@ -87,6 +99,9 @@ func TestConfigRejectsUnsafeOrInvalidValuesWithoutLeakingCredential(t *testing.T
 		{name: "embeddings path supplied", change: func(config *Config) { config.BaseURL = "https://api.example.com/v1/embeddings" }},
 		{name: "dot segment path", change: func(config *Config) { config.BaseURL = "https://api.example.com/v1/../v1" }},
 		{name: "encoded path separator", change: func(config *Config) { config.BaseURL = "https://api.example.com/v1%2fembeddings" }},
+		{name: "zero port", change: func(config *Config) { config.BaseURL = "https://api.example.com:0/v1" }},
+		{name: "port above range", change: func(config *Config) { config.BaseURL = "https://api.example.com:65536/v1" }},
+		{name: "empty port", change: func(config *Config) { config.BaseURL = "https://api.example.com:/v1" }},
 		{name: "empty model", change: func(config *Config) { config.Model = "" }},
 		{name: "whitespace model", change: func(config *Config) { config.Model = " \t" }},
 		{name: "negative dimensions", change: func(config *Config) { config.Dimensions = -1 }},
@@ -158,6 +173,37 @@ func TestConfigCreatesPrivateTransportWithoutProxyOrRedirects(t *testing.T) {
 	}
 	if err := client.httpClient.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
 		t.Fatalf("CheckRedirect() error = %v, want %v", err, http.ErrUseLastResponse)
+	}
+
+	second, err := New(validConfig())
+	if err != nil {
+		t.Fatalf("New(second) error = %v", err)
+	}
+	if second.httpClient == client.httpClient || second.httpClient.Transport == client.httpClient.Transport {
+		t.Fatal("clients share HTTP client or transport")
+	}
+}
+
+func TestConfigAcceptsPositiveOptionsAndProviderSelectedDimensions(t *testing.T) {
+	config := validConfig()
+	config.Dimensions = 0
+	config.BatchSize = 7
+	config.MaxBatchBytes = 8192
+	config.MaxInFlight = 3
+	config.Timeout = 4 * time.Second
+	config.MaxRetries = 1
+
+	client, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if client.config.Dimensions != 0 ||
+		client.config.BatchSize != 7 ||
+		client.config.MaxBatchBytes != 8192 ||
+		client.config.MaxInFlight != 3 ||
+		client.config.Timeout != 4*time.Second ||
+		client.config.MaxRetries != 1 {
+		t.Fatalf("New() config = %#v, want explicit options unchanged", client.config)
 	}
 }
 
