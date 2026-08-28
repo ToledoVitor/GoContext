@@ -12,6 +12,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -33,9 +34,29 @@ type repositoryHandle interface {
 
 type openPathFunc func(directory repositoryHandle, name string, wantDirectory bool) (repositoryHandle, error)
 
+type repositoryEntryMetadata struct {
+	mode     os.FileMode
+	size     int64
+	identity any
+}
+
+func (info repositoryEntryMetadata) IsDir() bool       { return info.mode.IsDir() }
+func (info repositoryEntryMetadata) Mode() os.FileMode { return info.mode }
+func (info repositoryEntryMetadata) Size() int64       { return info.size }
+
 // Scanner reads supported source files without following directory symlinks.
 type Scanner struct {
 	openPath openPathFunc
+}
+
+// OpenedRoot is an opaque, retained repository directory. It binds a scan to
+// the exact filesystem object that passed preflight even if its path is later
+// renamed or replaced.
+type OpenedRoot struct {
+	mu         sync.Mutex
+	repository repositoryHandle
+	identity   os.FileInfo
+	used       bool
 }
 
 // NewScanner creates a scanner with the built-in, non-overridable policy.
@@ -43,37 +64,126 @@ func NewScanner() *Scanner {
 	return &Scanner{}
 }
 
+// OpenRoot opens and validates a repository root without traversing it.
+func OpenRoot(root string) (*OpenedRoot, error) {
+	if root == "" {
+		return nil, fmt.Errorf("scan repository: root is empty")
+	}
+	repository, err := openRootNoFollow(root)
+	if err != nil {
+		return nil, fmt.Errorf("scan repository: open root failed")
+	}
+	rootInfo, err := repository.Stat()
+	if err != nil || !rootInfo.IsDir() {
+		_ = repository.Close()
+		if err != nil {
+			return nil, fmt.Errorf("scan repository: inspect root failed")
+		}
+		return nil, fmt.Errorf("scan repository: root is not a directory")
+	}
+	return &OpenedRoot{repository: repository, identity: rootInfo}, nil
+}
+
 // Scan discovers safe Python and TypeScript files below an authorized root.
 func (s *Scanner) Scan(ctx context.Context, root string) (ingest.ScanResult, error) {
-	result := ingest.ScanResult{
-		PolicyVersion: ingest.ScanPolicyVersion,
-		Report:        newScanReport(),
-	}
 	if err := ctx.Err(); err != nil {
 		return ingest.ScanResult{}, err
 	}
-	if root == "" {
-		return ingest.ScanResult{}, fmt.Errorf("scan repository: root is empty")
-	}
-
-	repository, err := openRootNoFollow(root)
+	opened, err := OpenRoot(root)
 	if err != nil {
-		return ingest.ScanResult{}, fmt.Errorf("scan repository: open root failed")
+		return ingest.ScanResult{}, err
 	}
-	defer repository.Close()
+	result, scanErr := s.ScanOpened(ctx, opened)
+	closeErr := opened.Close()
+	if scanErr != nil {
+		return ingest.ScanResult{}, scanErr
+	}
+	if closeErr != nil {
+		return ingest.ScanResult{}, fmt.Errorf("scan repository: close root failed")
+	}
+	return result, nil
+}
 
-	rootInfo, err := repository.Stat()
-	if err != nil {
-		return ingest.ScanResult{}, fmt.Errorf("scan repository: inspect root failed")
+// ScanOpened traverses an already-authorized root exactly once. The caller
+// retains ownership of the handle and must close it.
+func (s *Scanner) ScanOpened(ctx context.Context, opened *OpenedRoot) (ingest.ScanResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ingest.ScanResult{}, err
 	}
-	if !rootInfo.IsDir() {
-		return ingest.ScanResult{}, fmt.Errorf("scan repository: root is not a directory")
+	if opened == nil {
+		return ingest.ScanResult{}, fmt.Errorf("scan repository: opened root is invalid")
+	}
+	opened.mu.Lock()
+	if opened.repository == nil || opened.used {
+		opened.mu.Unlock()
+		return ingest.ScanResult{}, fmt.Errorf("scan repository: opened root is invalid")
+	}
+	opened.used = true
+	repository := opened.repository
+	identity := opened.identity
+	opened.mu.Unlock()
+	currentInfo, err := repository.Stat()
+	if err != nil || !currentInfo.IsDir() || !os.SameFile(identity, currentInfo) {
+		return ingest.ScanResult{}, fmt.Errorf("scan repository: opened root changed")
+	}
+	result := ingest.ScanResult{
+		PolicyVersion: ingest.ScanPolicyVersion,
+		Report:        newScanReport(),
 	}
 
 	if err := s.scanDirectory(ctx, repository, ".", &result); err != nil {
 		return ingest.ScanResult{}, fmt.Errorf("scan repository: %w", err)
 	}
 	return result, nil
+}
+
+// MatchesPath reports whether path currently names the retained root object.
+func (root *OpenedRoot) MatchesPath(path string) bool {
+	if root == nil {
+		return false
+	}
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	if root.repository == nil {
+		return false
+	}
+	current, err := root.repository.Stat()
+	pathInfo, pathErr := os.Lstat(path)
+	return err == nil && pathErr == nil && current.IsDir() && pathInfo.IsDir() &&
+		os.SameFile(root.identity, current) && os.SameFile(current, pathInfo)
+}
+
+// CompareIdentity compares info with the retained root and reports descriptor
+// failures separately from an ordinary identity mismatch.
+func (root *OpenedRoot) CompareIdentity(info os.FileInfo) (bool, error) {
+	if root == nil || info == nil {
+		return false, fmt.Errorf("scan repository: opened root is invalid")
+	}
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	if root.repository == nil {
+		return false, fmt.Errorf("scan repository: opened root is invalid")
+	}
+	current, err := root.repository.Stat()
+	if err != nil || !current.IsDir() || !os.SameFile(root.identity, current) {
+		return false, fmt.Errorf("scan repository: opened root changed")
+	}
+	return os.SameFile(current, info), nil
+}
+
+// Close releases the retained root descriptor.
+func (root *OpenedRoot) Close() error {
+	if root == nil {
+		return nil
+	}
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	if root.repository == nil {
+		return nil
+	}
+	err := root.repository.Close()
+	root.repository = nil
+	return err
 }
 
 func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle, relativeDirectory string, result *ingest.ScanResult) error {
@@ -112,33 +222,22 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			continue
 		}
 
-		var entryInfo os.FileInfo
-		var err error
-		isDirectory := entry.IsDir()
-		if entry.Type() == 0 {
-			entryInfo, err = entry.Info()
-			if err != nil {
-				return sanitizedPathError("inspect-entry", relativePath)
-			}
-			if entryInfo.Mode()&os.ModeSymlink != 0 {
-				addExclusion(&result.Report, ingest.ExclusionSymlink)
-				continue
-			}
-			isDirectory = entryInfo.IsDir()
+		entryInfo, err := inspectRepositoryEntry(directory, entry.Name(), entry)
+		if err != nil {
+			return sanitizedPathError("inspect-entry", relativePath)
 		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			addExclusion(&result.Report, ingest.ExclusionSymlink)
+			continue
+		}
+		isDirectory := entryInfo.IsDir()
 		if isDirectory {
-			if entryInfo == nil {
-				entryInfo, err = entry.Info()
-			}
-			if err != nil {
-				return sanitizedPathError("inspect-directory", relativePath)
-			}
 			childDirectory, err := s.openRepositoryPath(directory, entry.Name(), true)
 			if err != nil {
 				return sanitizedPathError("open-directory", relativePath)
 			}
 			openedInfo, statErr := childDirectory.Stat()
-			if statErr != nil || !openedInfo.IsDir() || !os.SameFile(entryInfo, openedInfo) {
+			if statErr != nil || !openedInfo.IsDir() || !sameRepositoryEntry(entryInfo, childDirectory) {
 				_ = childDirectory.Close()
 				return sanitizedPathError("directory-changed", relativePath)
 			}
@@ -158,12 +257,6 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 
 		language, supported := languageForPath(relativePath)
 		if !supported {
-			if entryInfo == nil {
-				entryInfo, err = entry.Info()
-				if err != nil {
-					return sanitizedPathError("inspect-unsupported", relativePath)
-				}
-			}
 			var unsupportedBytes int64
 			if entryInfo.Mode().IsRegular() {
 				unsupportedBytes = entryInfo.Size()
@@ -172,12 +265,6 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			continue
 		}
 
-		if entryInfo == nil {
-			entryInfo, err = entry.Info()
-			if err != nil {
-				return sanitizedPathError("inspect-file", relativePath)
-			}
-		}
 		if !entryInfo.Mode().IsRegular() {
 			addExclusion(&result.Report, ingest.ExclusionNonRegular)
 			continue
@@ -194,7 +281,7 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			return sanitizedPathError("open-file", relativePath)
 		}
 		openedInfo, statErr := file.Stat()
-		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(entryInfo, openedInfo) {
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !sameRepositoryEntry(entryInfo, file) {
 			_ = file.Close()
 			return sanitizedPathError("file-changed", relativePath)
 		}

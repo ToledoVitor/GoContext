@@ -106,15 +106,7 @@ func validInventory(value InventoryReport) bool {
 }
 
 func allowedUnsupportedExtension(extension Extension) bool {
-	allowed := map[Extension]struct{}{
-		".bash": {}, ".c": {}, ".cc": {}, ".cpp": {}, ".cs": {}, ".css": {}, ".csv": {}, ".go": {},
-		".h": {}, ".hpp": {}, ".html": {}, ".java": {}, ".js": {}, ".jsx": {}, ".json": {}, ".kt": {},
-		".kts": {}, ".less": {}, ".log": {}, ".lua": {}, ".md": {}, ".php": {}, ".rb": {}, ".rs": {},
-		".sass": {}, ".scala": {}, ".scss": {}, ".sh": {}, ".sql": {}, ".swift": {}, ".toml": {},
-		".txt": {}, ".vue": {}, ".xml": {}, ".yaml": {}, ".yml": {}, ".zsh": {}, "<other>": {}, "<none>": {},
-	}
-	_, ok := allowed[extension]
-	return ok
+	return ingest.SafeUnsupportedExtensionBucket(string(extension))
 }
 
 func validRetrieval(value RetrievalReport) bool {

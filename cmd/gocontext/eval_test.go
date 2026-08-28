@@ -110,6 +110,38 @@ func TestRunEvalInventoryRejectsChecklistSchemaVariantsBeforeScanning(t *testing
 			payload, _ := json.Marshal(value)
 			return append(payload[:len(payload)-1], []byte(`,"owner_authorized":true}`)...)
 		}, mode: 0o600},
+		{name: "case variant", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			return bytes.Replace(payload, []byte(`"owner_authorized"`), []byte(`"Owner_Authorized"`), 1)
+		}, mode: 0o600},
+		{name: "nested unknown", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			return bytes.Replace(payload, []byte(`"max_auto_queries":100`), []byte(`"max_auto_queries":100,"unknown":1`), 1)
+		}, mode: 0o600},
+		{name: "nested duplicate", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			return bytes.Replace(payload, []byte(`"max_auto_queries":100`), []byte(`"max_auto_queries":100,"max_auto_queries":100`), 1)
+		}, mode: 0o600},
+		{name: "nested case variant", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			return bytes.Replace(payload, []byte(`"max_auto_queries"`), []byte(`"Max_Auto_Queries"`), 1)
+		}, mode: 0o600},
+		{name: "boolean wrong type", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			return bytes.Replace(payload, []byte(`"owner_authorized":true`), []byte(`"owner_authorized":1`), 1)
+		}, mode: 0o600},
+		{name: "budgets wrong type", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			start := bytes.Index(payload, []byte(`"budgets":`))
+			if start < 0 {
+				return payload
+			}
+			return append(append([]byte(nil), payload[:start]...), []byte(`"budgets":true}`)...)
+		}, mode: 0o600},
+		{name: "budget wrong type", payload: func(value evaluation.Checklist) []byte {
+			payload, _ := json.Marshal(value)
+			return bytes.Replace(payload, []byte(`"max_auto_queries":100`), []byte(`"max_auto_queries":"100"`), 1)
+		}, mode: 0o600},
 		{name: "trailing", payload: func(value evaluation.Checklist) []byte {
 			payload, _ := json.Marshal(value)
 			return append(payload, []byte(` {}`)...)
@@ -301,6 +333,39 @@ func TestRunEvalInventoryRejectsDuplicateExplicitFlagsWithoutWriting(t *testing.
 	}
 }
 
+func TestRunEvalInventoryScansRetainedApprovedRootAfterPathReplacement(t *testing.T) {
+	fixture := newEvalCLIFixture(t)
+	writeEvalCLIFile(t, fixture.root, "approved.py", "def Approved():\n    return 1\n")
+	replacement := filepath.Join(filepath.Dir(fixture.root), "replacement")
+	if err := os.Mkdir(replacement, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeEvalCLIFile(t, replacement, "substituted.py", "def Substituted():\n    return 1\n")
+	writeEvalCLIFile(t, replacement, "second.py", "def Second():\n    return 2\n")
+	retained := fixture.root + "-retained"
+	composition := defaultEvalCLIComposition()
+	composition.afterOpenRoot = func() error {
+		if err := os.Rename(fixture.root, retained); err != nil {
+			return err
+		}
+		return os.Rename(replacement, fixture.root)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := runEvalWithComposition(context.Background(), evalCLIArgs(fixture)[1:], &stdout, &stderr, composition)
+	if exitCode != 0 || stdout.String() != "evaluation: go\n" || stderr.Len() != 0 {
+		t.Fatalf("exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+	}
+	var report evaluation.Report
+	payload, err := os.ReadFile(fixture.output)
+	if err != nil || json.Unmarshal(payload, &report) != nil {
+		t.Fatalf("report read/decode error = %v", err)
+	}
+	if report.Inventory.IncludedFiles != 1 {
+		t.Fatalf("included files = %d, want retained tree's one file", report.Inventory.IncludedFiles)
+	}
+}
+
 type evalCLIFixture struct {
 	root      string
 	checklist string
@@ -341,8 +406,10 @@ func validEvalChecklist() evaluation.Checklist {
 		OwnerAuthorized: true, RootReadOnly: true, Task13TaintGatePassed: true,
 		SemanticFixedOff: true, ExternalNetworkProhibited: true, OutputReviewedAsAggregates: true,
 		CacheOutputOutsideRepository: true, RollbackIsCacheDiscard: true,
-		MaxDurationMilliseconds: 30_000, MaxEligibleBytes: 1 << 20, MaxEligibleFiles: 100,
-		MaxOutputBytes: 1 << 20, MaxAutoQueries: 100,
+		Budget: evaluation.ChecklistBudgets{
+			MaxDurationMilliseconds: 30_000, MaxEligibleBytes: 1 << 20, MaxEligibleFiles: 100,
+			MaxOutputBytes: 1 << 20, MaxAutoQueries: 100,
+		},
 	}
 }
 

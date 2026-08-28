@@ -136,6 +136,58 @@ func TestScannerRejectsRepositoryRootSymlink(t *testing.T) {
 	}
 }
 
+func TestScanOpenedUsesRetainedRootWhenPathIsReplaced(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	replacement := filepath.Join(base, "replacement")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(replacement, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeInternalFile(t, root, "approved.py", "print('approved')\n")
+	writeInternalFile(t, replacement, "substituted.py", "print('substituted')\n")
+
+	opened, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	if err := os.Rename(root, filepath.Join(base, "approved-retained")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, root); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewScanner().ScanOpened(context.Background(), opened)
+	if err != nil {
+		t.Fatalf("ScanOpened() error = %v", err)
+	}
+	if len(result.Files) != 1 || result.Files[0].Reference.Path != "approved.py" {
+		t.Fatalf("ScanOpened() files = %#v, want retained approved.py", result.Files)
+	}
+	if opened.MatchesPath(root) {
+		t.Fatal("MatchesPath(replaced root) = true")
+	}
+}
+
+func TestScanOpenedRejectsReuse(t *testing.T) {
+	root := t.TempDir()
+	opened, err := OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	if _, err := NewScanner().ScanOpened(context.Background(), opened); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewScanner().ScanOpened(context.Background(), opened); err == nil {
+		t.Fatal("second ScanOpened() error = nil")
+	}
+}
+
 type readErrorFile struct {
 	*os.File
 }

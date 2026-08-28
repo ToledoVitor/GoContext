@@ -95,13 +95,16 @@ func EvaluateMetrics(
 				Text:         evaluationCase.Query,
 				Limit:        10,
 			})
-			finished := now()
 			if searchErr != nil {
 				if ctx.Err() != nil {
 					return MetricAggregate{}, ctx.Err()
 				}
 				return MetricAggregate{}, ErrMetrics
 			}
+			if err := ctx.Err(); err != nil {
+				return MetricAggregate{}, err
+			}
+			finished := now()
 			if len(hits) > 10 || finished.Before(started) {
 				return MetricAggregate{}, ErrMetrics
 			}
@@ -109,10 +112,13 @@ func EvaluateMetrics(
 			runs[run] = append([]search.Hit(nil), hits...)
 			seenHits := make(map[string]struct{}, len(hits))
 			for _, hit := range hits {
+				_, duplicate := seenHits[hit.Chunk.ID]
+				if duplicate {
+					return MetricAggregate{}, ErrMetrics
+				}
 				citations++
 				canonicalChunk, present := canonical[hit.Chunk.ID]
-				_, duplicate := seenHits[hit.Chunk.ID]
-				if present && !duplicate && canonicalChunk == hit.Chunk {
+				if present && canonicalChunk == hit.Chunk {
 					validCitations++
 				}
 				seenHits[hit.Chunk.ID] = struct{}{}
@@ -131,6 +137,9 @@ func EvaluateMetrics(
 		evaluatedCases++
 	}
 
+	if err := ctx.Err(); err != nil {
+		return MetricAggregate{}, err
+	}
 	if evaluatedCases == 0 {
 		return MetricAggregate{Report: report}, nil
 	}
@@ -152,6 +161,9 @@ func EvaluateMetrics(
 	report.FallbackReason = FallbackLexicalBaseline
 
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
+	if err := ctx.Err(); err != nil {
+		return MetricAggregate{}, err
+	}
 	return MetricAggregate{
 		Report:         report,
 		QueryP50Micros: percentileMicros(latencies, 0.50),

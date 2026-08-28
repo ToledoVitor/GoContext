@@ -14,6 +14,7 @@ import (
 type sequenceSearcher struct {
 	results [][]search.Hit
 	calls   int
+	cancel  context.CancelFunc
 }
 
 func (searcher *sequenceSearcher) Search(ctx context.Context, query search.Query) ([]search.Hit, error) {
@@ -22,6 +23,9 @@ func (searcher *sequenceSearcher) Search(ctx context.Context, query search.Query
 	}
 	result := searcher.results[searcher.calls]
 	searcher.calls++
+	if searcher.cancel != nil {
+		searcher.cancel()
+	}
 	return append([]search.Hit(nil), result...), nil
 }
 
@@ -146,6 +150,54 @@ func TestEvaluateMetricsRejectsUnknownRelevantIDAndSearcherLimitViolation(t *tes
 	}}, evaluation.MetricOptions{})
 	if err == nil || searcher.calls != 1 {
 		t.Fatalf("limit violation error/calls = %v/%d", err, searcher.calls)
+	}
+}
+
+func TestEvaluateMetricsRejectsDuplicateSearchHitIDsBeforeComputingQuality(t *testing.T) {
+	canonical := []source.Chunk{metricChunk("a", "one.py", 1)}
+	duplicate := []search.Hit{{Chunk: canonical[0]}, {Chunk: canonical[0]}}
+	searcher := &sequenceSearcher{results: [][]search.Hit{duplicate}}
+
+	_, err := evaluation.EvaluateMetrics(context.Background(), searcher, "repo-a1", canonical, []evaluation.Case{{
+		Category: evaluation.CategoryExactSymbol, Query: "symbol", RelevantChunkIDs: []string{"a"},
+	}}, evaluation.MetricOptions{})
+	if err == nil || searcher.calls != 1 {
+		t.Fatalf("duplicate hit error/calls = %v/%d", err, searcher.calls)
+	}
+}
+
+func TestEvaluateMetricsQualityRatiosRemainBounded(t *testing.T) {
+	canonical := []source.Chunk{
+		metricChunk("a", "one.py", 1), metricChunk("b", "two.py", 2), metricChunk("x", "other.py", 3),
+	}
+	hits := []search.Hit{{Chunk: canonical[0]}, {Chunk: canonical[2]}, {Chunk: canonical[1]}}
+	result, err := evaluation.EvaluateMetrics(context.Background(), &sequenceSearcher{results: [][]search.Hit{hits, hits}}, "repo-a1", canonical, []evaluation.Case{{
+		Category: evaluation.CategoryExactSymbol, Query: "symbol", RelevantChunkIDs: []string{"a", "b"},
+	}}, evaluation.MetricOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := result.Report.Categories[evaluation.CategoryExactSymbol]
+	for name, value := range map[string]float64{
+		"recall@5": metrics.RecallAt5, "recall@10": metrics.RecallAt10,
+		"mrr@10": metrics.MRRAt10, "ndcg@10": metrics.NDCGAt10,
+	} {
+		if value < 0 || value > 1 {
+			t.Fatalf("%s = %v, want [0,1]", name, value)
+		}
+	}
+}
+
+func TestEvaluateMetricsReturnsCancellationAfterSuccessfulSearch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	canonical := []source.Chunk{metricChunk("a", "one.py", 1)}
+	searcher := &sequenceSearcher{results: [][]search.Hit{{{Chunk: canonical[0]}}}, cancel: cancel}
+
+	_, err := evaluation.EvaluateMetrics(ctx, searcher, "repo-a1", canonical, []evaluation.Case{{
+		Category: evaluation.CategoryExactSymbol, Query: "symbol", RelevantChunkIDs: []string{"a"},
+	}}, evaluation.MetricOptions{})
+	if err != context.Canceled || searcher.calls != 1 {
+		t.Fatalf("post-search cancellation error/calls = %v/%d", err, searcher.calls)
 	}
 }
 

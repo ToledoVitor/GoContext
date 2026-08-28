@@ -25,14 +25,14 @@ func TestChecklistRequiresEveryGateAndBoundedPositiveBudget(t *testing.T) {
 		{name: "aggregate review", mutate: func(value *evaluation.Checklist) { value.OutputReviewedAsAggregates = false }},
 		{name: "outside", mutate: func(value *evaluation.Checklist) { value.CacheOutputOutsideRepository = false }},
 		{name: "rollback", mutate: func(value *evaluation.Checklist) { value.RollbackIsCacheDiscard = false }},
-		{name: "duration zero", mutate: func(value *evaluation.Checklist) { value.MaxDurationMilliseconds = 0 }},
+		{name: "duration zero", mutate: func(value *evaluation.Checklist) { value.Budget.MaxDurationMilliseconds = 0 }},
 		{name: "duration excessive", mutate: func(value *evaluation.Checklist) {
-			value.MaxDurationMilliseconds = int64((24*time.Hour)/time.Millisecond) + 1
+			value.Budget.MaxDurationMilliseconds = int64((24*time.Hour)/time.Millisecond) + 1
 		}},
-		{name: "files", mutate: func(value *evaluation.Checklist) { value.MaxEligibleFiles = 0 }},
-		{name: "bytes", mutate: func(value *evaluation.Checklist) { value.MaxEligibleBytes = 0 }},
-		{name: "output", mutate: func(value *evaluation.Checklist) { value.MaxOutputBytes = 0 }},
-		{name: "queries", mutate: func(value *evaluation.Checklist) { value.MaxAutoQueries = 0 }},
+		{name: "files", mutate: func(value *evaluation.Checklist) { value.Budget.MaxEligibleFiles = 0 }},
+		{name: "bytes", mutate: func(value *evaluation.Checklist) { value.Budget.MaxEligibleBytes = 0 }},
+		{name: "output", mutate: func(value *evaluation.Checklist) { value.Budget.MaxOutputBytes = 0 }},
+		{name: "queries", mutate: func(value *evaluation.Checklist) { value.Budget.MaxAutoQueries = 0 }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -50,7 +50,9 @@ func validChecklist() evaluation.Checklist {
 		OwnerAuthorized: true, RootReadOnly: true, Task13TaintGatePassed: true,
 		SemanticFixedOff: true, ExternalNetworkProhibited: true, OutputReviewedAsAggregates: true,
 		CacheOutputOutsideRepository: true, RollbackIsCacheDiscard: true,
-		MaxDurationMilliseconds: 10_000, MaxEligibleBytes: 1 << 20, MaxEligibleFiles: 100,
-		MaxOutputBytes: 1 << 20, MaxAutoQueries: 100,
+		Budget: evaluation.ChecklistBudgets{
+			MaxDurationMilliseconds: 10_000, MaxEligibleBytes: 1 << 20, MaxEligibleFiles: 100,
+			MaxOutputBytes: 1 << 20, MaxAutoQueries: 100,
+		},
 	}
 }

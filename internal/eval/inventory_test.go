@@ -301,6 +301,74 @@ func TestEvaluateDeadlineCancelsScannerWithFixedNoGoCategory(t *testing.T) {
 	}
 }
 
+func TestEvaluateStopsAfterSuccessfulDependencyCancelsContext(t *testing.T) {
+	file := source.File{
+		Reference: source.Reference{Path: "safe.py", StartLine: 1, EndLine: 1},
+		Language:  source.LanguagePython,
+		Content:   []byte("def Safe():"),
+	}
+	symbols := []source.Symbol{{
+		Name: "Safe", Kind: "function", Reference: file.Reference,
+	}}
+	chunks := []source.Chunk{{
+		ID: "safe", Text: "def Safe():", Language: file.Language, SymbolName: "Safe", Reference: file.Reference,
+	}}
+	for _, cancelStage := range []string{"scanner", "parser", "chunker", "factory"} {
+		t.Run(cancelStage, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			calls := map[string]int{}
+			report, err := evaluation.Evaluate(ctx, "repo-a1", "ignored", evaluation.Dependencies{
+				Scanner: scannerFunc(func(context.Context, string) (ingest.ScanResult, error) {
+					calls["scanner"]++
+					if cancelStage == "scanner" {
+						cancel()
+					}
+					return validFixedScanResult([]source.File{file}), nil
+				}),
+				Parser: parserFunc(func(context.Context, source.File) ([]source.Symbol, error) {
+					calls["parser"]++
+					if cancelStage == "parser" {
+						cancel()
+					}
+					return symbols, nil
+				}),
+				Chunker: chunkerFunc(func(context.Context, source.File, []source.Symbol) ([]source.Chunk, error) {
+					calls["chunker"]++
+					if cancelStage == "chunker" {
+						cancel()
+					}
+					return chunks, nil
+				}),
+				SearchFactory: func(string, []source.Chunk) (search.Searcher, error) {
+					calls["factory"]++
+					if cancelStage == "factory" {
+						cancel()
+					}
+					return searcherFunc(func(context.Context, search.Query) ([]search.Hit, error) {
+						calls["search"]++
+						return []search.Hit{{Chunk: chunks[0]}}, nil
+					}), nil
+				},
+			}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10})
+			if err != context.Canceled || report.Blockers[evaluation.BlockerCanceled] != 1 {
+				t.Fatalf("report/error = %#v/%v", report, err)
+			}
+			order := []string{"scanner", "parser", "chunker", "factory", "search"}
+			cancelIndex := 0
+			for index, stage := range order {
+				if stage == cancelStage {
+					cancelIndex = index
+				}
+			}
+			for _, stage := range order[cancelIndex+1:] {
+				if calls[stage] != 0 {
+					t.Fatalf("%s called after %s canceled context: %#v", stage, cancelStage, calls)
+				}
+			}
+		})
+	}
+}
+
 func TestEvaluateRejectsChunkerThatOmitsParsedSymbol(t *testing.T) {
 	file := source.File{
 		Reference: source.Reference{Path: "symbols.py", StartLine: 1, EndLine: 2}, Language: source.LanguagePython,

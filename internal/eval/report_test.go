@@ -72,6 +72,20 @@ func TestMarshalValidatedRejectsNonOpaqueRepositoryAndUnknownMapCategories(t *te
 		{name: "category", mutate: func(report *evaluation.Report) {
 			report.Retrieval.Categories["private-query"] = evaluation.CategoryMetrics{}
 		}},
+		{name: "recall above one", mutate: func(report *evaluation.Report) {
+			metrics := report.Retrieval.Categories[evaluation.CategoryExactSymbol]
+			metrics.Status = evaluation.StatusEvaluated
+			metrics.QueryCount = 1
+			metrics.RecallAt5 = 1.01
+			report.Retrieval.Categories[evaluation.CategoryExactSymbol] = metrics
+		}},
+		{name: "ndcg above one", mutate: func(report *evaluation.Report) {
+			metrics := report.Retrieval.Categories[evaluation.CategoryExactSymbol]
+			metrics.Status = evaluation.StatusEvaluated
+			metrics.QueryCount = 1
+			metrics.NDCGAt10 = 1.01
+			report.Retrieval.Categories[evaluation.CategoryExactSymbol] = metrics
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

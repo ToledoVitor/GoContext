@@ -83,6 +83,55 @@ func TestEvalOutputPreservesVisibleReportOnDurabilityAmbiguity(t *testing.T) {
 	}
 }
 
+func TestEvalOutputRejectsParentPathRetargetBeforePublication(t *testing.T) {
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "report.json")
+	output, err := prepareEvalOutput(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained := directory + "-retained"
+	err = output.writeWithOperations([]byte("complete-report\n"), 1024, evalOutputOperations{
+		beforePublish: func() error {
+			if err := os.Rename(directory, retained); err != nil {
+				return err
+			}
+			return os.Mkdir(directory, 0o700)
+		},
+	})
+	if !errors.Is(err, errEvalOutput) {
+		t.Fatalf("write error = %v", err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{target, filepath.Join(retained, "report.json")} {
+		if _, err := os.Lstat(candidate); !os.IsNotExist(err) {
+			t.Fatalf("retargeted output exists/error = %v", err)
+		}
+	}
+}
+
+func TestPrivateEvalFileRejectsParentPathRetargetAfterDirectoryOpen(t *testing.T) {
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "gate.json")
+	if err := os.WriteFile(target, []byte(`{"owner_authorized":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retained := directory + "-retained"
+	_, err := readPrivateEvalFileWithOperations(target, 1024, evalFileOperations{
+		afterOpenParent: func() error {
+			if err := os.Rename(directory, retained); err != nil {
+				return err
+			}
+			return os.Symlink(retained, directory)
+		},
+	})
+	if !errors.Is(err, errEvalChecklist) {
+		t.Fatalf("read error = %v", err)
+	}
+}
+
 func secureEvalOutputDirectory(t *testing.T) string {
 	t.Helper()
 	directory, err := filepath.EvalSymlinks(t.TempDir())

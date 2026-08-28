@@ -6,9 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"path/filepath"
 	"regexp"
-	"strings"
 
 	evaluation "github.com/ToledoVitor/GoContext/internal/eval"
 	"github.com/ToledoVitor/GoContext/internal/ingest"
@@ -50,6 +48,20 @@ type evalCLIComposition struct {
 	newParser     func() ingest.Parser
 	newChunker    func() ingest.Chunker
 	searchFactory evaluation.SearchFactory
+	afterOpenRoot func() error
+}
+
+type scanOpenedRoot interface {
+	ScanOpened(context.Context, *filesystem.OpenedRoot) (ingest.ScanResult, error)
+}
+
+type retainedEvalScanner struct {
+	root    *filesystem.OpenedRoot
+	scanner scanOpenedRoot
+}
+
+func (scanner retainedEvalScanner) Scan(ctx context.Context, _ string) (ingest.ScanResult, error) {
+	return scanner.scanner.ScanOpened(ctx, scanner.root)
 }
 
 func (loader evalCorpusLoader) Load(ctx context.Context, repositoryID string) ([]source.Chunk, error) {
@@ -60,14 +72,18 @@ func (loader evalCorpusLoader) Load(ctx context.Context, repositoryID string) ([
 }
 
 func runEval(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return runEvalWithComposition(ctx, args, stdout, stderr, evalCLIComposition{
+	return runEvalWithComposition(ctx, args, stdout, stderr, defaultEvalCLIComposition())
+}
+
+func defaultEvalCLIComposition() evalCLIComposition {
+	return evalCLIComposition{
 		newScanner: func() ingest.Scanner { return filesystem.NewScanner() },
 		newParser:  func() ingest.Parser { return lineparser.NewParser() },
 		newChunker: func() ingest.Chunker { return symbolchunker.NewChunker() },
 		searchFactory: func(repositoryID string, chunks []source.Chunk) (searchdomain.Searcher, error) {
 			return lexical.NewSearcher(evalCorpusLoader{repositoryID: repositoryID, chunks: append([]source.Chunk(nil), chunks...)})
 		},
-	})
+	}
 }
 
 func runEvalWithComposition(ctx context.Context, args []string, stdout, stderr io.Writer, composition evalCLIComposition) int {
@@ -91,39 +107,56 @@ func runEvalWithComposition(ctx context.Context, args []string, stdout, stderr i
 	if err != nil {
 		return evalTrustFailure(stdout, stderr, "output")
 	}
-	canonicalRoot, rootErr := validateEvalRoot(root.value)
+	openedRoot, rootErr := openCanonicalEvalRoot(root.value)
 	if rootErr != nil {
-		return finishEvalReport(output, evalNoGo(repositoryID.value, evaluation.BlockerRoot, 1), evaluation.MaxReportBytes, stdout, stderr, "root")
+		return finishEvalReport(output, nil, evalNoGo(repositoryID.value, evaluation.BlockerRoot, 1), evaluation.MaxReportBytes, stdout, stderr, "root")
 	}
-	if pathInside(canonicalRoot, output.absolutePath()) {
-		_ = output.Close()
+	if err := output.requireOutsideRoot(openedRoot); err != nil {
+		outputCloseErr := output.Close()
+		rootCloseErr := openedRoot.Close()
+		if outputCloseErr != nil {
+			return evalTrustFailure(stdout, stderr, "output")
+		}
+		if rootCloseErr != nil {
+			return evalTrustFailure(stdout, stderr, "root")
+		}
 		return evalTrustFailure(stdout, stderr, "location")
 	}
-	if pathInside(canonicalRoot, checklistPath.value) {
-		return finishEvalReport(output, evalNoGo(repositoryID.value, evaluation.BlockerLocation, 1), evaluation.MaxReportBytes, stdout, stderr, "location")
-	}
 
-	checklist, err := readEvalChecklist(checklistPath.value)
+	checklist, err := readEvalChecklist(checklistPath.value, openedRoot)
 	if err != nil {
-		return finishEvalReport(output, evalNoGo(repositoryID.value, evaluation.BlockerChecklist, 1), evaluation.MaxReportBytes, stdout, stderr, "checklist")
+		if errors.Is(err, errEvalChecklistLocation) {
+			return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerLocation, 1), evaluation.MaxReportBytes, stdout, stderr, "location")
+		}
+		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerChecklist, 1), evaluation.MaxReportBytes, stdout, stderr, "checklist")
 	}
 	if blockers := checklist.BlockerCount(); blockers > 0 {
-		return finishEvalReport(output, evalNoGo(repositoryID.value, evaluation.BlockerChecklist, blockers), evaluation.MaxReportBytes, stdout, stderr, "checklist")
+		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerChecklist, blockers), evaluation.MaxReportBytes, stdout, stderr, "checklist")
 	}
 
 	evaluationContext, cancel := context.WithTimeout(ctx, checklist.Duration())
 	defer cancel()
 	if composition.newScanner == nil || composition.newParser == nil || composition.newChunker == nil || composition.searchFactory == nil {
-		return finishEvalReport(output, evalNoGo(repositoryID.value, evaluation.BlockerIntegrity, 1), checklist.MaxOutputBytes, stdout, stderr, "integrity")
+		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerIntegrity, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "integrity")
 	}
-	report, evaluationErr := evaluation.Evaluate(evaluationContext, repositoryID.value, canonicalRoot, evaluation.Dependencies{
-		Scanner: composition.newScanner(), Parser: composition.newParser(), Chunker: composition.newChunker(),
+	if composition.afterOpenRoot != nil {
+		if err := composition.afterOpenRoot(); err != nil {
+			return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerRoot, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "root")
+		}
+	}
+	configuredScanner := composition.newScanner()
+	openedScanner, ok := configuredScanner.(scanOpenedRoot)
+	if !ok || openedScanner == nil {
+		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerIntegrity, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "integrity")
+	}
+	report, evaluationErr := evaluation.Evaluate(evaluationContext, repositoryID.value, "retained-root", evaluation.Dependencies{
+		Scanner: retainedEvalScanner{root: openedRoot, scanner: openedScanner}, Parser: composition.newParser(), Chunker: composition.newChunker(),
 		SearchFactory: composition.searchFactory,
-	}, checklist.Budgets())
+	}, checklist.EvaluationBudgets())
 	if evaluationErr != nil {
-		return finishEvalReport(output, report, checklist.MaxOutputBytes, stdout, stderr, evalReportErrorCategory(report))
+		return finishEvalReport(output, openedRoot, report, checklist.Budget.MaxOutputBytes, stdout, stderr, evalReportErrorCategory(report))
 	}
-	return finishEvalReport(output, report, checklist.MaxOutputBytes, stdout, stderr, "")
+	return finishEvalReport(output, openedRoot, report, checklist.Budget.MaxOutputBytes, stdout, stderr, "")
 }
 
 func evalNoGo(repositoryID string, blocker evaluation.Blocker, count int) evaluation.Report {
@@ -134,6 +167,7 @@ func evalNoGo(repositoryID string, blocker evaluation.Blocker, count int) evalua
 
 func finishEvalReport(
 	output *evalOutput,
+	root *filesystem.OpenedRoot,
 	report evaluation.Report,
 	maxBytes int64,
 	stdout, stderr io.Writer,
@@ -144,10 +178,16 @@ func finishEvalReport(
 		err = output.Write(payload, maxBytes)
 	}
 	closeErr := output.Close()
-	if err != nil || closeErr != nil {
+	var rootCloseErr error
+	if root != nil {
+		rootCloseErr = root.Close()
+	}
+	if err != nil || closeErr != nil || rootCloseErr != nil {
 		fmt.Fprintf(stdout, "evaluation: %s\n", report.Decision)
 		if err == errEvalOutputIndeterminate || closeErr != nil && output.visible {
 			fmt.Fprintln(stderr, "evaluation error: output_indeterminate")
+		} else if rootCloseErr != nil && err == nil && closeErr == nil {
+			fmt.Fprintln(stderr, "evaluation error: root")
 		} else {
 			fmt.Fprintln(stderr, "evaluation error: output")
 		}
@@ -189,15 +229,4 @@ func evalReportErrorCategory(report evaluation.Report) string {
 		}
 	}
 	return "integrity"
-}
-
-func pathInside(root, target string) bool {
-	if !filepath.IsAbs(target) || filepath.Clean(target) != target {
-		return false
-	}
-	relative, err := filepath.Rel(root, target)
-	if err != nil {
-		return false
-	}
-	return relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }

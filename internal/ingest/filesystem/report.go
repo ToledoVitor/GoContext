@@ -1,21 +1,9 @@
 package filesystem
 
 import (
-	"path"
-	"strings"
-
 	"github.com/ToledoVitor/GoContext/internal/ingest"
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
-
-var safeUnsupportedExtensions = map[string]struct{}{
-	".bash": {}, ".c": {}, ".cc": {}, ".cpp": {}, ".cs": {}, ".css": {}, ".csv": {},
-	".go": {}, ".h": {}, ".hpp": {}, ".html": {}, ".java": {}, ".js": {}, ".jsx": {},
-	".json": {}, ".kt": {}, ".kts": {}, ".less": {}, ".log": {}, ".lua": {}, ".md": {},
-	".php": {}, ".rb": {}, ".rs": {}, ".sass": {}, ".scala": {}, ".scss": {}, ".sh": {},
-	".sql": {}, ".swift": {}, ".toml": {}, ".txt": {}, ".vue": {}, ".xml": {}, ".yaml": {},
-	".yml": {}, ".zsh": {},
-}
 
 func newScanReport() ingest.ScanReport {
 	return ingest.ScanReport{
@@ -33,12 +21,7 @@ func addExclusion(report *ingest.ScanReport, reason ingest.ExclusionReason) {
 
 func addUnsupported(report *ingest.ScanReport, name string, bytes int64) {
 	addExclusion(report, ingest.ExclusionUnsupportedExtension)
-	extension := strings.ToLower(path.Ext(name))
-	if extension == "" {
-		extension = "<none>"
-	} else if _, safe := safeUnsupportedExtensions[extension]; !safe {
-		extension = "<other>"
-	}
+	extension := ingest.UnsupportedExtensionBucket(name)
 	report.UnsupportedByExtension[extension]++
 	report.UnsupportedBytesByExtension[extension] += bytes
 }

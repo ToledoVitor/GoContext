@@ -71,13 +71,16 @@ func Evaluate(
 
 	scanStarted := now()
 	scanResult, err := dependencies.Scanner.Scan(ctx, root)
-	scanFinished := now()
 	if err != nil {
 		if ctx.Err() != nil {
 			return failedReport(repositoryID, BlockerCanceled), ctx.Err()
 		}
 		return failedReport(repositoryID, BlockerScan), ErrEvaluation
 	}
+	if err := ctx.Err(); err != nil {
+		return failedReport(repositoryID, BlockerCanceled), err
+	}
+	scanFinished := now()
 	if scanFinished.Before(scanStarted) {
 		return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
 	}
@@ -99,10 +102,10 @@ func Evaluate(
 			return failedReport(repositoryID, BlockerCanceled), err
 		}
 		symbols, parseErr := dependencies.Parser.Parse(ctx, file)
+		if err := ctx.Err(); err != nil {
+			return failedReport(repositoryID, BlockerCanceled), err
+		}
 		if parseErr != nil || !validSymbolsForFile(file, symbols) {
-			if ctx.Err() != nil {
-				return failedReport(repositoryID, BlockerCanceled), ctx.Err()
-			}
 			return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
 		}
 		if len(symbols) == 0 {
@@ -112,10 +115,10 @@ func Evaluate(
 			report.Inventory.SymbolKinds[allowlistedSymbolKind(symbol.Kind)]++
 		}
 		fileChunks, chunkErr := dependencies.Chunker.Chunk(ctx, file, symbols)
+		if err := ctx.Err(); err != nil {
+			return failedReport(repositoryID, BlockerCanceled), err
+		}
 		if chunkErr != nil || !validChunksForFile(file, symbols, fileChunks) {
-			if ctx.Err() != nil {
-				return failedReport(repositoryID, BlockerCanceled), ctx.Err()
-			}
 			return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
 		}
 		for _, chunk := range fileChunks {
@@ -130,6 +133,9 @@ func Evaluate(
 		}
 		return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
 	}
+	if err := ctx.Err(); err != nil {
+		return failedReport(repositoryID, BlockerCanceled), err
+	}
 	report.Inventory.Chunks = len(corpus.Chunks)
 	indexFinished := now()
 	if indexFinished.Before(indexStarted) {
@@ -141,6 +147,9 @@ func Evaluate(
 	cases := exactSymbolCases(corpus.Chunks, budgets.MaxAutoQueries)
 	if len(cases) > 0 {
 		searcher, factoryErr := dependencies.SearchFactory(repositoryID, append([]source.Chunk(nil), corpus.Chunks...))
+		if err := ctx.Err(); err != nil {
+			return failedReport(repositoryID, BlockerCanceled), err
+		}
 		if factoryErr != nil || interfaceNil(searcher) {
 			return failedReport(repositoryID, BlockerRetrieval), ErrEvaluation
 		}
@@ -155,10 +164,16 @@ func Evaluate(
 		report.Performance.QueryP50Micros = metrics.QueryP50Micros
 		report.Performance.QueryP95Micros = metrics.QueryP95Micros
 	}
+	if err := ctx.Err(); err != nil {
+		return failedReport(repositoryID, BlockerCanceled), err
+	}
 	sampleHeap()
 	report.Performance.PeakHeapBytes = peakHeap
 	if _, err := MarshalValidated(report); err != nil {
 		return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
+	}
+	if err := ctx.Err(); err != nil {
+		return failedReport(repositoryID, BlockerCanceled), err
 	}
 	return report, nil
 }

@@ -2,7 +2,11 @@
 
 package main
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/ToledoVitor/GoContext/internal/ingest/filesystem"
+)
 
 var (
 	errEvalOutput              = errors.New("evaluation output privacy unsupported")
@@ -14,9 +18,11 @@ type evalOutput struct {
 }
 
 func prepareEvalOutput(string) (*evalOutput, error) { return nil, errEvalOutput }
-func (*evalOutput) absolutePath() string            { return "" }
-func (*evalOutput) Write([]byte, int64) error       { return errEvalOutput }
-func (*evalOutput) Close() error                    { return nil }
-func readPrivateEvalFile(string, int64) ([]byte, error) {
+func (*evalOutput) requireOutsideRoot(*filesystem.OpenedRoot) error {
+	return errEvalOutput
+}
+func (*evalOutput) Write([]byte, int64) error { return errEvalOutput }
+func (*evalOutput) Close() error              { return nil }
+func readPrivateEvalFileOutsideRoot(string, int64, *filesystem.OpenedRoot) ([]byte, error) {
 	return nil, errEvalChecklist
 }

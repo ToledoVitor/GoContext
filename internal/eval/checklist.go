@@ -11,19 +11,23 @@ const (
 )
 
 type Checklist struct {
-	OwnerAuthorized              bool  `json:"owner_authorized"`
-	RootReadOnly                 bool  `json:"root_read_only"`
-	Task13TaintGatePassed        bool  `json:"task_13_taint_gate_passed"`
-	SemanticFixedOff             bool  `json:"semantic_fixed_off"`
-	ExternalNetworkProhibited    bool  `json:"external_network_prohibited"`
-	OutputReviewedAsAggregates   bool  `json:"output_reviewed_as_aggregates"`
-	CacheOutputOutsideRepository bool  `json:"cache_output_outside_repository"`
-	RollbackIsCacheDiscard       bool  `json:"rollback_is_cache_discard"`
-	MaxDurationMilliseconds      int64 `json:"max_duration_milliseconds"`
-	MaxEligibleBytes             int64 `json:"max_eligible_bytes"`
-	MaxEligibleFiles             int   `json:"max_eligible_files"`
-	MaxOutputBytes               int64 `json:"max_output_bytes"`
-	MaxAutoQueries               int   `json:"max_auto_queries"`
+	OwnerAuthorized              bool             `json:"owner_authorized"`
+	RootReadOnly                 bool             `json:"root_read_only"`
+	Task13TaintGatePassed        bool             `json:"task_13_taint_gate_passed"`
+	SemanticFixedOff             bool             `json:"semantic_fixed_off"`
+	ExternalNetworkProhibited    bool             `json:"external_network_prohibited"`
+	OutputReviewedAsAggregates   bool             `json:"output_reviewed_as_aggregates"`
+	CacheOutputOutsideRepository bool             `json:"cache_output_outside_repository"`
+	RollbackIsCacheDiscard       bool             `json:"rollback_is_cache_discard"`
+	Budget                       ChecklistBudgets `json:"budgets"`
+}
+
+type ChecklistBudgets struct {
+	MaxDurationMilliseconds int64 `json:"max_duration_milliseconds"`
+	MaxEligibleBytes        int64 `json:"max_eligible_bytes"`
+	MaxEligibleFiles        int   `json:"max_eligible_files"`
+	MaxOutputBytes          int64 `json:"max_output_bytes"`
+	MaxAutoQueries          int   `json:"max_auto_queries"`
 }
 
 func (checklist Checklist) BlockerCount() int {
@@ -43,32 +47,32 @@ func (checklist Checklist) BlockerCount() int {
 		}
 	}
 	maxDurationMilliseconds := int64((24 * time.Hour) / time.Millisecond)
-	if checklist.MaxDurationMilliseconds <= 0 || checklist.MaxDurationMilliseconds > maxDurationMilliseconds {
+	if checklist.Budget.MaxDurationMilliseconds <= 0 || checklist.Budget.MaxDurationMilliseconds > maxDurationMilliseconds {
 		blockers++
 	}
-	if checklist.MaxEligibleBytes <= 0 || checklist.MaxEligibleBytes > maxEligibleBytes {
+	if checklist.Budget.MaxEligibleBytes <= 0 || checklist.Budget.MaxEligibleBytes > maxEligibleBytes {
 		blockers++
 	}
-	if checklist.MaxEligibleFiles <= 0 || checklist.MaxEligibleFiles > maxEligibleFiles {
+	if checklist.Budget.MaxEligibleFiles <= 0 || checklist.Budget.MaxEligibleFiles > maxEligibleFiles {
 		blockers++
 	}
-	if checklist.MaxOutputBytes <= 0 || checklist.MaxOutputBytes > MaxReportBytes {
+	if checklist.Budget.MaxOutputBytes <= 0 || checklist.Budget.MaxOutputBytes > MaxReportBytes {
 		blockers++
 	}
-	if checklist.MaxAutoQueries <= 0 || checklist.MaxAutoQueries > maxAutoQueries {
+	if checklist.Budget.MaxAutoQueries <= 0 || checklist.Budget.MaxAutoQueries > maxAutoQueries {
 		blockers++
 	}
 	return blockers
 }
 
-func (checklist Checklist) Budgets() Budgets {
+func (checklist Checklist) EvaluationBudgets() Budgets {
 	return Budgets{
-		MaxEligibleFiles: checklist.MaxEligibleFiles,
-		MaxEligibleBytes: checklist.MaxEligibleBytes,
-		MaxAutoQueries:   checklist.MaxAutoQueries,
+		MaxEligibleFiles: checklist.Budget.MaxEligibleFiles,
+		MaxEligibleBytes: checklist.Budget.MaxEligibleBytes,
+		MaxAutoQueries:   checklist.Budget.MaxAutoQueries,
 	}
 }
 
 func (checklist Checklist) Duration() time.Duration {
-	return time.Duration(checklist.MaxDurationMilliseconds) * time.Millisecond
+	return time.Duration(checklist.Budget.MaxDurationMilliseconds) * time.Millisecond
 }
