@@ -422,21 +422,22 @@ func TestExactSearchRejectsIncompatibleSpaceBeforeScanning(t *testing.T) {
 	queries := []struct {
 		name   string
 		mutate func(*vectorsearch.IndexQuery)
+		want   error
 	}{
-		{name: "repository", mutate: func(q *vectorsearch.IndexQuery) { q.RepositoryID = "other-repository" }},
-		{name: "generation", mutate: func(q *vectorsearch.IndexQuery) { q.GenerationID = "other-generation" }},
-		{name: "fingerprint", mutate: func(q *vectorsearch.IndexQuery) { q.Profile.Fingerprint = "PRIVATE_FINGERPRINT_CANARY" }},
-		{name: "model", mutate: func(q *vectorsearch.IndexQuery) { q.Profile.Model = "PRIVATE_MODEL_CANARY" }},
-		{name: "dimensions", mutate: func(q *vectorsearch.IndexQuery) { q.Dimensions = 3; q.Vector = embedding.Vector{1, 0, 0} }},
-		{name: "metric", mutate: func(q *vectorsearch.IndexQuery) { q.Metric = index.VectorMetric("PRIVATE_QUERY_METRIC_CANARY") }},
+		{name: "repository", mutate: func(q *vectorsearch.IndexQuery) { q.RepositoryID = "other-repository" }, want: vectorsearch.ErrIncompatibleSpace},
+		{name: "generation", mutate: func(q *vectorsearch.IndexQuery) { q.GenerationID = "other-generation" }, want: vectorsearch.ErrGenerationChanged},
+		{name: "fingerprint", mutate: func(q *vectorsearch.IndexQuery) { q.Profile.Fingerprint = "PRIVATE_FINGERPRINT_CANARY" }, want: vectorsearch.ErrIncompatibleSpace},
+		{name: "model", mutate: func(q *vectorsearch.IndexQuery) { q.Profile.Model = "PRIVATE_MODEL_CANARY" }, want: vectorsearch.ErrIncompatibleSpace},
+		{name: "dimensions", mutate: func(q *vectorsearch.IndexQuery) { q.Dimensions = 3; q.Vector = embedding.Vector{1, 0, 0} }, want: vectorsearch.ErrIncompatibleSpace},
+		{name: "metric", mutate: func(q *vectorsearch.IndexQuery) { q.Metric = index.VectorMetric("PRIVATE_QUERY_METRIC_CANARY") }, want: vectorsearch.ErrIncompatibleSpace},
 	}
 	for _, tt := range queries {
 		t.Run(tt.name, func(t *testing.T) {
 			query := vectorIndexQuery(generation, embedding.Vector{1, 0}, 1)
 			tt.mutate(&query)
 			_, err := reader.Search(context.Background(), query)
-			if !errors.Is(err, vectorsearch.ErrIncompatibleSpace) {
-				t.Fatalf("Search(incompatible space) error = %v, want ErrIncompatibleSpace", err)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("Search(incompatible space) error = %v, want %v", err, tt.want)
 			}
 			for _, canary := range []string{"PRIVATE_INCOMPATIBLE_SOURCE_CANARY", "private/incompatible.py", "PRIVATE_FINGERPRINT_CANARY", "PRIVATE_MODEL_CANARY", "PRIVATE_QUERY_METRIC_CANARY"} {
 				if strings.Contains(err.Error(), canary) {
@@ -447,6 +448,27 @@ func TestExactSearchRejectsIncompatibleSpaceBeforeScanning(t *testing.T) {
 	}
 	if _, err := reader.Describe(context.Background(), "other-repository"); !errors.Is(err, vectorsearch.ErrIncompatibleSpace) {
 		t.Fatalf("Describe(other repository) error = %v, want ErrIncompatibleSpace", err)
+	}
+}
+
+func TestExactSearchReportsGenerationChangedSeparatelyFromSpaceMismatch(t *testing.T) {
+	store := newVectorStore(t, t.TempDir())
+	generation := vectorGeneration(t, "repository", "generation", "", []source.Chunk{
+		vectorChunk("chunk", "generation.py", 1, source.LanguagePython, "GENERATION_SOURCE"),
+	}, []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0}}})
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	reader := bindVectorReader(t, store, generation.RepositoryID)
+	query := vectorIndexQuery(generation, embedding.Vector{1, 0}, 1)
+	query.GenerationID = "other-generation"
+
+	_, err := reader.Search(context.Background(), query)
+	if !errors.Is(err, vectorsearch.ErrGenerationChanged) {
+		t.Fatalf("Search(generation mismatch) error = %v, want ErrGenerationChanged", err)
+	}
+	if errors.Is(err, vectorsearch.ErrIncompatibleSpace) {
+		t.Fatalf("Search(generation mismatch) error = %v, must not conflate space incompatibility", err)
 	}
 }
 

@@ -20,6 +20,8 @@ var (
 	ErrVectorUnavailable = errors.New("vector index unavailable")
 	// ErrVectorIntegrity reports malformed or incomplete persisted vector state.
 	ErrVectorIntegrity = errors.New("vector index integrity failure")
+	// ErrGenerationChanged reports a query that no longer matches pinned metadata.
+	ErrGenerationChanged = errors.New("vector index generation changed")
 )
 
 // Metadata describes the vector space pinned by a bound index reader.

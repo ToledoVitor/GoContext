@@ -195,8 +195,13 @@ func (r *BoundReader) Search(ctx context.Context, query vectorsearch.IndexQuery)
 	if r.profileFingerprint == "" && r.profileModel == "" && r.dimensions == 0 {
 		return nil, r.lexicalOnlyVectorState(ctx, "search bound vector index")
 	}
-	if query.RepositoryID != r.repositoryID || query.GenerationID != r.generationID ||
-		query.Profile.Fingerprint != r.profileFingerprint || query.Profile.Model != r.profileModel ||
+	if query.RepositoryID != r.repositoryID {
+		return nil, vectorsearch.ErrIncompatibleSpace
+	}
+	if query.GenerationID != r.generationID {
+		return nil, vectorsearch.ErrGenerationChanged
+	}
+	if query.Profile.Fingerprint != r.profileFingerprint || query.Profile.Model != r.profileModel ||
 		query.Dimensions != r.dimensions || query.Metric != r.metric {
 		return nil, vectorsearch.ErrIncompatibleSpace
 	}
