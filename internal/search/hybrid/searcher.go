@@ -13,7 +13,6 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/embedding"
 	"github.com/ToledoVitor/GoContext/internal/search"
 	"github.com/ToledoVitor/GoContext/internal/search/vector"
-	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
 var (
@@ -67,7 +66,12 @@ type Event struct {
 	Latency time.Duration
 }
 
-// Observer receives sanitized hybrid-search events.
+// Observer receives sanitized hybrid-search events. Calls made by one Searcher
+// are serialized. Implementations must honor ctx and return promptly: Search
+// cannot forcibly stop an arbitrary callback that ignores cancellation. A
+// blocked callback delays later events, while a canceled search can stop waiting
+// for its turn without starting another goroutine. Implementations must not
+// synchronously re-enter the same Searcher from Observe.
 type Observer interface {
 	Observe(context.Context, Event)
 }
@@ -87,6 +91,7 @@ type Searcher struct {
 	lexical             search.Searcher
 	vector              search.Searcher
 	observer            Observer
+	observerGate        chan struct{}
 	mode                SemanticMode
 	rrfK                int
 	lexicalWeight       float64
@@ -106,6 +111,10 @@ func NewSearcher(lexical search.Searcher, vector search.Searcher, observer Obser
 	}
 	if nilInterface(observer) {
 		observer = nil
+	}
+	var observerGate chan struct{}
+	if observer != nil {
+		observerGate = make(chan struct{}, 1)
 	}
 
 	if config.Mode == "" {
@@ -148,11 +157,21 @@ func NewSearcher(lexical search.Searcher, vector search.Searcher, observer Obser
 	if !finitePositive(normalizer) {
 		return nil, ErrInvalidConfig
 	}
+	worstRankDenominator := float64(config.RRFK) + maxQueryLimit
+	lexicalWorstContribution := config.LexicalWeight / worstRankDenominator
+	vectorWorstContribution := config.VectorWeight / worstRankDenominator
+	if !finitePositive(lexicalWorstContribution) ||
+		!finitePositive(vectorWorstContribution) ||
+		!finitePositive(lexicalWorstContribution/normalizer) ||
+		!finitePositive(vectorWorstContribution/normalizer) {
+		return nil, ErrInvalidConfig
+	}
 
 	return &Searcher{
 		lexical:             lexical,
 		vector:              vector,
 		observer:            observer,
+		observerGate:        observerGate,
 		mode:                config.Mode,
 		rrfK:                config.RRFK,
 		lexicalWeight:       config.LexicalWeight,
@@ -173,14 +192,18 @@ func (s *Searcher) Search(ctx context.Context, query search.Query) ([]search.Hit
 	}
 	if s.vector == nil {
 		if s.mode == SemanticRequired {
-			s.observe(ctx, eventKindFailure, eventVectorUnavailable, 0)
+			if err := s.observe(ctx, eventKindFailure, eventVectorUnavailable, 0); err != nil {
+				return nil, err
+			}
 			return nil, vector.ErrVectorUnavailable
 		}
 		hits, err := s.searchLexicalFallback(ctx, query)
 		if err != nil {
 			return nil, err
 		}
-		s.observe(ctx, eventKindFallback, eventVectorUnavailable, 0)
+		if err := s.observe(ctx, eventKindFallback, eventVectorUnavailable, 0); err != nil {
+			return nil, err
+		}
 		return hits, nil
 	}
 	return s.searchHybrid(ctx, query)
@@ -271,7 +294,7 @@ func (s *Searcher) searchHybrid(ctx context.Context, query search.Query) ([]sear
 		return nil, fmt.Errorf("search hybrid evidence: %w", err)
 	}
 	if lexicalResult.err != nil {
-		return nil, classifyLexicalError(lexicalResult.err)
+		return nil, classifyLexicalError(ctx, lexicalResult.err)
 	}
 	if err := validateHits(ctx, lexicalResult.hits); err != nil {
 		return nil, err
@@ -279,10 +302,14 @@ func (s *Searcher) searchHybrid(ctx context.Context, query search.Query) ([]sear
 	if vectorResult.err != nil {
 		if cause, reason, degradable := degradableVectorError(vectorResult); degradable {
 			if s.mode == SemanticRequired {
-				s.observe(ctx, eventKindFailure, reason, vectorResult.latency)
+				if err := s.observe(ctx, eventKindFailure, reason, vectorResult.latency); err != nil {
+					return nil, err
+				}
 				return nil, cause
 			}
-			s.observe(ctx, eventKindFallback, reason, vectorResult.latency)
+			if err := s.observe(ctx, eventKindFallback, reason, vectorResult.latency); err != nil {
+				return nil, err
+			}
 			return lexicalTop(lexicalResult.hits, query.Limit), nil
 		}
 		return nil, classifyFatalVectorError(vectorResult.err)
@@ -546,14 +573,34 @@ func candidateLimit(limit, multiplier int) int {
 	return candidate
 }
 
-func (s *Searcher) observe(ctx context.Context, kind, reason string, latency time.Duration) {
-	if s.observer == nil {
-		return
+func (s *Searcher) observe(ctx context.Context, kind, reason string, latency time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("search hybrid evidence: %w", err)
 	}
 	if latency < 0 {
 		latency = 0
 	}
-	s.observer.Observe(ctx, Event{Backend: eventBackendVector, Kind: kind, Reason: reason, Latency: latency})
+	if s.observer != nil {
+		select {
+		case s.observerGate <- struct{}{}:
+		case <-ctx.Done():
+			return fmt.Errorf("search hybrid evidence: %w", ctx.Err())
+		}
+		defer func() { <-s.observerGate }()
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("search hybrid evidence: %w", err)
+		}
+		func() {
+			defer func() {
+				_ = recover()
+			}()
+			s.observer.Observe(ctx, Event{Backend: eventBackendVector, Kind: kind, Reason: reason, Latency: latency})
+		}()
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("search hybrid evidence: %w", err)
+	}
+	return nil
 }
 
 func (s *Searcher) searchLexicalOnly(ctx context.Context, query search.Query) ([]search.Hit, error) {
@@ -562,7 +609,7 @@ func (s *Searcher) searchLexicalOnly(ctx context.Context, query search.Query) ([
 		return nil, fmt.Errorf("search hybrid evidence: %w", contextErr)
 	}
 	if err != nil {
-		return nil, classifyLexicalError(err)
+		return nil, classifyLexicalError(ctx, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("search hybrid evidence: %w", err)
@@ -570,14 +617,12 @@ func (s *Searcher) searchLexicalOnly(ctx context.Context, query search.Query) ([
 	return hits, nil
 }
 
-func classifyLexicalError(err error) error {
+func classifyLexicalError(ctx context.Context, err error) error {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("search hybrid evidence: %w", contextErr)
+	}
 	if errors.Is(err, search.ErrInvalidFilter) {
 		return fmt.Errorf("%w: %w", ErrInvalidQuery, search.ErrInvalidFilter)
-	}
-	for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
-		if errors.Is(err, sentinel) {
-			return fmt.Errorf("search hybrid evidence: %w", sentinel)
-		}
 	}
 	return ErrLexicalFailure
 }
@@ -604,9 +649,18 @@ func finitePositive(value float64) bool {
 }
 
 func cloneQuery(query search.Query) search.Query {
-	query.Filter.PathPrefixes = append([]string(nil), query.Filter.PathPrefixes...)
-	query.Filter.Languages = append([]source.Language(nil), query.Filter.Languages...)
+	query.Filter.PathPrefixes = cloneSlice(query.Filter.PathPrefixes)
+	query.Filter.Languages = cloneSlice(query.Filter.Languages)
 	return query
+}
+
+func cloneSlice[T any](values []T) []T {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]T, len(values))
+	copy(cloned, values)
+	return cloned
 }
 
 func nilInterface(value any) bool {

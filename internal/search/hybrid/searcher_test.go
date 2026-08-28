@@ -67,6 +67,47 @@ func TestNewSearcherRejectsInvalidDependenciesAndConfig(t *testing.T) {
 	}
 }
 
+func TestNewSearcherRejectsWeightsThatCannotProducePositiveNormalizedScores(t *testing.T) {
+	lexical := &fakeSearcher{}
+	tests := []struct {
+		name   string
+		config hybrid.Config
+	}{
+		{name: "smallest lexical weight", config: hybrid.Config{LexicalWeight: math.SmallestNonzeroFloat64}},
+		{name: "smallest vector weight", config: hybrid.Config{VectorWeight: math.SmallestNonzeroFloat64}},
+		{name: "extreme ratio underflows normalization", config: hybrid.Config{LexicalWeight: math.MaxFloat64, VectorWeight: 1e-300}},
+		{name: "large k underflows lexical contribution", config: hybrid.Config{RRFK: math.MaxInt, LexicalWeight: math.SmallestNonzeroFloat64}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := hybrid.NewSearcher(lexical, nil, nil, test.config); !errors.Is(err, hybrid.ErrInvalidConfig) {
+				t.Fatalf("NewSearcher() error = %v, want ErrInvalidConfig", err)
+			}
+		})
+	}
+
+	t.Run("normal defaults and safe large k remain usable", func(t *testing.T) {
+		searcher, err := hybrid.NewSearcher(
+			&fakeSearcher{searchFn: func(context.Context, search.Query) ([]search.Hit, error) {
+				return []search.Hit{{Chunk: testChunk("lexical", "lexical.py", 1, 2, "LEXICAL_SOURCE"), Score: 1}}, nil
+			}},
+			&fakeSearcher{},
+			nil,
+			hybrid.Config{Mode: hybrid.SemanticPreferred, RRFK: math.MaxInt},
+		)
+		if err != nil {
+			t.Fatalf("NewSearcher() error = %v", err)
+		}
+		hits, err := searcher.Search(context.Background(), validQuery())
+		if err != nil {
+			t.Fatalf("Search() error = %v", err)
+		}
+		if len(hits) != 1 || hits[0].Score != 0.5 {
+			t.Fatalf("Search() hits = %#v, want stable default-weight score 0.5", hits)
+		}
+	})
+}
+
 func TestSearcherHandlesAbsentVectorBySemanticMode(t *testing.T) {
 	query := validQuery()
 	query.Filter.PathPrefixes = []string{"internal"}
@@ -121,6 +162,237 @@ func TestSearcherHandlesAbsentVectorBySemanticMode(t *testing.T) {
 			t.Fatalf("observer events = %#v, want exactly one sanitized failure", events)
 		}
 	})
+}
+
+func TestSearcherPreservesNonNilEmptyFilterSlicesAcrossEveryBackendPath(t *testing.T) {
+	newQuery := func() search.Query {
+		query := validQuery()
+		query.Filter.PathPrefixes = make([]string, 0, 2)
+		query.Filter.Languages = make([]source.Language, 0, 2)
+		return query
+	}
+	assertExactEmptyFilter := func(t *testing.T, got, want search.Query) {
+		t.Helper()
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("backend query = %#v, want exact shape %#v", got, want)
+		}
+		if got.Filter.PathPrefixes == nil || got.Filter.Languages == nil {
+			t.Errorf("backend filter = %#v, want non-nil empty slices", got.Filter)
+		}
+	}
+
+	t.Run("semantic off", func(t *testing.T) {
+		query := newQuery()
+		lexical := &fakeSearcher{searchFn: func(_ context.Context, got search.Query) ([]search.Hit, error) {
+			assertExactEmptyFilter(t, got, query)
+			got.Filter.PathPrefixes = append(got.Filter.PathPrefixes, "PRIVATE_LEXICAL_MUTATION")
+			got.Filter.Languages = append(got.Filter.Languages, source.LanguagePython)
+			return nil, nil
+		}}
+		searcher, err := hybrid.NewSearcher(lexical, nil, nil, hybrid.Config{Mode: hybrid.SemanticOff})
+		if err != nil {
+			t.Fatalf("NewSearcher() error = %v", err)
+		}
+		if _, err := searcher.Search(context.Background(), query); err != nil {
+			t.Fatalf("Search() error = %v", err)
+		}
+		assertExactEmptyFilter(t, query, newQuery())
+	})
+
+	t.Run("preferred without vector", func(t *testing.T) {
+		query := newQuery()
+		lexical := &fakeSearcher{searchFn: func(_ context.Context, got search.Query) ([]search.Hit, error) {
+			assertExactEmptyFilter(t, got, query)
+			got.Filter.PathPrefixes = append(got.Filter.PathPrefixes, "PRIVATE_LEXICAL_MUTATION")
+			got.Filter.Languages = append(got.Filter.Languages, source.LanguagePython)
+			return nil, nil
+		}}
+		searcher, err := hybrid.NewSearcher(lexical, nil, nil, hybrid.Config{Mode: hybrid.SemanticPreferred})
+		if err != nil {
+			t.Fatalf("NewSearcher() error = %v", err)
+		}
+		if _, err := searcher.Search(context.Background(), query); err != nil {
+			t.Fatalf("Search() error = %v", err)
+		}
+		assertExactEmptyFilter(t, query, newQuery())
+	})
+
+	t.Run("enabled backends receive independent clones", func(t *testing.T) {
+		query := newQuery()
+		backendQuery := query
+		backendQuery.Limit = 20
+		lexicalMutated := make(chan struct{})
+		lexical := &fakeSearcher{searchFn: func(_ context.Context, got search.Query) ([]search.Hit, error) {
+			assertExactEmptyFilter(t, got, backendQuery)
+			got.Filter.PathPrefixes = append(got.Filter.PathPrefixes, "PRIVATE_LEXICAL_MUTATION")
+			got.Filter.Languages = append(got.Filter.Languages, source.LanguagePython)
+			close(lexicalMutated)
+			return nil, nil
+		}}
+		vectorSearcher := &fakeSearcher{searchFn: func(_ context.Context, got search.Query) ([]search.Hit, error) {
+			<-lexicalMutated
+			assertExactEmptyFilter(t, got, backendQuery)
+			got.Filter.PathPrefixes = append(got.Filter.PathPrefixes, "PRIVATE_VECTOR_MUTATION")
+			got.Filter.Languages = append(got.Filter.Languages, source.LanguageTypeScript)
+			return nil, nil
+		}}
+		searcher, err := hybrid.NewSearcher(lexical, vectorSearcher, nil, hybrid.Config{Mode: hybrid.SemanticPreferred})
+		if err != nil {
+			t.Fatalf("NewSearcher() error = %v", err)
+		}
+		if _, err := searcher.Search(context.Background(), query); err != nil {
+			t.Fatalf("Search() error = %v", err)
+		}
+		assertExactEmptyFilter(t, query, newQuery())
+		if got := query.Filter.PathPrefixes[:1][0]; got != "" {
+			t.Fatalf("caller path backing array mutated to %q", got)
+		}
+		if got := query.Filter.Languages[:1][0]; got != "" {
+			t.Fatalf("caller language backing array mutated to %q", got)
+		}
+	})
+}
+
+func TestSearcherIsolatesObserverPanic(t *testing.T) {
+	lexicalHit := search.Hit{Chunk: testChunk("lexical", "lexical.py", 1, 2, "LEXICAL_SOURCE"), Score: 0.7}
+	searcher, err := hybrid.NewSearcher(
+		&fakeSearcher{searchFn: func(context.Context, search.Query) ([]search.Hit, error) {
+			return []search.Hit{lexicalHit}, nil
+		}},
+		nil,
+		observerFunc(func(context.Context, hybrid.Event) {
+			panic("PRIVATE_OBSERVER_PANIC_CANARY")
+		}),
+		hybrid.Config{Mode: hybrid.SemanticPreferred},
+	)
+	if err != nil {
+		t.Fatalf("NewSearcher() error = %v", err)
+	}
+
+	hits, err := searcher.Search(context.Background(), validQuery())
+	if err != nil {
+		t.Fatalf("Search() error = %v, want observer panic isolated", err)
+	}
+	if len(hits) != 1 || !reflect.DeepEqual(hits[0], lexicalHit) {
+		t.Fatalf("Search() hits = %#v, want lexical fallback %#v", hits, lexicalHit)
+	}
+}
+
+func TestSearcherParentCancellationDuringObserverWinsOverFallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	observerCalled := false
+	searcher, err := hybrid.NewSearcher(
+		&fakeSearcher{searchFn: func(context.Context, search.Query) ([]search.Hit, error) {
+			return []search.Hit{{Chunk: testChunk("lexical", "lexical.py", 1, 2, "LEXICAL_SOURCE"), Score: 0.7}}, nil
+		}},
+		nil,
+		observerFunc(func(observed context.Context, event hybrid.Event) {
+			observerCalled = true
+			if observed.Done() == nil || observed.Done() != ctx.Done() {
+				t.Errorf("Observe() context is not the cancellable parent context")
+			}
+			if event.Backend != "vector" || event.Kind != "fallback" || event.Reason != "vector_unavailable" {
+				t.Errorf("Observe() event = %#v, want fixed fallback vocabulary", event)
+			}
+			cancel()
+		}),
+		hybrid.Config{Mode: hybrid.SemanticPreferred},
+	)
+	if err != nil {
+		t.Fatalf("NewSearcher() error = %v", err)
+	}
+
+	hits, err := searcher.Search(ctx, validQuery())
+	if !observerCalled {
+		t.Fatal("Observe() was not called")
+	}
+	if !errors.Is(err, context.Canceled) || len(hits) != 0 {
+		t.Fatalf("Search() hits = %#v error = %v, want parent context.Canceled instead of fallback", hits, err)
+	}
+}
+
+func TestSearcherSerializesConcurrentCallsToNonThreadsafeObserver(t *testing.T) {
+	observer := newUnsafeBlockingObserver()
+	secondBackendReady := make(chan struct{})
+	var backendCalls atomic.Int64
+	lexical := &fakeSearcher{searchFn: func(context.Context, search.Query) ([]search.Hit, error) {
+		if backendCalls.Add(1) == 2 {
+			close(secondBackendReady)
+		}
+		return []search.Hit{{Chunk: testChunk("lexical", "lexical.py", 1, 2, "LEXICAL_SOURCE"), Score: 0.7}}, nil
+	}}
+	searcher, err := hybrid.NewSearcher(lexical, nil, observer, hybrid.Config{Mode: hybrid.SemanticPreferred})
+	if err != nil {
+		t.Fatalf("NewSearcher() error = %v", err)
+	}
+	results := make(chan error, 2)
+	go func() {
+		_, searchErr := searcher.Search(context.Background(), validQuery())
+		results <- searchErr
+	}()
+	waitForSignal(t, observer.firstEntered, "first observer call")
+	go func() {
+		_, searchErr := searcher.Search(context.Background(), validQuery())
+		results <- searchErr
+	}()
+	waitForSignal(t, secondBackendReady, "second search fallback")
+
+	select {
+	case <-observer.laterEntered:
+		// An unserialized observer reaches this branch while the first call is blocked.
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(observer.releaseFirst)
+	for range 2 {
+		select {
+		case searchErr := <-results:
+			if searchErr != nil {
+				t.Fatalf("Search() error = %v", searchErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent Search() did not return")
+		}
+	}
+	if observer.overlap {
+		t.Fatal("Observe() calls overlapped on a non-threadsafe observer")
+	}
+}
+
+func TestSearcherBlockingObserverHonorsParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	observerStarted := make(chan struct{})
+	observerReturned := make(chan struct{})
+	searcher, err := hybrid.NewSearcher(
+		&fakeSearcher{searchFn: func(context.Context, search.Query) ([]search.Hit, error) {
+			return []search.Hit{{Chunk: testChunk("lexical", "lexical.py", 1, 2, "LEXICAL_SOURCE"), Score: 0.7}}, nil
+		}},
+		nil,
+		observerFunc(func(observed context.Context, _ hybrid.Event) {
+			close(observerStarted)
+			<-observed.Done()
+			close(observerReturned)
+		}),
+		hybrid.Config{Mode: hybrid.SemanticPreferred},
+	)
+	if err != nil {
+		t.Fatalf("NewSearcher() error = %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, searchErr := searcher.Search(ctx, validQuery())
+		result <- searchErr
+	}()
+	waitForSignal(t, observerStarted, "blocking observer start")
+	cancel()
+	waitForSignal(t, observerReturned, "blocking observer cancellation return")
+	select {
+	case searchErr := <-result:
+		if !errors.Is(searchErr, context.Canceled) {
+			t.Fatalf("Search() error = %v, want parent context.Canceled", searchErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Search() did not return promptly after observer honored cancellation")
+	}
 }
 
 func TestSearcherStartsBothBackendsBeforeWaitingAndParentCancellationWins(t *testing.T) {
@@ -801,14 +1073,15 @@ func TestSearcherIsolatesConcurrentFiltersAndDoesNotMutateBackendHits(t *testing
 
 func TestSearcherSanitizesMandatoryLexicalFailuresAndNeverReturnsVectorOnlyEvidence(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want error
+		name   string
+		err    error
+		want   error
+		reject error
 	}{
 		{name: "unknown", err: errors.New("PRIVATE_LEXICAL_FAILURE_CANARY"), want: hybrid.ErrLexicalFailure},
 		{name: "filter category", err: fmt.Errorf("PRIVATE_LEXICAL_FAILURE_CANARY: %w", search.ErrInvalidFilter), want: search.ErrInvalidFilter},
-		{name: "canceled category", err: fmt.Errorf("PRIVATE_LEXICAL_FAILURE_CANARY: %w", context.Canceled), want: context.Canceled},
-		{name: "deadline category", err: fmt.Errorf("PRIVATE_LEXICAL_FAILURE_CANARY: %w", context.DeadlineExceeded), want: context.DeadlineExceeded},
+		{name: "synthetic canceled category", err: fmt.Errorf("PRIVATE_LEXICAL_FAILURE_CANARY: %w", context.Canceled), want: hybrid.ErrLexicalFailure, reject: context.Canceled},
+		{name: "synthetic internal deadline", err: fmt.Errorf("PRIVATE_INTERNAL_TIMEOUT_CANARY: %w", context.DeadlineExceeded), want: hybrid.ErrLexicalFailure, reject: context.DeadlineExceeded},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -828,7 +1101,10 @@ func TestSearcherSanitizesMandatoryLexicalFailuresAndNeverReturnsVectorOnlyEvide
 			if !errors.Is(searchErr, test.want) || len(hits) != 0 {
 				t.Fatalf("Search() hits = %#v error = %v, want no vector-only evidence and %v", hits, searchErr, test.want)
 			}
-			for _, canary := range []string{"PRIVATE_LEXICAL_FAILURE_CANARY", "PRIVATE_VECTOR_ONLY_SOURCE"} {
+			if test.reject != nil && errors.Is(searchErr, test.reject) {
+				t.Fatalf("Search() error = %v, must not trust backend-only category %v", searchErr, test.reject)
+			}
+			for _, canary := range []string{"PRIVATE_LEXICAL_FAILURE_CANARY", "PRIVATE_INTERNAL_TIMEOUT_CANARY", "PRIVATE_VECTOR_ONLY_SOURCE"} {
 				if strings.Contains(searchErr.Error(), canary) {
 					t.Fatalf("Search() error exposes backend data: %v", searchErr)
 				}
@@ -838,6 +1114,30 @@ func TestSearcherSanitizesMandatoryLexicalFailuresAndNeverReturnsVectorOnlyEvide
 			}
 		})
 	}
+
+	t.Run("actual parent cancellation wins", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		lexical := &fakeSearcher{searchFn: func(context.Context, search.Query) ([]search.Hit, error) {
+			cancel()
+			return nil, errors.New("PRIVATE_PARENT_CANCEL_CANARY")
+		}}
+		vectorSearcher := &fakeSearcher{searchFn: func(ctx context.Context, _ search.Query) ([]search.Hit, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+		searcher, err := hybrid.NewSearcher(lexical, vectorSearcher, nil, hybrid.Config{Mode: hybrid.SemanticPreferred})
+		if err != nil {
+			t.Fatalf("NewSearcher() error = %v", err)
+		}
+
+		hits, searchErr := searcher.Search(ctx, validQuery())
+		if !errors.Is(searchErr, context.Canceled) || len(hits) != 0 {
+			t.Fatalf("Search() hits = %#v error = %v, want actual parent context.Canceled", hits, searchErr)
+		}
+		if strings.Contains(searchErr.Error(), "PRIVATE_PARENT_CANCEL_CANARY") {
+			t.Fatalf("Search() error exposes lexical cause: %v", searchErr)
+		}
+	})
 }
 
 func TestSearcherCancellationInterruptsLargeFusionAndSort(t *testing.T) {
@@ -1001,6 +1301,44 @@ type recordingObserver struct {
 	events []hybrid.Event
 }
 
+type observerFunc func(context.Context, hybrid.Event)
+
+func (f observerFunc) Observe(ctx context.Context, event hybrid.Event) {
+	f(ctx, event)
+}
+
+type unsafeBlockingObserver struct {
+	active       bool
+	overlap      bool
+	calls        int
+	firstEntered chan struct{}
+	laterEntered chan struct{}
+	releaseFirst chan struct{}
+}
+
+func newUnsafeBlockingObserver() *unsafeBlockingObserver {
+	return &unsafeBlockingObserver{
+		firstEntered: make(chan struct{}),
+		laterEntered: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+}
+
+func (o *unsafeBlockingObserver) Observe(context.Context, hybrid.Event) {
+	if o.active {
+		o.overlap = true
+	}
+	o.active = true
+	o.calls++
+	if o.calls == 1 {
+		close(o.firstEntered)
+		<-o.releaseFirst
+	} else {
+		close(o.laterEntered)
+	}
+	o.active = false
+}
+
 func (o *recordingObserver) Observe(_ context.Context, event hybrid.Event) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -1018,8 +1356,12 @@ func validQuery() search.Query {
 }
 
 func cloneQuery(query search.Query) search.Query {
-	query.Filter.PathPrefixes = append([]string(nil), query.Filter.PathPrefixes...)
-	query.Filter.Languages = append([]source.Language(nil), query.Filter.Languages...)
+	if query.Filter.PathPrefixes != nil {
+		query.Filter.PathPrefixes = append([]string{}, query.Filter.PathPrefixes...)
+	}
+	if query.Filter.Languages != nil {
+		query.Filter.Languages = append([]source.Language{}, query.Filter.Languages...)
+	}
 	return query
 }
 
