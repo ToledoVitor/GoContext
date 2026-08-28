@@ -7,12 +7,13 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
-	"strconv"
 )
 
 const (
-	maxEncodedScanBytes  = 72 << 20
-	maxEncodedTokenBytes = 1 << 20
+	maxEncodedScanBytes       = 72 << 20
+	maxEncodedTokenBytes      = 1 << 20
+	maxEncodedTokenCount      = 1 << 20
+	maxTotalEncodedTokenBytes = maxEncodedScanBytes
 
 	EncodingRaw          = "raw"
 	EncodingBase64       = "base64"
@@ -90,20 +91,25 @@ func findRaw(payload []byte, canaries [][]byte, encoding string) (Match, bool) {
 }
 
 func findBase64Tokens(payload []byte, canaries [][]byte) (Match, bool, bool) {
+	tokenCount := 0
+	totalTokenBytes := 0
 	for offset := 0; offset < len(payload); {
-		if !base64TokenByte(payload[offset]) {
+		if !base64AlphabetByte(payload[offset]) {
 			offset++
 			continue
 		}
 		end := offset + 1
-		for end < len(payload) && base64TokenByte(payload[end]) {
+		for end < len(payload) && base64AlphabetByte(payload[end]) {
 			end++
 		}
-		token := payload[offset:end]
-		if len(token) > maxEncodedTokenBytes {
+		end = base64PaddedTokenEnd(payload, offset, end)
+		tokenCount++
+		totalTokenBytes += end - offset
+		if tokenCount > maxEncodedTokenCount || end-offset > maxEncodedTokenBytes ||
+			totalTokenBytes > maxTotalEncodedTokenBytes {
 			return Match{}, false, false
 		}
-		for _, decoded := range decodeWholeBase64Token(token) {
+		for _, decoded := range decodeWholeBase64Token(payload[offset:end]) {
 			encoding := EncodingBase64
 			if decoded.url {
 				encoding = EncodingBase64URL
@@ -115,6 +121,23 @@ func findBase64Tokens(payload []byte, canaries [][]byte) (Match, bool, bool) {
 		offset = end
 	}
 	return Match{}, false, true
+}
+
+func base64PaddedTokenEnd(payload []byte, start, coreEnd int) int {
+	requiredPadding := (4 - (coreEnd-start)%4) % 4
+	if requiredPadding < 1 || requiredPadding > 2 || coreEnd+requiredPadding > len(payload) {
+		return coreEnd
+	}
+	for index := coreEnd; index < coreEnd+requiredPadding; index++ {
+		if payload[index] != '=' {
+			return coreEnd
+		}
+	}
+	paddedEnd := coreEnd + requiredPadding
+	if paddedEnd < len(payload) && (base64AlphabetByte(payload[paddedEnd]) || payload[paddedEnd] == '=') {
+		return coreEnd
+	}
+	return paddedEnd
 }
 
 type decodedBase64 struct {
@@ -192,10 +215,10 @@ func splitBase64Padding(token []byte) ([]byte, int, bool) {
 	return token[:first], padding, true
 }
 
-func base64TokenByte(value byte) bool {
+func base64AlphabetByte(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
 		value >= '0' && value <= '9' || value == '+' || value == '/' ||
-		value == '-' || value == '_' || value == '='
+		value == '-' || value == '_'
 }
 
 func findHexTokens(payload []byte, canaries [][]byte) (Match, bool, bool) {
@@ -299,43 +322,107 @@ func parseGoHexByte(payload []byte, offset int) (byte, int, bool) {
 }
 
 func findDecimalByteTokens(payload []byte, canaries [][]byte) (Match, bool, bool) {
-	for offset := 0; offset < len(payload); offset++ {
-		if payload[offset] != '[' {
-			continue
-		}
-		endOffset := bytes.IndexByte(payload[offset+1:], ']')
-		if endOffset < 0 {
-			continue
-		}
-		end := offset + 1 + endOffset
-		if end-offset+1 > maxEncodedTokenBytes {
-			return Match{}, false, false
-		}
-		decoded, valid := parseDecimalBytes(payload[offset+1 : end])
-		if valid {
-			if match, found := findRaw(decoded, canaries, EncodingDecimalBytes); found {
-				return match, true, true
-			}
-		}
-		offset = end
-	}
-	return Match{}, false, true
+	match, found, complete, _ := findDecimalByteTokensWithBudget(payload, canaries, len(payload))
+	return match, found, complete
 }
 
-func parseDecimalBytes(payload []byte) ([]byte, bool) {
-	fields := bytes.Fields(payload)
-	if len(fields) == 0 {
-		return nil, false
-	}
-	decoded := make([]byte, len(fields))
-	for index, field := range fields {
-		value, err := strconv.ParseUint(string(field), 10, 8)
-		if err != nil {
-			return nil, false
+// findDecimalByteTokensWithBudget charges exactly one step for each input byte
+// visited so tests can prove malformed brackets cannot trigger suffix rescans.
+func findDecimalByteTokensWithBudget(
+	payload []byte,
+	canaries [][]byte,
+	stepBudget int,
+) (Match, bool, bool, int) {
+	const (
+		decimalBeforeValue = iota
+		decimalInValue
+		decimalBetweenValues
+	)
+	active := false
+	start := 0
+	state := decimalBeforeValue
+	value := 0
+	digits := 0
+	decoded := make([]byte, 0)
+	steps := 0
+	for offset, current := range payload {
+		if steps >= stepBudget {
+			return Match{}, false, false, steps
 		}
-		decoded[index] = byte(value)
+		steps++
+		if current == '[' {
+			active = true
+			start = offset
+			state = decimalBeforeValue
+			value = 0
+			digits = 0
+			decoded = decoded[:0]
+			continue
+		}
+		if !active {
+			continue
+		}
+		if offset-start+1 > maxEncodedTokenBytes {
+			return Match{}, false, false, steps
+		}
+
+		switch state {
+		case decimalBeforeValue:
+			switch {
+			case decimalWhitespace(current):
+			case decimalDigit(current):
+				state = decimalInValue
+				value = int(current - '0')
+				digits = 1
+			default:
+				active = false
+			}
+		case decimalInValue:
+			switch {
+			case decimalDigit(current):
+				value = value*10 + int(current-'0')
+				digits++
+				if digits > 3 || value > 255 {
+					active = false
+				}
+			case decimalWhitespace(current):
+				decoded = append(decoded, byte(value))
+				state = decimalBetweenValues
+			case current == ']':
+				decoded = append(decoded, byte(value))
+				if match, found := findRaw(decoded, canaries, EncodingDecimalBytes); found {
+					return match, true, true, steps
+				}
+				active = false
+			default:
+				active = false
+			}
+		case decimalBetweenValues:
+			switch {
+			case decimalWhitespace(current):
+			case decimalDigit(current):
+				state = decimalInValue
+				value = int(current - '0')
+				digits = 1
+			case current == ']':
+				if match, found := findRaw(decoded, canaries, EncodingDecimalBytes); found {
+					return match, true, true, steps
+				}
+				active = false
+			default:
+				active = false
+			}
+		}
 	}
-	return decoded, true
+	return Match{}, false, true, steps
+}
+
+func decimalDigit(value byte) bool {
+	return value >= '0' && value <= '9'
+}
+
+func decimalWhitespace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\n' || value == '\r' || value == '\v' || value == '\f'
 }
 
 func hexByte(value byte) bool {

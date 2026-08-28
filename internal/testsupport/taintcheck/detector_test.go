@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestScanDetectsShortCanaryInsideWholeBase64TokensAtEveryAlignment(t *testing.T) {
+func TestScanDetectsShortCanaryAcrossDelimitedBase64TokensAtEveryAlignment(t *testing.T) {
 	const canary = ".env"
 	encodings := []struct {
 		name   string
@@ -20,6 +20,18 @@ func TestScanDetectsShortCanaryInsideWholeBase64TokensAtEveryAlignment(t *testin
 		{name: "URL padded", encode: base64.URLEncoding.EncodeToString},
 		{name: "URL raw", encode: base64.RawURLEncoding.EncodeToString},
 	}
+	wrappers := []struct {
+		name string
+		wrap func(string) string
+	}{
+		{name: "assignment", wrap: func(encoded string) string { return "key=" + encoded }},
+		{name: "colon", wrap: func(encoded string) string { return "value:" + encoded + ";" }},
+		{name: "single quote", wrap: func(encoded string) string { return "value='" + encoded + "'" }},
+		{name: "double quote", wrap: func(encoded string) string { return `value="` + encoded + `"` }},
+		{name: "query", wrap: func(encoded string) string { return "?data=" + encoded + "&mode=safe" }},
+		{name: "invalid leading alphabet token", wrap: func(encoded string) string { return "A=" + encoded }},
+		{name: "invalid padding prefix", wrap: func(encoded string) string { return "value====" + encoded + ";" }},
+	}
 
 	for prefixLength := 0; prefixLength < 3; prefixLength++ {
 		prefix := []byte{0xfb, 0xef, 0xff}[:prefixLength:prefixLength]
@@ -28,17 +40,45 @@ func TestScanDetectsShortCanaryInsideWholeBase64TokensAtEveryAlignment(t *testin
 		near := append(append([]byte(nil), prefix...), []byte(".enw")...)
 		near = append(near, 0xfa, 0x00, 0x7f)
 		for _, encoding := range encodings {
-			t.Run(fmt.Sprintf("%s/prefix-%d", encoding.name, prefixLength), func(t *testing.T) {
-				wrapped := []byte("larger-wrapper:" + encoding.encode(payload) + ":suffix")
-				result := Scan(wrapped, []string{canary})
-				if !result.Complete || !result.Found || result.Match.Canary != canary {
-					t.Fatalf("Scan() = %#v; want complete encoded-canary match", result)
-				}
-				nearResult := Scan([]byte("larger-wrapper:"+encoding.encode(near)+":suffix"), []string{canary})
-				if !nearResult.Complete || nearResult.Found {
-					t.Fatalf("Scan(same-length near value) = %#v; want complete no-match", nearResult)
-				}
-			})
+			for _, wrapper := range wrappers {
+				t.Run(fmt.Sprintf("%s/prefix-%d/%s", encoding.name, prefixLength, wrapper.name), func(t *testing.T) {
+					result := Scan([]byte(wrapper.wrap(encoding.encode(payload))), []string{canary})
+					if !result.Complete || !result.Found || result.Match.Canary != canary {
+						t.Fatalf("Scan() = %#v; want complete encoded-canary match", result)
+					}
+					nearResult := Scan([]byte(wrapper.wrap(encoding.encode(near))), []string{canary})
+					if !nearResult.Complete || nearResult.Found {
+						t.Fatalf("Scan(same-length near value) = %#v; want complete no-match", nearResult)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestScanDetectsExactShortCanaryAfterBase64AssignmentDelimiter(t *testing.T) {
+	const canary = ".env"
+	for name, payload := range map[string]string{
+		"standard padded":     "key=LmVudg==",
+		"standard raw":        "key=LmVudg",
+		"URL padded":          `encoded="LmVudg=="`,
+		"URL raw":             `encoded='LmVudg'`,
+		"query padded":        "?data=LmVudg==&mode=safe",
+		"invalid leading run": "A=LmVudg==",
+		"invalid padding run": "====LmVudg==",
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := Scan([]byte(payload), []string{canary})
+			if !result.Complete || !result.Found || result.Match.Canary != canary {
+				t.Fatalf("Scan(%q) = %#v; want complete encoded-canary match", payload, result)
+			}
+		})
+	}
+
+	for _, payload := range []string{"key=LmVudw==", "key=LmVudw"} {
+		result := Scan([]byte(payload), []string{canary})
+		if !result.Complete || result.Found {
+			t.Fatalf("Scan(near %q) = %#v; want complete no-match", payload, result)
 		}
 	}
 }
@@ -66,6 +106,44 @@ func TestScanDetectsContextIndependentHexAndEscapedDebugSubsequences(t *testing.
 				t.Fatalf("Scan() = %#v; want %s canary", result, name)
 			}
 		})
+	}
+}
+
+func TestScanDetectsDecimalDebugCanaryInLargerWrapperAndRecoversMalformedPrefix(t *testing.T) {
+	const canary = "SYNTHETIC_DECIMAL_DETECTOR_CANARY_TASK13"
+	prefixed := append([]byte("prefix"), []byte(canary)...)
+	prefixed = append(prefixed, []byte("suffix")...)
+	decimal := fmt.Sprintf("%v", prefixed)
+	variants := map[string]string{
+		"larger byte slice wrapper": "prefix=[]byte(" + decimal + ");suffix",
+		"malformed word prefix":     "prefix=[not-a-byte " + decimal + ";suffix",
+		"out-of-range prefix":       "prefix=[999 " + decimal + ";suffix",
+	}
+	for name, payload := range variants {
+		t.Run(name, func(t *testing.T) {
+			result := Scan([]byte(payload), []string{canary})
+			if !result.Complete || !result.Found || result.Match.Canary != canary ||
+				result.Match.Encoding != EncodingDecimalBytes {
+				t.Fatalf("Scan() = %#v; want complete decimal canary match", result)
+			}
+		})
+	}
+}
+
+func TestDecimalDebugScanHasDeterministicLinearStepBudget(t *testing.T) {
+	payload := bytes.Repeat([]byte{'['}, 4<<20)
+	_, found, complete, steps := findDecimalByteTokensWithBudget(
+		payload, [][]byte{[]byte(".env")}, len(payload),
+	)
+	if !complete || found || steps != len(payload) {
+		t.Fatalf("full scan = found %t complete %t steps %d; want complete no-match in %d steps", found, complete, steps, len(payload))
+	}
+
+	_, found, complete, steps = findDecimalByteTokensWithBudget(
+		payload, [][]byte{[]byte(".env")}, len(payload)-1,
+	)
+	if complete || found || steps != len(payload)-1 {
+		t.Fatalf("bounded scan = found %t complete %t steps %d; want incomplete at exact budget %d", found, complete, steps, len(payload)-1)
 	}
 }
 
