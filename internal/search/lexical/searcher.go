@@ -51,6 +51,9 @@ func (s *Searcher) Search(ctx context.Context, query search.Query) ([]search.Hit
 	if strings.TrimSpace(query.RepositoryID) == "" || len(queryTerms) == 0 || query.Limit <= 0 {
 		return nil, ErrInvalidQuery
 	}
+	if err := search.ValidateFilter(query.Filter); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidQuery, err)
+	}
 
 	chunks, err := s.loader.Load(ctx, query.RepositoryID)
 	if err != nil {
@@ -61,6 +64,9 @@ func (s *Searcher) Search(ctx context.Context, query search.Query) ([]search.Hit
 	for _, chunk := range chunks {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("search repository snapshot: %w", err)
+		}
+		if !search.MatchesFilter(chunk, query.Filter) {
+			continue
 		}
 		score := scoreChunk(queryTerms, chunk)
 		if score > 0 {
