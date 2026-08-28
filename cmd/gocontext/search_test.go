@@ -86,6 +86,7 @@ func TestRunSearchRejectsInvalidUsage(t *testing.T) {
 	tests := [][]string{
 		{"search"},
 		{"search", "repository-only"},
+		{"search", "repository", "   "},
 		{"search", "--limit", "0", "repository", "term"},
 	}
 	for _, args := range tests {

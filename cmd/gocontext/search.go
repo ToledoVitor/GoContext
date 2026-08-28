@@ -30,6 +30,11 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		flags.Usage()
 		return 2
 	}
+	queryText := strings.TrimSpace(strings.Join(flags.Args()[1:], " "))
+	if queryText == "" {
+		flags.Usage()
+		return 2
+	}
 
 	storePath, err := storeDirectory(*storeFlag)
 	if err != nil {
@@ -54,7 +59,7 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	hits, err := searcher.Search(ctx, searchdomain.Query{
 		RepositoryID: repositoryID,
-		Text:         strings.Join(flags.Args()[1:], " "),
+		Text:         queryText,
 		Limit:        *limit,
 	})
 	if err != nil {
