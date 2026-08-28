@@ -217,14 +217,19 @@ func validJavaScriptArrowTail(ctx context.Context, value string, allowAwait bool
 		strings.HasPrefix(body, "/*") {
 		return false
 	}
-	return validJavaScriptArrowBodyStarter(ctx, body, allowAwait)
+	bodyState, valid := scanJavaScriptArrowBody(ctx, body, allowAwait)
+	return valid && validJavaScriptArrowBodyStarter(body, bodyState, allowAwait)
 }
 
 // validJavaScriptArrowBodyStarter deliberately recognizes a small expression
 // prefix subset. The lexical pass validates delimiters and literals; this
 // guard prevents statement/binary keywords and incomplete unary constructs
 // from becoming invented function boundaries without implementing an AST.
-func validJavaScriptArrowBodyStarter(ctx context.Context, body string, allowAwait bool) bool {
+func validJavaScriptArrowBodyStarter(
+	body string,
+	bodyState *javaScriptLexicalState,
+	allowAwait bool,
+) bool {
 	value := strings.TrimLeft(body, " \t\r\n")
 	for value != "" {
 		first := value[0]
@@ -233,7 +238,7 @@ func validJavaScriptArrowBodyStarter(ctx context.Context, body string, allowAwai
 			value = strings.TrimLeft(value[1:], " \t\r\n")
 			continue
 		case first == '<':
-			return completeJavaScriptJSXExpression(ctx, value)
+			return startsJavaScriptJSX(value, 0) && bodyState.atTopLevel()
 		case first == '/' || first == '\'' || first == '"' || first == '`' ||
 			first == '(' || first == '[' || first == '{':
 			return true
@@ -269,6 +274,24 @@ func validJavaScriptArrowBodyStarter(ctx context.Context, body string, allowAwai
 	return false
 }
 
+func scanJavaScriptArrowBody(
+	ctx context.Context,
+	body string,
+	allowAwait bool,
+) (*javaScriptLexicalState, bool) {
+	state := newJavaScriptLexicalState()
+	state.identifierPolicy = func(identifier string) bool {
+		if identifier == "yield" {
+			return false
+		}
+		return identifier != "await" || allowAwait
+	}
+	if err := state.consume(ctx, body); err != nil {
+		return state, false
+	}
+	return state, !state.identifierRejected && state.trustworthy()
+}
+
 func validJavaScriptClassExpressionSyntax(value string) bool {
 	if !strings.HasPrefix(value, "class") {
 		return false
@@ -299,17 +322,6 @@ func validJavaScriptClassExpressionSyntax(value string) bool {
 		}
 	}
 	return strings.HasPrefix(remainder, "{")
-}
-
-func completeJavaScriptJSXExpression(ctx context.Context, value string) bool {
-	if !startsJavaScriptJSX(value, 0) {
-		return false
-	}
-	state := newJavaScriptLexicalState()
-	if err := state.consume(ctx, value); err != nil {
-		return false
-	}
-	return state.atTopLevel()
 }
 
 func validJavaScriptParameterList(value string) (string, bool) {

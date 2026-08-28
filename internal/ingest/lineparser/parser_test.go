@@ -465,6 +465,89 @@ func TestParserJavaScriptPreservesObjectDivisionContext(t *testing.T) {
 	assertSymbols(t, symbols, want)
 }
 
+func TestParserJavaScriptAmbiguousSlashAfterBraceFailsClosed(t *testing.T) {
+	prefixes := []string{
+		"function before() {} /`/.test(value)",
+		"function before() {} /* bridge */ /`/.test(value)",
+		"; {} /`/.test(value)",
+		"label: {} /`/.test(value)",
+		"class Before {} /`/.test(value)",
+	}
+	for _, prefix := range prefixes {
+		t.Run(prefix, func(t *testing.T) {
+			lines := []string{
+				prefix,
+				"const source = `first",
+				"function fake() {}",
+				"`",
+				"function real() {}",
+			}
+			file := source.File{
+				Reference: source.Reference{Path: "src/ambiguous-brace.js", StartLine: 1, EndLine: len(lines)},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(strings.Join(lines, "\n") + "\n"),
+			}
+
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(symbols) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want fail-closed result", prefix, symbols)
+			}
+		})
+	}
+}
+
+func TestParserJavaScriptAmbiguousBraceStateSurvivesNewline(t *testing.T) {
+	lines := []string{
+		"function before() {}",
+		"/`/.test(value)",
+		"const source = `first",
+		"function fake() {}",
+		"`",
+		"function real() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/ambiguous-newline.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "before", Kind: "function", Signature: lines[0], Reference: source.Reference{Path: "src/ambiguous-newline.js", StartLine: 1, EndLine: 1}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
+func TestParserJavaScriptLeadingCommentKeepsStatementBlockContext(t *testing.T) {
+	lines := []string{
+		"/* lead */ {} /`/.test(value)",
+		"const source = `first",
+		"function fake() {}",
+		"`",
+		"function real() {}",
+	}
+	file := source.File{
+		Reference: source.Reference{Path: "src/comment-block.js", StartLine: 1, EndLine: len(lines)},
+		Language:  source.LanguageJavaScript,
+		Content:   []byte(strings.Join(lines, "\n") + "\n"),
+	}
+
+	symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.Symbol{
+		{Name: "real", Kind: "function", Signature: lines[4], Reference: source.Reference{Path: "src/comment-block.js", StartLine: 5, EndLine: 5}},
+	}
+	assertSymbols(t, symbols, want)
+}
+
 func TestParserJavaScriptIgnoresDeclarationTextInsideMultilineJSX(t *testing.T) {
 	lines := []string{
 		"<section data-label=\"</section>\">",
@@ -654,6 +737,70 @@ func TestParserJavaScriptAwaitRequiresAsyncArrowAndYieldFailsClosed(t *testing.T
 			want := []source.Symbol{{
 				Name: test.name, Kind: "function", Signature: test.line,
 				Reference: source.Reference{Path: "src/async-arrow.js", StartLine: 1, EndLine: 1},
+			}}
+			assertSymbols(t, symbols, want)
+		})
+	}
+}
+
+func TestParserJavaScriptAwaitAndYieldAreCheckedThroughoutArrowExpression(t *testing.T) {
+	invalidLines := []string{
+		"const parenAwait = () => (await load())",
+		"const arrayAwait = () => [await load()]",
+		"const objectAwait = () => ({ value: await load() })",
+		"const templateAwait = () => `${await load()}`",
+		"const jsxAwait = () => <Tag value={await load()} />",
+		"const parenYield = () => (yield value)",
+		"const arrayYield = () => [yield value]",
+		"const objectYield = () => ({ value: yield value })",
+		"const templateYield = () => `${yield value}`",
+		"const jsxYield = () => <Tag value={yield value} />",
+		"const asyncYield = async () => ({ value: yield value })",
+	}
+	for _, line := range invalidLines {
+		t.Run("invalid "+line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/nested-keywords.jsx", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(symbols) != 0 {
+				t.Fatalf("Parse(%q) symbols = %#v, want none", line, symbols)
+			}
+		})
+	}
+
+	validLines := []struct {
+		line string
+		name string
+	}{
+		{line: "const stringWords = () => 'await yield'", name: "stringWords"},
+		{line: "const regexWords = () => /await|yield/.test(value)", name: "regexWords"},
+		{line: "const commentWords = () => (value /* await yield */)", name: "commentWords"},
+		{line: "const templateWords = () => `await yield`", name: "templateWords"},
+		{line: "const jsxWords = () => <Tag>await yield</Tag>", name: "jsxWords"},
+		{line: "const asyncObject = async () => ({ value: [await load()] })", name: "asyncObject"},
+		{line: "const asyncTemplate = async () => `${await load()}`", name: "asyncTemplate"},
+		{line: "const asyncJSX = async () => <Tag value={await load()} />", name: "asyncJSX"},
+	}
+	for _, test := range validLines {
+		t.Run("valid "+test.line, func(t *testing.T) {
+			file := source.File{
+				Reference: source.Reference{Path: "src/opaque-keywords.jsx", StartLine: 1, EndLine: 1},
+				Language:  source.LanguageJavaScript,
+				Content:   []byte(test.line + "\n"),
+			}
+			symbols, err := lineparser.NewParser().Parse(context.Background(), file)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			want := []source.Symbol{{
+				Name: test.name, Kind: "function", Signature: test.line,
+				Reference: source.Reference{Path: "src/opaque-keywords.jsx", StartLine: 1, EndLine: 1},
 			}}
 			assertSymbols(t, symbols, want)
 		})
