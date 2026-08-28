@@ -1,4 +1,4 @@
-//go:build windows
+//go:build !windows
 
 package main
 
@@ -8,13 +8,7 @@ import (
 	"testing"
 )
 
-func TestSyncMarkerDirectoryWindowsDoesNotRejectDirectory(t *testing.T) {
-	if err := syncMarkerDirectory(t.TempDir()); err != nil {
-		t.Fatalf("syncMarkerDirectory() error = %v, want best-effort success", err)
-	}
-}
-
-func TestReplaceRollbackMarkerWindowsUsesDurableAtomicReplacement(t *testing.T) {
+func TestReplaceRollbackMarkerUnixReplacesAndPersistsDirectoryEntry(t *testing.T) {
 	directory := t.TempDir()
 	temporary := filepath.Join(directory, "marker.tmp")
 	target := filepath.Join(directory, "marker.json")

@@ -1469,6 +1469,31 @@ func TestOpenExistingRejectsUnsafePrivateDatabaseModeWithoutMutation(t *testing.
 	}
 }
 
+func TestOpenExistingRejectsUnsafePrivateStoreDirectoryWithoutMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX private mode bits are not meaningful on Windows")
+	}
+	directory := t.TempDir()
+	store := openStore(t, directory)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(created) error = %v", err)
+	}
+	if err := os.Chmod(directory, 0o750); err != nil {
+		t.Fatalf("Chmod(directory) error = %v", err)
+	}
+
+	if _, err := indexsqlite.OpenExisting(directory); err == nil || errors.Is(err, index.ErrNotFound) {
+		t.Fatalf("OpenExisting(unsafe directory mode) error = %v, want fatal non-absence error", err)
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		t.Fatalf("Lstat(directory) error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o750 {
+		t.Fatalf("OpenExisting changed directory mode to %#o, want %#o", got, 0o750)
+	}
+}
+
 func TestOpenExistingRejectsUnknownSchemaWithoutMutation(t *testing.T) {
 	directory := t.TempDir()
 	databasePath := filepath.Join(directory, "index-v2.sqlite3")
@@ -1484,6 +1509,9 @@ func TestOpenExistingRejectsUnknownSchemaWithoutMutation(t *testing.T) {
 	}
 	if err := os.Chmod(databasePath, 0o600); err != nil {
 		t.Fatalf("Chmod(future schema) error = %v", err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatalf("Chmod(future schema directory) error = %v", err)
 	}
 	beforeBytes, err := os.ReadFile(databasePath)
 	if err != nil {
@@ -1589,6 +1617,62 @@ func TestOpenExistingLoadsPersistedStore(t *testing.T) {
 	}
 	if afterInfo.Size() != beforeInfo.Size() || !afterInfo.ModTime().Equal(beforeInfo.ModTime()) || afterInfo.Mode() != beforeInfo.Mode() {
 		t.Fatalf("OpenExisting changed database metadata: before=%v after=%v", beforeInfo, afterInfo)
+	}
+}
+
+func TestOpenExistingSupportsTwoSimultaneousBoundReaders(t *testing.T) {
+	directory := t.TempDir()
+	created := openStore(t, directory)
+	generation := generationFromCorpus(t, "repository", "generation", "", []source.Chunk{
+		sampleChunk("chunk", "persisted.py", "VALUE = 1"),
+	})
+	if err := created.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatalf("Close(created) error = %v", err)
+	}
+	reopened, err := indexsqlite.OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting() error = %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	first, err := reopened.BindActive(context.Background(), generation.RepositoryID)
+	if err != nil {
+		t.Fatalf("BindActive(first) error = %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	secondContext, cancelSecond := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSecond()
+	second, err := reopened.BindActive(secondContext, generation.RepositoryID)
+	if err != nil {
+		t.Fatalf("BindActive(second while first pinned) error = %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	type loadResult struct {
+		name   string
+		chunks []source.Chunk
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan loadResult, 2)
+	for name, reader := range map[string]*indexsqlite.BoundReader{"first": first, "second": second} {
+		go func() {
+			<-start
+			loaded, err := reader.Load(context.Background(), generation.RepositoryID)
+			results <- loadResult{name: name, chunks: loaded, err: err}
+		}()
+	}
+	close(start)
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("Load(%s) error = %v", result.name, result.err)
+		}
+		if !reflect.DeepEqual(result.chunks, generation.Chunks) {
+			t.Fatalf("Load(%s) = %#v, want %#v", result.name, result.chunks, generation.Chunks)
+		}
 	}
 }
 

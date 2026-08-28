@@ -1,12 +1,15 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -15,7 +18,320 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
-func TestOpenExistingPinsValidatedDatabaseIdentityAcrossPathSwap(t *testing.T) {
+func TestWriterInitializesPrivateStoreIdentityAndReadOnlyRequiresIt(t *testing.T) {
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, databaseName)
+	created, err := createPrivateDatabaseFile(databasePath)
+	if err != nil || !created {
+		t.Fatalf("createPrivateDatabaseFile() = %v, %v; want created", created, err)
+	}
+	if err := initializeNewDatabase(databasePath); err != nil {
+		t.Fatalf("initializeNewDatabase() error = %v", err)
+	}
+	if err := os.Chmod(databasePath, 0o600); err != nil {
+		t.Fatalf("Chmod(database) error = %v", err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatalf("Chmod(directory) error = %v", err)
+	}
+
+	legacyReader, err := OpenExisting(directory)
+	if legacyReader != nil {
+		_ = legacyReader.Close()
+		t.Fatal("OpenExisting(legacy store) returned store, want nil")
+	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("OpenExisting(legacy store) error = %v, want ErrReindexRequired", err)
+	}
+	identityPath := filepath.Join(directory, "index-v2.identity.json")
+	if _, err := os.Lstat(identityPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("OpenExisting(legacy store) identity sidecar error = %v, want absent", err)
+	}
+
+	writer, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore(legacy store) error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close(writer) error = %v", err)
+	}
+	secondWriter, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore(initialized store) error = %v", err)
+	}
+	if err := secondWriter.Close(); err != nil {
+		t.Fatalf("Close(second writer) error = %v", err)
+	}
+	payload, err := os.ReadFile(identityPath)
+	if err != nil {
+		t.Fatalf("ReadFile(identity) error = %v", err)
+	}
+	var sidecar struct {
+		Version int    `json:"version"`
+		StoreID string `json:"store_id"`
+	}
+	if err := json.Unmarshal(payload, &sidecar); err != nil {
+		t.Fatalf("Unmarshal(identity) error = %v", err)
+	}
+	if sidecar.Version != 1 || len(sidecar.StoreID) != 64 {
+		t.Fatalf("identity sidecar = %#v, want version 1 opaque 32-byte hex ID", sidecar)
+	}
+	if filepath.IsAbs(storeIdentityRepositoryID(sidecar.StoreID)) {
+		t.Fatalf("reserved identity row %q can collide with a canonical absolute repository ID", storeIdentityRepositoryID(sidecar.StoreID))
+	}
+	identityInfo, err := os.Lstat(identityPath)
+	if err != nil {
+		t.Fatalf("Lstat(identity) error = %v", err)
+	}
+	if !identityInfo.Mode().IsRegular() || (runtime.GOOS != "windows" && identityInfo.Mode().Perm() != 0o600) {
+		t.Fatalf("identity sidecar mode = %v, want private regular file", identityInfo.Mode())
+	}
+	db, err := sql.Open("sqlite", inspectionDataSourceName(databasePath))
+	if err != nil {
+		t.Fatalf("sql.Open(identity inspection) error = %v", err)
+	}
+	defer db.Close()
+	var reservedRows int
+	if err := db.QueryRow(`SELECT count(*) FROM repositories WHERE repository_id LIKE 'gocontext:store-identity:v1:%' AND active_generation IS NULL`).Scan(&reservedRows); err != nil {
+		t.Fatalf("query reserved identity row error = %v", err)
+	}
+	if reservedRows != 1 {
+		t.Fatalf("reserved identity rows = %d, want 1", reservedRows)
+	}
+
+	reader, err := OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting(initialized store) error = %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close(reader) error = %v", err)
+	}
+}
+
+func TestOpenExistingRejectsUntrustedStoreIdentitySidecars(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string, []byte)
+		skip   bool
+	}{
+		{
+			name: "missing",
+			mutate: func(t *testing.T, path string, _ []byte) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(identity) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "mismatch",
+			mutate: func(t *testing.T, path string, _ []byte) {
+				t.Helper()
+				payload := []byte(`{"version":1,"store_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+				if err := os.WriteFile(path, payload, 0o600); err != nil {
+					t.Fatalf("WriteFile(identity mismatch) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			skip: runtime.GOOS == "windows",
+			mutate: func(t *testing.T, path string, original []byte) {
+				t.Helper()
+				target := filepath.Join(t.TempDir(), "identity-target")
+				if err := os.WriteFile(target, original, 0o600); err != nil {
+					t.Fatalf("WriteFile(identity target) error = %v", err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(identity) error = %v", err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatalf("Symlink(identity) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "nonregular",
+			mutate: func(t *testing.T, path string, _ []byte) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove(identity) error = %v", err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("Mkdir(identity path) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "permissive",
+			skip: runtime.GOOS == "windows",
+			mutate: func(t *testing.T, path string, _ []byte) {
+				t.Helper()
+				if err := os.Chmod(path, 0o640); err != nil {
+					t.Fatalf("Chmod(identity) error = %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.skip {
+				t.Skip("filesystem behavior is not reliable on this platform")
+			}
+			directory := t.TempDir()
+			store, err := NewStore(directory)
+			if err != nil {
+				t.Fatalf("NewStore() error = %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+			identityPath := filepath.Join(directory, storeIdentitySidecar)
+			original, err := os.ReadFile(identityPath)
+			if err != nil {
+				t.Fatalf("ReadFile(identity) error = %v", err)
+			}
+			test.mutate(t, identityPath, original)
+
+			opened, err := OpenExisting(directory)
+			if opened != nil {
+				_ = opened.Close()
+				t.Fatal("OpenExisting(untrusted identity) returned store, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) || strings.Contains(err.Error(), string(original)) {
+				t.Fatalf("OpenExisting(untrusted identity) error = %v, want sanitized ErrReindexRequired", err)
+			}
+		})
+	}
+}
+
+func TestOpenExistingFailurePreservesOnlySanitizedOperationAndCleanupCategories(t *testing.T) {
+	operationCanary := errors.New("PRIVATE_OPEN_OPERATION_CANARY")
+	connectionCloseCanary := errors.New("PRIVATE_CONNECTION_CLOSE_CANARY")
+	databaseCloseCanary := errors.New("PRIVATE_DATABASE_CLOSE_CANARY")
+	err := openExistingFailure(
+		errors.Join(index.ErrReindexRequired, operationCanary),
+		connectionCloseCanary,
+		databaseCloseCanary,
+	)
+	if !errors.Is(err, index.ErrReindexRequired) || !errors.Is(err, errOpenExistingCleanup) {
+		t.Fatalf("openExistingFailure() error = %v, want reindex and cleanup categories", err)
+	}
+	for _, canary := range []string{operationCanary.Error(), connectionCloseCanary.Error(), databaseCloseCanary.Error()} {
+		if errorTreeContains(err, canary) {
+			t.Fatalf("openExistingFailure() error tree exposes %q", canary)
+		}
+	}
+}
+
+func TestStoreRejectsReservedIdentityRepositoryIDWithoutCorruptingIdentity(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	reservedID := storeIdentityRepositoryID(strings.Repeat("a", 64))
+	generation := internalTestGeneration(t, reservedID, "generation", "reserved.py", "VALUE = 1")
+	if err := store.Replace(context.Background(), generation); !errors.Is(err, index.ErrInvalidGeneration) {
+		t.Fatalf("Replace(reserved repository) error = %v, want ErrInvalidGeneration", err)
+	}
+	if _, err := store.ActiveGeneration(context.Background(), reservedID); !errors.Is(err, index.ErrInvalidGeneration) {
+		t.Fatalf("ActiveGeneration(reserved repository) error = %v, want ErrInvalidGeneration", err)
+	}
+	if _, err := store.BindActive(context.Background(), reservedID); !errors.Is(err, index.ErrInvalidGeneration) {
+		t.Fatalf("BindActive(reserved repository) error = %v, want ErrInvalidGeneration", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	reopened, err := OpenExisting(directory)
+	if err != nil {
+		t.Fatalf("OpenExisting(after rejection) error = %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close(reopened) error = %v", err)
+	}
+}
+
+func TestNewStoreValidatesExclusiveCreateCollisionBeforeMutableOpen(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		schema string
+	}{
+		{name: "future schema", schema: `CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES (2)`},
+		{name: "unrelated sqlite", schema: `CREATE TABLE unrelated(value TEXT)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			var beforeBytes []byte
+			var beforeEntries []string
+			store, err := newStore(directory, storeOpenHooks{
+				beforeCreateDatabase: func(databasePath string) error {
+					db, err := sql.Open("sqlite", bootstrapDataSourceName(databasePath))
+					if err != nil {
+						return err
+					}
+					if _, err := db.ExecContext(context.Background(), test.schema); err != nil {
+						_ = db.Close()
+						return err
+					}
+					if err := db.Close(); err != nil {
+						return err
+					}
+					if err := os.Chmod(databasePath, 0o600); err != nil {
+						return err
+					}
+					beforeBytes, err = os.ReadFile(databasePath)
+					if err != nil {
+						return err
+					}
+					beforeEntries, err = internalDirectoryEntries(directory)
+					return err
+				},
+			})
+			if store != nil {
+				_ = store.Close()
+				t.Fatal("newStore(collision) returned store, want nil")
+			}
+			if !errors.Is(err, index.ErrReindexRequired) {
+				t.Fatalf("newStore(collision) error = %v, want ErrReindexRequired", err)
+			}
+			databasePath := filepath.Join(directory, databaseName)
+			afterBytes, readErr := os.ReadFile(databasePath)
+			if readErr != nil {
+				t.Fatalf("ReadFile(after collision) error = %v", readErr)
+			}
+			if !bytes.Equal(afterBytes, beforeBytes) {
+				t.Fatal("newStore(collision) mutated colliding database bytes")
+			}
+			afterEntries, readErr := internalDirectoryEntries(directory)
+			if readErr != nil {
+				t.Fatalf("ReadDir(after collision) error = %v", readErr)
+			}
+			if !reflect.DeepEqual(afterEntries, beforeEntries) {
+				t.Fatalf("newStore(collision) entries = %v, want unchanged %v", afterEntries, beforeEntries)
+			}
+			for _, sidecar := range []string{databasePath + "-wal", databasePath + "-shm"} {
+				if _, statErr := os.Lstat(sidecar); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("Lstat(%s) error = %v, want absent", filepath.Base(sidecar), statErr)
+				}
+			}
+		})
+	}
+}
+
+func internalDirectoryEntries(directory string) ([]string, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(entries))
+	for index, entry := range entries {
+		names[index] = entry.Name()
+	}
+	return names, nil
+}
+
+func TestOpenExistingFutureConnectionRejectsDatabasePathSwap(t *testing.T) {
 	firstDirectory := t.TempDir()
 	firstStore, err := NewStore(firstDirectory)
 	if err != nil {
@@ -63,16 +379,76 @@ func TestOpenExistingPinsValidatedDatabaseIdentityAcrossPathSwap(t *testing.T) {
 		t.Fatalf("Rename(second into first path) error = %v", err)
 	}
 
-	loaded, err := opened.Load(context.Background(), firstGeneration.RepositoryID)
+	if _, err := opened.Load(context.Background(), firstGeneration.RepositoryID); !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("Load(first after path swap) error = %v, want identity ErrReindexRequired", err)
+	}
+}
+
+func TestOpenExistingRejectsDatabaseABAWhileOpening(t *testing.T) {
+	firstDirectory, firstPath := internalIdentityStore(t, "first-repository", "first-generation")
+	secondDirectory, secondPath := internalIdentityStore(t, "second-repository", "second-generation")
+	firstIdentity, err := readStoreIdentitySidecar(firstDirectory)
 	if err != nil {
-		t.Fatalf("Load(first after path swap) error = %v", err)
+		t.Fatalf("readStoreIdentitySidecar(first) error = %v", err)
 	}
-	if !reflect.DeepEqual(loaded, firstGeneration.Chunks) {
-		t.Fatalf("Load(first after path swap) = %#v, want pinned %#v", loaded, firstGeneration.Chunks)
+	secondIdentity, err := readStoreIdentitySidecar(secondDirectory)
+	if err != nil {
+		t.Fatalf("readStoreIdentitySidecar(second) error = %v", err)
 	}
-	if _, err := opened.Load(context.Background(), secondGeneration.RepositoryID); !errors.Is(err, index.ErrNotFound) {
-		t.Fatalf("Load(second after path swap) error = %v, want pinned database ErrNotFound", err)
+	firstAside := firstPath + ".original"
+
+	store, err := openExisting(firstDirectory, openExistingHooks{
+		beforeOperationalConnection: func(string) error {
+			if err := os.Rename(firstPath, firstAside); err != nil {
+				return err
+			}
+			return os.Rename(secondPath, firstPath)
+		},
+		afterOperationalConnection: func(string) error {
+			if err := os.Rename(firstPath, secondPath); err != nil {
+				return err
+			}
+			return os.Rename(firstAside, firstPath)
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("openExisting(ABA) returned store, want nil")
 	}
+	if !errors.Is(err, index.ErrReindexRequired) {
+		t.Fatalf("openExisting(ABA) error = %v, want ErrReindexRequired", err)
+	}
+	for _, identity := range []string{firstIdentity, secondIdentity} {
+		if strings.Contains(err.Error(), identity) {
+			t.Fatalf("openExisting(ABA) error exposes opaque store identity %q", identity)
+		}
+	}
+	if _, err := os.Lstat(firstPath); err != nil {
+		t.Fatalf("Lstat(first restored database) error = %v", err)
+	}
+	if _, err := os.Lstat(secondPath); err != nil {
+		t.Fatalf("Lstat(second restored database) error = %v", err)
+	}
+}
+
+func internalIdentityStore(t *testing.T, repositoryID, generationID string) (string, string) {
+	t.Helper()
+	directory := t.TempDir()
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore(%s) error = %v", repositoryID, err)
+	}
+	generation := internalTestGeneration(t, repositoryID, generationID, repositoryID+".py", "VALUE = 1")
+	if err := store.Replace(context.Background(), generation); err != nil {
+		t.Fatalf("Replace(%s) error = %v", repositoryID, err)
+	}
+	if err := store.checkpoint(context.Background()); err != nil {
+		t.Fatalf("checkpoint(%s) error = %v", repositoryID, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close(%s) error = %v", repositoryID, err)
+	}
+	return directory, filepath.Join(directory, databaseName)
 }
 
 func internalTestGeneration(t *testing.T, repositoryID, generationID, path, text string) index.Generation {

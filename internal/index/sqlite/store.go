@@ -29,16 +29,41 @@ import (
 const databaseName = "index-v2.sqlite3"
 
 var (
-	errBoundReaderClosed = errors.New("bound sqlite reader is closed")
-	errPublicationFailed = errors.New("sqlite index publication failed")
+	errBoundReaderClosed   = errors.New("bound sqlite reader is closed")
+	errPublicationFailed   = errors.New("sqlite index publication failed")
+	errOpenExistingFailed  = errors.New("open existing sqlite index store failed")
+	errOpenExistingCleanup = errors.New("open existing sqlite index store cleanup failed")
 )
+
+func openExistingFailure(operationErr error, cleanupErrs ...error) error {
+	var categories []error
+	switch {
+	case errors.Is(operationErr, index.ErrNotFound):
+		categories = append(categories, index.ErrNotFound)
+	case errors.Is(operationErr, index.ErrReindexRequired):
+		categories = append(categories, index.ErrReindexRequired)
+	case errors.Is(operationErr, context.Canceled):
+		categories = append(categories, context.Canceled)
+	case errors.Is(operationErr, context.DeadlineExceeded):
+		categories = append(categories, context.DeadlineExceeded)
+	case operationErr != nil:
+		categories = append(categories, errOpenExistingFailed)
+	}
+	for _, cleanupErr := range cleanupErrs {
+		if cleanupErr != nil {
+			categories = append(categories, errOpenExistingCleanup)
+			break
+		}
+	}
+	return errors.Join(categories...)
+}
 
 // Store keeps complete repository generations in one local SQLite database.
 type Store struct {
-	db              *sql.DB
-	operationalConn *sql.Conn
-	readOnly        bool
-	writeToken      chan struct{}
+	db            *sql.DB
+	readOnly      bool
+	storeIdentity string
+	writeToken    chan struct{}
 
 	lifecycleMu sync.Mutex
 	readers     map[*BoundReader]struct{}
@@ -67,6 +92,14 @@ type BoundReader struct {
 
 // NewStore creates or opens a private SQLite corpus store.
 func NewStore(directory string) (*Store, error) {
+	return newStore(directory, storeOpenHooks{})
+}
+
+type storeOpenHooks struct {
+	beforeCreateDatabase func(string) error
+}
+
+func newStore(directory string, hooks storeOpenHooks) (*Store, error) {
 	if strings.TrimSpace(directory) == "" {
 		return nil, fmt.Errorf("create sqlite index store: directory is empty")
 	}
@@ -111,6 +144,11 @@ func NewStore(directory string) (*Store, error) {
 		if err := os.Chmod(canonical, 0o700); err != nil {
 			return nil, fmt.Errorf("create sqlite index store: secure directory: %w", err)
 		}
+		if hooks.beforeCreateDatabase != nil {
+			if err := hooks.beforeCreateDatabase(databasePath); err != nil {
+				return nil, fmt.Errorf("create sqlite index store: prepare database creation: %w", err)
+			}
+		}
 		created, err = createPrivateDatabaseFile(databasePath)
 		if err != nil {
 			return nil, fmt.Errorf("create sqlite index store: create database: %w", err)
@@ -120,7 +158,10 @@ func NewStore(directory string) (*Store, error) {
 			if err != nil {
 				return nil, fmt.Errorf("create sqlite index store: inspect database collision: %w", err)
 			}
-			if err := validateDatabaseFile(databaseInfo, false); err != nil {
+			if err := validateDatabaseFile(databaseInfo, true); err != nil {
+				return nil, fmt.Errorf("create sqlite index store: %w", err)
+			}
+			if err := inspectDatabase(databasePath); err != nil {
 				return nil, fmt.Errorf("create sqlite index store: %w", err)
 			}
 			databaseExists = true
@@ -148,15 +189,23 @@ func NewStore(directory string) (*Store, error) {
 			return nil, fmt.Errorf("create sqlite index store: secure database: %w", err)
 		}
 	}
+	storeIdentity, err := initializeStoreIdentity(canonical, databasePath)
+	if err != nil {
+		if created {
+			removeCreatedDatabase(databasePath)
+		}
+		return nil, formatStoreIdentityError("create sqlite index store")
+	}
 
 	db, err := sql.Open("sqlite", dataSourceName(databasePath))
 	if err != nil {
 		return nil, fmt.Errorf("create sqlite index store: open database: %w", err)
 	}
 	store := &Store{
-		db:         db,
-		writeToken: make(chan struct{}, 1),
-		readers:    make(map[*BoundReader]struct{}),
+		db:            db,
+		storeIdentity: storeIdentity,
+		writeToken:    make(chan struct{}, 1),
+		readers:       make(map[*BoundReader]struct{}),
 	}
 	store.writeToken <- struct{}{}
 	if err := db.PingContext(context.Background()); err != nil {
@@ -172,6 +221,15 @@ func NewStore(directory string) (*Store, error) {
 // OpenExisting opens a previously initialized SQLite store without creating or
 // changing the requested directory or database when either is absent.
 func OpenExisting(directory string) (*Store, error) {
+	return openExisting(directory, openExistingHooks{})
+}
+
+type openExistingHooks struct {
+	beforeOperationalConnection func(string) error
+	afterOperationalConnection  func(string) error
+}
+
+func openExisting(directory string, hooks openExistingHooks) (*Store, error) {
 	if strings.TrimSpace(directory) == "" {
 		return nil, fmt.Errorf("open existing sqlite index store: directory is empty")
 	}
@@ -200,25 +258,42 @@ func OpenExisting(directory string) (*Store, error) {
 	} else if err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: inspect database: %w", err)
 	}
+	canonicalDirectoryInfo, err := os.Stat(canonical)
+	if err != nil || !canonicalDirectoryInfo.IsDir() || validatePrivateMode(canonicalDirectoryInfo) != nil {
+		return nil, errors.New("open existing sqlite index store: unsafe private directory")
+	}
 	if err := validateDatabaseFile(beforeInfo, true); err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: %w", err)
+	}
+	storeIdentity, err := readStoreIdentitySidecar(canonical)
+	if err != nil {
+		return nil, formatStoreIdentityError("open existing sqlite index store")
 	}
 
 	db, err := sql.Open("sqlite", readOnlyDataSourceName(databasePath))
 	if err != nil {
 		return nil, fmt.Errorf("open existing sqlite index store: open database: %w", err)
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	if hooks.beforeOperationalConnection != nil {
+		if err := hooks.beforeOperationalConnection(databasePath); err != nil {
+			_ = db.Close()
+			return nil, formatStoreIdentityError("open existing sqlite index store")
+		}
+	}
 	connection, err := db.Conn(context.Background())
 	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("open existing sqlite index store: open operational database: %w", err)
+		closeErr := db.Close()
+		return nil, fmt.Errorf("open existing sqlite index store: %w", openExistingFailure(err, closeErr))
 	}
 	closeFailure := func(openErr error) (*Store, error) {
-		_ = connection.Close()
-		_ = db.Close()
-		return nil, fmt.Errorf("open existing sqlite index store: %w", openErr)
+		connectionCloseErr := connection.Close()
+		databaseCloseErr := db.Close()
+		return nil, fmt.Errorf("open existing sqlite index store: %w", openExistingFailure(openErr, connectionCloseErr, databaseCloseErr))
+	}
+	if hooks.afterOperationalConnection != nil {
+		if err := hooks.afterOperationalConnection(databasePath); err != nil {
+			return closeFailure(invalidStoreIdentity())
+		}
 	}
 	afterOpenInfo, err := secureDatabaseInfo(databasePath)
 	if err != nil {
@@ -230,6 +305,9 @@ func OpenExisting(directory string) (*Store, error) {
 	if err := validateSchema(context.Background(), connection); err != nil {
 		return closeFailure(err)
 	}
+	if err := verifyStoreIdentity(context.Background(), connection, storeIdentity); err != nil {
+		return closeFailure(invalidStoreIdentity())
+	}
 	afterValidationInfo, err := secureDatabaseInfo(databasePath)
 	if err != nil {
 		return closeFailure(err)
@@ -237,12 +315,16 @@ func OpenExisting(directory string) (*Store, error) {
 	if !os.SameFile(beforeInfo, afterValidationInfo) {
 		return closeFailure(errors.New("database identity changed while validating"))
 	}
+	if err := connection.Close(); err != nil {
+		databaseCloseErr := db.Close()
+		return nil, fmt.Errorf("open existing sqlite index store: %w", openExistingFailure(nil, err, databaseCloseErr))
+	}
 	store := &Store{
-		db:              db,
-		operationalConn: connection,
-		readOnly:        true,
-		writeToken:      make(chan struct{}, 1),
-		readers:         make(map[*BoundReader]struct{}),
+		db:            db,
+		readOnly:      true,
+		storeIdentity: storeIdentity,
+		writeToken:    make(chan struct{}, 1),
+		readers:       make(map[*BoundReader]struct{}),
 	}
 	store.writeToken <- struct{}{}
 	return store, nil
@@ -656,11 +738,6 @@ func (s *Store) Close() error {
 				s.closeErr = err
 			}
 		}
-		if s.operationalConn != nil {
-			if err := s.operationalConn.Close(); err != nil && s.closeErr == nil {
-				s.closeErr = err
-			}
-		}
 		if err := s.db.Close(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
@@ -673,7 +750,7 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("replace sqlite index: %w", err)
 	}
-	if strings.TrimSpace(generation.RepositoryID) == "" || strings.TrimSpace(generation.ID) == "" {
+	if strings.TrimSpace(generation.RepositoryID) == "" || isStoreIdentityRepositoryID(generation.RepositoryID) || strings.TrimSpace(generation.ID) == "" {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
 	}
 	if s.readOnly {
@@ -760,6 +837,10 @@ func (s *Store) publishAttempt(ctx context.Context, generation index.Generation,
 	connection, err := s.db.Conn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquire write connection: %w", err)
+	}
+	if err := verifyStoreIdentity(ctx, connection, s.storeIdentity); err != nil {
+		_ = connection.Close()
+		return false, invalidStoreIdentity()
 	}
 	return publishOnConnection(ctx, connection, generation, vectors)
 }
@@ -915,6 +996,9 @@ func (s *Store) purgeInactive(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := verifyStoreIdentity(ctx, tx, s.storeIdentity); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM generations
 		WHERE NOT EXISTS (
@@ -937,8 +1021,16 @@ func (s *Store) checkpoint(ctx context.Context) error {
 	if len(s.readers) != 0 {
 		return fmt.Errorf("bound readers remain open")
 	}
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if err := verifyStoreIdentity(ctx, connection, s.storeIdentity); err != nil {
+		return err
+	}
 	var busy, logFrames, checkpointedFrames int
-	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
+	if err := connection.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
 		&busy, &logFrames, &checkpointedFrames,
 	); err != nil {
 		return err
@@ -1108,15 +1200,19 @@ func (s *Store) ActiveGeneration(ctx context.Context, repositoryID string) (stri
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("read active sqlite index: %w", err)
 	}
-	if strings.TrimSpace(repositoryID) == "" {
+	if strings.TrimSpace(repositoryID) == "" || isStoreIdentityRepositoryID(repositoryID) {
 		return "", fmt.Errorf("read active sqlite index: %w", index.ErrInvalidGeneration)
 	}
-	var generationID sql.NullString
-	queryer := schemaQuerier(s.db)
-	if s.operationalConn != nil {
-		queryer = s.operationalConn
+	connection, err := s.db.Conn(ctx)
+	if err != nil {
+		return "", invalidStoreIdentity()
 	}
-	err := queryer.QueryRowContext(ctx, `SELECT active_generation FROM repositories WHERE repository_id = ?`, repositoryID).Scan(&generationID)
+	defer connection.Close()
+	if err := verifyStoreIdentity(ctx, connection, s.storeIdentity); err != nil {
+		return "", err
+	}
+	var generationID sql.NullString
+	err = connection.QueryRowContext(ctx, `SELECT active_generation FROM repositories WHERE repository_id = ?`, repositoryID).Scan(&generationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", index.ErrNotFound
 	}
@@ -1134,7 +1230,7 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("bind active sqlite index: %w", err)
 	}
-	if strings.TrimSpace(repositoryID) == "" {
+	if strings.TrimSpace(repositoryID) == "" || isStoreIdentityRepositoryID(repositoryID) {
 		return nil, fmt.Errorf("bind active sqlite index: %w", index.ErrInvalidGeneration)
 	}
 	s.lifecycleMu.Lock()
@@ -1142,15 +1238,13 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 	if s.closed {
 		return nil, fmt.Errorf("bind active sqlite index: store is closed")
 	}
-	var tx *sql.Tx
-	var err error
-	if s.operationalConn != nil {
-		tx, err = s.operationalConn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	} else {
-		tx, err = s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("bind active sqlite index: begin transaction: %w", err)
+	}
+	if err := verifyStoreIdentity(ctx, tx, s.storeIdentity); err != nil {
+		_ = tx.Rollback()
+		return nil, err
 	}
 	var generationID, revision, contentDigest, policy, fingerprint, model, metric string
 	var dimensions int

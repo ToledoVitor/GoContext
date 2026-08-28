@@ -131,15 +131,10 @@ func writeRollbackMarker(ctx context.Context, storeDirectory string, marker roll
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, target); err != nil {
+	if err := replaceRollbackMarker(temporary, target, canonicalDirectory); err != nil {
 		return err
 	}
 	keepTemporary = false
-	if err := syncMarkerDirectory(canonicalDirectory); err != nil {
-		_ = os.Remove(target)
-		_ = syncMarkerDirectory(canonicalDirectory)
-		return err
-	}
 	return nil
 }
 
