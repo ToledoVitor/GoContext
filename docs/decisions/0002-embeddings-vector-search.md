@@ -1,6 +1,6 @@
 # ADR 0002: embeddings e busca vetorial provider-agnostic
 
-- **Status:** aceito; núcleo M2 implementado, Tasks 13/14 e revisão humana pendentes
+- **Status:** aceito; núcleo M2, prova taint e harness agregado implementados; priorização de novos parsers e revisão humana pendentes
 - **Data:** 2026-08-27
 
 ## Contexto
@@ -201,6 +201,8 @@ Recuperação é por reindexação completa. Em POSIX e store saudável, `index 
 
 Cada resultado do scanner carrega `ScanPolicyVersion`; composition root a transfere explicitamente para snapshot/corpus e stores nunca a inferem. Loader rejeita versão ausente, antiga ou diferente. Mudança em hard/built-in deny, precedência, detector de segredo/binário/UTF-8/gerado, regra de symlink/nested repo ou decisão pré-open exige nova versão e teste de rejeição da anterior.
 
+`scanner-v5` adiciona deny case-insensitive, antes de metadata/open, para raízes de dependências/build/cache de alta confiança: `Pods`, `.gradle`, `.dart_tool`, `.pub-cache`, `DerivedData`, `Carthage`, `.cxx`, `.expo`, `.turbo`, `.nx`, `.parcel-cache`, `.vite` e `.bundle`. Nomes ambíguos como `packages` não são negados. A mesma versão amplia apenas buckets agregados sanitizados para famílias source/build, assets, imagens/fontes, archives e binários comuns; labels continuam extensões lowercase centralmente permitidas, com `<none>`/`<other>` para o restante. Nenhuma extensão nova se torna ingestível. Snapshot/corpus `scanner-v4` ou anterior exige reindex completo, sem migração in-place.
+
 Reader SQLite é ligado a um `GenerationID` e read transaction imutáveis por consulta, com `Close`: corpus lexical, vetores e hidratação usam mesma geração mesmo se manifest mudar concorrentemente. Cleanup pode apagar linhas logicamente, mas checkpoint/truncate espera readers fecharem.
 
 ### Filtros
@@ -283,6 +285,8 @@ Flags vencem env para valores não secretos. Endpoint não aceita userinfo, quer
 - nome de arquivo não prova ausência de segredo. Conteúdo permitido passa por detector conservador antes de virar `source.File`; segredo detectado é lido somente pelo scanner para classificação e não segue para parser/rede/store. Detector admite falsos negativos e positivos; por isso avaliação profissional continua proibida em provider externo;
 - M2 não lê `.gitignore` nem metadata do repositório para relaxar policy. Regras futuras podem somente excluir mais; hard deny nunca é reabilitado;
 - exclusões e falhas produzem contagens por categoria, sem paths, basenames, conteúdo ou exemplos;
+- a primeira descoberta profissional autorizada expôs somente agregados: a taxonomia de extensões estava incompleta e as contagens eram compatíveis com provável ruído de dependências/build/cache. Isso não afirma conteúdo oculto nem autoriza abrir esses diretórios;
+- JSON permanece não suportado. Sua presença agregada não prova conteúdo seguro e não justifica habilitação cega de parser/ingestão;
 - configuração semântica é opt-in explícito porque indexação pode enviar código a endpoint remoto;
 - Ollama local usa mesmo adapter com URL de IP loopback e normalmente sem API key; transport desabilita proxy/redirect e valida peer loopback no modo profissional;
 - logs nunca contêm fonte, consulta, vetor, prompt ou credencial;
@@ -291,9 +295,9 @@ Flags vencem env para valores não secretos. Endpoint não aceita userinfo, quer
 - timeout/degradação produz aviso claro: busca ou índice lexical continua disponível;
 - `source.Reference` é carregado somente do chunk canônico persistido.
 
-### Validação em repositórios profissionais — pendente Tasks 13/14
+### Validação em repositórios profissionais — evidência aggregate-only
 
-Nenhum repositório profissional foi acessado durante esta entrega. A validação ocorrerá somente depois da prova taint da Task 13 e com autorização da Task 14. Inventário descobrirá linguagens, extensões, tamanhos e padrões reais; nenhuma stack é presumida. Resultados versionados conterão somente agregados e IDs opacos.
+Depois da prova taint da Task 13, a fase autorizada de inventário local executou somente o harness offline e persistiu sinal agregado com IDs opacos. A descoberta indicou taxonomia incompleta e provável ruído de dependências/build/cache, sem revelar paths, nomes, amostras ou conteúdo e sem justificar inferência de stack. Novos parsers continuam dependentes de fixture sintética, revisão de risco e decisão separada; JSON permanece unsupported.
 
 Nesse trabalho futuro, código permanece local: baseline lexical/offline e semântica opcional via Ollama loopback. Embeddings externos ficam proibidos mesmo que a configuração genérica aceite opt-in. Queries, gold sets, paths, símbolos e trechos não entram em documentação. Parser estrutural e novos chunkers permanecem pendentes; só nascerão de gap medido e usarão fixture sintética ou suficientemente minimizada.
 

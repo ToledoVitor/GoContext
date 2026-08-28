@@ -37,6 +37,57 @@ func TestScannerAppliesHardDenyBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestScannerAppliesExpandedDirectoryDenyBeforeMetadataAndOpen(t *testing.T) {
+	root := t.TempDir()
+	deniedDirectories := []string{
+		"Pods", ".gradle", ".dart_tool", ".pub-cache", "DerivedData", "Carthage", ".cxx",
+		".expo", ".turbo", ".nx", ".parcel-cache", ".vite", ".bundle",
+	}
+	for _, directory := range deniedDirectories {
+		writeInternalFile(t, root, path.Join(directory, "canary.ts"), "never inspected or opened\n")
+	}
+	writeInternalFile(t, root, "keep.py", "print('keep')\n")
+
+	metadataInspections := 0
+	fileOpens := 0
+	scanner := &Scanner{
+		inspectEntry: func(directory repositoryHandle, name string, entry os.DirEntry) (repositoryEntryMetadata, error) {
+			for _, denied := range deniedDirectories {
+				if strings.EqualFold(name, denied) {
+					return repositoryEntryMetadata{}, fmt.Errorf("inspected denied directory %q", name)
+				}
+			}
+			metadataInspections++
+			return inspectRepositoryEntry(directory, name, entry)
+		},
+		openPath: func(directory repositoryHandle, name string, wantDirectory bool) (repositoryHandle, error) {
+			for _, denied := range deniedDirectories {
+				if strings.EqualFold(name, denied) {
+					return nil, fmt.Errorf("opened denied directory %q", name)
+				}
+			}
+			if !wantDirectory {
+				fileOpens++
+			}
+			return openNoFollow(directory, name, wantDirectory)
+		},
+	}
+
+	result, err := scanner.Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if metadataInspections != 1 || fileOpens != 1 {
+		t.Fatalf("metadata inspections/file opens = %d/%d, want 1/1 for keep.py only", metadataInspections, fileOpens)
+	}
+	if len(result.Files) != 1 || result.Files[0].Reference.Path != "keep.py" {
+		t.Fatalf("Scan() files = %#v, want [keep.py]", result.Files)
+	}
+	if got := result.Report.Excluded[ingest.ExclusionDependencyBuildCache]; got != len(deniedDirectories) {
+		t.Fatalf("dependency/build/cache exclusions = %d, want %d", got, len(deniedDirectories))
+	}
+}
+
 func TestScannerAggregatesUnsupportedMetadataWithoutOpeningContent(t *testing.T) {
 	root := t.TempDir()
 	writeInternalFile(t, root, "notes.md", "metadata-only")

@@ -1,6 +1,7 @@
 package ingest_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest"
@@ -16,6 +17,25 @@ func TestUnsupportedExtensionBucketUsesSanitizedAllowlist(t *testing.T) {
 	for name, want := range tests {
 		if got := ingest.UnsupportedExtensionBucket(name); got != want {
 			t.Errorf("UnsupportedExtensionBucket(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestUnsupportedExtensionBucketAllowsExpandedAggregateOnlyTaxonomy(t *testing.T) {
+	for _, extension := range []string{
+		".dart", ".m", ".mm", ".gradle", ".properties", ".lock", ".podspec", ".xcconfig", ".pbxproj",
+		".plist", ".storyboard", ".xib", ".graphql", ".gql", ".proto", ".svelte", ".astro", ".pyi",
+		".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico", ".tif", ".tiff",
+		".ttf", ".otf", ".woff", ".woff2", ".eot",
+		".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".aar", ".apk", ".ipa",
+		".so", ".dylib", ".dll", ".a", ".lib", ".o", ".obj", ".exe", ".bin", ".wasm",
+	} {
+		name := "artifact" + strings.ToUpper(extension)
+		if got := ingest.UnsupportedExtensionBucket(name); got != extension {
+			t.Errorf("UnsupportedExtensionBucket(%q) = %q, want %q", name, got, extension)
+		}
+		if !ingest.SafeUnsupportedExtensionBucket(extension) {
+			t.Errorf("SafeUnsupportedExtensionBucket(%q) = false", extension)
 		}
 	}
 }

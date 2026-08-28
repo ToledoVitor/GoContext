@@ -21,19 +21,20 @@ import (
 )
 
 const (
-	taintSecurityCanary     = "TAINT_SECURITY_CANARY_TASK13"
-	taintDependencyCanary   = "TAINT_DEPENDENCY_CANARY_TASK13"
-	taintNestedCanary       = "TAINT_NESTED_CANARY_TASK13"
-	taintSymlinkCanary      = "TAINT_SYMLINK_CANARY_TASK13"
-	taintBinaryCanary       = "TAINT_BINARY_CANARY_TASK13"
-	taintTooLargeCanary     = "TAINT_TOO_LARGE_CANARY_TASK13"
-	taintGeneratedCanary    = "TAINT_GENERATED_CANARY_TASK13"
-	taintUnsupportedCanary  = "TAINT_UNSUPPORTED_CANARY_TASK13"
-	taintInvalidUTF8Canary  = "TAINT_INVALID_UTF8_CANARY_TASK13"
-	taintPEMCanary          = "TAINT_PEM_CONTENT_CANARY_TASK13"
-	taintPythonSecretCanary = "TAINT_PYTHON_SECRET_CANARY_TASK13"
-	taintTypedSecretCanary  = "TAINT_TYPED_SECRET_CANARY_TASK13"
-	taintControlPathCanary  = "TAINT_CONTROL_PATH_CANARY_TASK13"
+	taintSecurityCanary      = "TAINT_SECURITY_CANARY_TASK13"
+	taintDependencyCanary    = "TAINT_DEPENDENCY_CANARY_TASK13"
+	taintNewDependencyCanary = "TAINT_NEW_DEPENDENCY_CANARY_TASK14C"
+	taintNestedCanary        = "TAINT_NESTED_CANARY_TASK13"
+	taintSymlinkCanary       = "TAINT_SYMLINK_CANARY_TASK13"
+	taintBinaryCanary        = "TAINT_BINARY_CANARY_TASK13"
+	taintTooLargeCanary      = "TAINT_TOO_LARGE_CANARY_TASK13"
+	taintGeneratedCanary     = "TAINT_GENERATED_CANARY_TASK13"
+	taintUnsupportedCanary   = "TAINT_UNSUPPORTED_CANARY_TASK13"
+	taintInvalidUTF8Canary   = "TAINT_INVALID_UTF8_CANARY_TASK13"
+	taintPEMCanary           = "TAINT_PEM_CONTENT_CANARY_TASK13"
+	taintPythonSecretCanary  = "TAINT_PYTHON_SECRET_CANARY_TASK13"
+	taintTypedSecretCanary   = "TAINT_TYPED_SECRET_CANARY_TASK13"
+	taintControlPathCanary   = "TAINT_CONTROL_PATH_CANARY_TASK13"
 )
 
 type scannerTaintFixture struct {
@@ -162,6 +163,15 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 	} {
 		writeFile(t, root, path, taintDependencyCanary+"\n")
 	}
+	newDependencyPaths := []string{
+		"Pods/dependency.ts", ".gradle/dependency.ts", ".dart_tool/dependency.ts", ".pub-cache/dependency.ts",
+		"DerivedData/dependency.ts", "Carthage/dependency.ts", ".cxx/dependency.ts", ".expo/dependency.ts",
+		".turbo/dependency.ts", ".nx/dependency.ts", ".parcel-cache/dependency.ts", ".vite/dependency.ts",
+		".bundle/dependency.ts",
+	}
+	for index, path := range newDependencyPaths {
+		writeFile(t, root, path, fmt.Sprintf("%s_%02d\n", taintNewDependencyCanary, index))
+	}
 	writeFile(t, root, "nested-repository/.git/config", taintNestedCanary+"\n")
 	writeFile(t, root, "nested-repository/00-child.py", "def "+taintNestedCanary+"():\n    return True\n")
 
@@ -192,7 +202,7 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 	}
 
 	forbidden := []string{
-		taintSecurityCanary, taintDependencyCanary, taintNestedCanary, taintBinaryCanary,
+		taintSecurityCanary, taintDependencyCanary, taintNewDependencyCanary, taintNestedCanary, taintBinaryCanary,
 		taintTooLargeCanary, taintGeneratedCanary, taintUnsupportedCanary, taintInvalidUTF8Canary,
 		taintPEMCanary, taintPythonSecretCanary, taintTypedSecretCanary,
 		".env", ".env.local", ".env.ts", ".git/config", ".github/workflows/ci.ts",
@@ -202,6 +212,7 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 		"generated-header.py", "binary.py", "oversized.ts", "invalid-utf8.py",
 		"opaque.TAINT_UNSUPPORTED_NAME_TASK13", "pem-material.py", "embedded-secret.py", "embedded-secret.ts",
 	}
+	forbidden = append(forbidden, newDependencyPaths...)
 	if symlinkCount != 0 {
 		forbidden = append(
 			forbidden,
@@ -215,7 +226,7 @@ func newScannerTaintFixture(t *testing.T) scannerTaintFixture {
 
 	wantReport := map[ingest.ExclusionReason]int{
 		ingest.ExclusionSecurity:             securityCount,
-		ingest.ExclusionDependencyBuildCache: 4,
+		ingest.ExclusionDependencyBuildCache: 4 + len(newDependencyPaths),
 		ingest.ExclusionNestedRepository:     1,
 		ingest.ExclusionUnsupportedExtension: 1,
 		ingest.ExclusionTooLarge:             1,

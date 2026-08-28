@@ -81,6 +81,12 @@ Sem flags, o comando percorre fontes Python/TypeScript, descobre declarações, 
 go run ./cmd/gocontext index --store /caminho/do/cache /caminho/do/repositório
 ```
 
+### Policy de scanner v5 e reindexação
+
+A policy `scanner-v5` amplia somente a taxonomia sanitizada de extensões não suportadas usada em contagens agregadas e bloqueia, antes de inspeção de metadata ou abertura, raízes de dependências/build/cache de alta confiança como `Pods`, `.gradle`, `.dart_tool`, `DerivedData` e equivalentes documentados na ADR. Isso não habilita parser, chunker ou ingestão para nenhuma extensão nova. Em particular, JSON continua não suportado e não deve ser habilitado cegamente: arquivos JSON podem misturar configuração útil com credenciais ou outros dados sensíveis.
+
+Snapshots e corpora `scanner-v4` ou anteriores são incompatíveis e falham com pedido sanitizado de reindexação; não existe migração in-place. Reexecute `index` no backend desejado para produzir um corpus `scanner-v5`. A descoberta que motivou a mudança continha somente agregados: ela mostrou taxonomia incompleta e ruído provavelmente associado a dependências/build/cache, sem observar ou afirmar conteúdo dos diretórios negados.
+
 ### Opt-in SQLite sem embeddings
 
 A migração suportada é uma reindexação completa explícita. O schema SQLite v2 liga metadados semânticos e bytes vetoriais por digests SHA-256; caches SQLite v1 não são migrados no lugar e exigem reindexação. A operação publica a geração v2 e um snapshot companheiro do mesmo corpus, sem rede:

@@ -212,7 +212,7 @@ func TestStoreRejectsInvalidChunkProvenance(t *testing.T) {
 
 func TestStoreRequiresCurrentScanPolicy(t *testing.T) {
 	store := newStore(t)
-	legacy, err := source.NewCorpus("scanner-v3", []source.Chunk{sampleChunk("legacy", "legacy.py", "LEGACY_POLICY_CANARY")})
+	legacy, err := source.NewCorpus("scanner-v4", []source.Chunk{sampleChunk("legacy", "legacy.py", "LEGACY_POLICY_CANARY")})
 	if err != nil {
 		t.Fatalf("NewCorpus(legacy) error = %v", err)
 	}
@@ -686,7 +686,7 @@ func TestStoreRejectsPersistedStalePolicyRevisionAndContent(t *testing.T) {
 		mutate   string
 		argument any
 	}{
-		{name: "stale policy", mutate: `UPDATE generations SET scan_policy_version = ?`, argument: "scanner-v3"},
+		{name: "stale policy", mutate: `UPDATE generations SET scan_policy_version = ?`, argument: "scanner-v4"},
 		{name: "forged revision", mutate: `UPDATE generations SET corpus_revision = ?`, argument: "forged-private-revision"},
 		{name: "changed canonical content", mutate: `UPDATE chunks SET text = ?`, argument: "PERSISTED_CHANGED_PRIVATE_CANARY"},
 	}

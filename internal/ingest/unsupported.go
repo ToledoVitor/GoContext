@@ -17,6 +17,18 @@ var safeUnsupportedExtensions = map[string]struct{}{
 	".php": {}, ".rb": {}, ".rs": {}, ".sass": {}, ".scala": {}, ".scss": {}, ".sh": {},
 	".sql": {}, ".swift": {}, ".toml": {}, ".txt": {}, ".vue": {}, ".xml": {}, ".yaml": {},
 	".yml": {}, ".zsh": {},
+
+	".dart": {}, ".m": {}, ".mm": {}, ".gradle": {}, ".properties": {}, ".lock": {},
+	".podspec": {}, ".xcconfig": {}, ".pbxproj": {}, ".plist": {}, ".storyboard": {}, ".xib": {},
+	".graphql": {}, ".gql": {}, ".proto": {}, ".svelte": {}, ".astro": {}, ".pyi": {},
+
+	".svg": {}, ".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".webp": {}, ".avif": {},
+	".bmp": {}, ".ico": {}, ".tif": {}, ".tiff": {},
+	".ttf": {}, ".otf": {}, ".woff": {}, ".woff2": {}, ".eot": {},
+	".zip": {}, ".tar": {}, ".gz": {}, ".tgz": {}, ".bz2": {}, ".xz": {}, ".7z": {},
+	".rar": {}, ".jar": {}, ".war": {}, ".aar": {}, ".apk": {}, ".ipa": {},
+	".so": {}, ".dylib": {}, ".dll": {}, ".a": {}, ".lib": {}, ".o": {}, ".obj": {},
+	".exe": {}, ".bin": {}, ".wasm": {},
 }
 
 // UnsupportedExtensionBucket returns an aggregate-only extension label that

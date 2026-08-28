@@ -36,24 +36,25 @@ import (
 )
 
 const (
-	cliTaintSecurityCanary     = "CLI_TAINT_SECURITY_CANARY_TASK13"
-	cliTaintDependencyCanary   = "CLI_TAINT_DEPENDENCY_CANARY_TASK13"
-	cliTaintNestedCanary       = "CLI_TAINT_NESTED_CANARY_TASK13"
-	cliTaintSymlinkCanary      = "CLI_TAINT_SYMLINK_CANARY_TASK13"
-	cliTaintBinaryCanary       = "CLI_TAINT_BINARY_CANARY_TASK13"
-	cliTaintTooLargeCanary     = "CLI_TAINT_TOO_LARGE_CANARY_TASK13"
-	cliTaintGeneratedCanary    = "CLI_TAINT_GENERATED_CANARY_TASK13"
-	cliTaintUnsupportedCanary  = "CLI_TAINT_UNSUPPORTED_CANARY_TASK13"
-	cliTaintInvalidUTF8Canary  = "CLI_TAINT_INVALID_UTF8_CANARY_TASK13"
-	cliTaintPEMCanary          = "CLI_TAINT_PEM_CONTENT_CANARY_TASK13"
-	cliTaintPythonSecretCanary = "CLI_TAINT_PYTHON_SECRET_CANARY_TASK13"
-	cliTaintTypedSecretCanary  = "CLI_TAINT_TYPED_SECRET_CANARY_TASK13"
-	cliTaintControlPathCanary  = "CLI_TAINT_CONTROL_PATH_CANARY_TASK13"
-	cliTaintProviderKey        = "CLI_TAINT_PROVIDER_KEY_TASK13"
-	cliTaintProviderBody       = "CLI_TAINT_PROVIDER_BODY_TASK13"
-	cliTaintMalformedBody      = "CLI_TAINT_MALFORMED_BODY_TASK13"
-	cliTaintQueryCanary        = "CLI_TAINT_QUERY_EGRESS_CANARY_TASK13"
-	cliTaintReplacement        = "CLI_SAFE_UNPUBLISHED_REPLACEMENT_TASK13"
+	cliTaintSecurityCanary      = "CLI_TAINT_SECURITY_CANARY_TASK13"
+	cliTaintDependencyCanary    = "CLI_TAINT_DEPENDENCY_CANARY_TASK13"
+	cliTaintNewDependencyCanary = "CLI_TAINT_NEW_DEPENDENCY_CANARY_TASK14C"
+	cliTaintNestedCanary        = "CLI_TAINT_NESTED_CANARY_TASK13"
+	cliTaintSymlinkCanary       = "CLI_TAINT_SYMLINK_CANARY_TASK13"
+	cliTaintBinaryCanary        = "CLI_TAINT_BINARY_CANARY_TASK13"
+	cliTaintTooLargeCanary      = "CLI_TAINT_TOO_LARGE_CANARY_TASK13"
+	cliTaintGeneratedCanary     = "CLI_TAINT_GENERATED_CANARY_TASK13"
+	cliTaintUnsupportedCanary   = "CLI_TAINT_UNSUPPORTED_CANARY_TASK13"
+	cliTaintInvalidUTF8Canary   = "CLI_TAINT_INVALID_UTF8_CANARY_TASK13"
+	cliTaintPEMCanary           = "CLI_TAINT_PEM_CONTENT_CANARY_TASK13"
+	cliTaintPythonSecretCanary  = "CLI_TAINT_PYTHON_SECRET_CANARY_TASK13"
+	cliTaintTypedSecretCanary   = "CLI_TAINT_TYPED_SECRET_CANARY_TASK13"
+	cliTaintControlPathCanary   = "CLI_TAINT_CONTROL_PATH_CANARY_TASK13"
+	cliTaintProviderKey         = "CLI_TAINT_PROVIDER_KEY_TASK13"
+	cliTaintProviderBody        = "CLI_TAINT_PROVIDER_BODY_TASK13"
+	cliTaintMalformedBody       = "CLI_TAINT_MALFORMED_BODY_TASK13"
+	cliTaintQueryCanary         = "CLI_TAINT_QUERY_EGRESS_CANARY_TASK13"
+	cliTaintReplacement         = "CLI_SAFE_UNPUBLISHED_REPLACEMENT_TASK13"
 )
 
 type cliTaintFixture struct {
@@ -464,6 +465,15 @@ func newCLITaintFixture(t *testing.T) cliTaintFixture {
 	} {
 		writeCLIFile(t, repository, path, cliTaintDependencyCanary+"\n")
 	}
+	newDependencyPaths := []string{
+		"Pods/dependency.ts", ".gradle/dependency.ts", ".dart_tool/dependency.ts", ".pub-cache/dependency.ts",
+		"DerivedData/dependency.ts", "Carthage/dependency.ts", ".cxx/dependency.ts", ".expo/dependency.ts",
+		".turbo/dependency.ts", ".nx/dependency.ts", ".parcel-cache/dependency.ts", ".vite/dependency.ts",
+		".bundle/dependency.ts",
+	}
+	for index, path := range newDependencyPaths {
+		writeCLIFile(t, repository, path, fmt.Sprintf("%s_%02d\n", cliTaintNewDependencyCanary, index))
+	}
 	writeCLIFile(t, repository, "nested-repository/.git/config", cliTaintNestedCanary+"\n")
 	writeCLIFile(t, repository, "nested-repository/00-child.py", "def "+cliTaintNestedCanary+"():\n    return True\n")
 	writeCLIFile(t, repository, "client.generated.ts", cliTaintGeneratedCanary+"\n")
@@ -478,7 +488,7 @@ func newCLITaintFixture(t *testing.T) cliTaintFixture {
 	writeCLIFile(t, repository, "embedded-secret.ts", "const safe = \"x\"; const token: string = \""+cliTaintTypedSecretCanary+"\"\n")
 
 	forbidden := []string{
-		cliTaintSecurityCanary, cliTaintDependencyCanary, cliTaintNestedCanary, cliTaintBinaryCanary,
+		cliTaintSecurityCanary, cliTaintDependencyCanary, cliTaintNewDependencyCanary, cliTaintNestedCanary, cliTaintBinaryCanary,
 		cliTaintTooLargeCanary, cliTaintGeneratedCanary, cliTaintUnsupportedCanary, cliTaintInvalidUTF8Canary,
 		cliTaintPEMCanary, cliTaintPythonSecretCanary, cliTaintTypedSecretCanary,
 		".env", ".env.local", ".env.ts", ".git/config", ".github/workflows/ci.ts",
@@ -488,6 +498,7 @@ func newCLITaintFixture(t *testing.T) cliTaintFixture {
 		"generated-header.py", "binary.py", "oversized.ts", "invalid-utf8.py",
 		"opaque.CLI_TAINT_UNSUPPORTED_NAME_TASK13", "pem-material.py", "embedded-secret.py", "embedded-secret.ts",
 	}
+	forbidden = append(forbidden, newDependencyPaths...)
 	if runtime.GOOS != "windows" {
 		writeCLIFile(t, outside, "outside.py", cliTaintSymlinkCanary+"\n")
 		writeCLIFile(t, repository, ".env.internal-link", cliTaintSymlinkCanary+"\n")

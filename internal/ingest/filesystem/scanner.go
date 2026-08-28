@@ -33,6 +33,7 @@ type repositoryHandle interface {
 }
 
 type openPathFunc func(directory repositoryHandle, name string, wantDirectory bool) (repositoryHandle, error)
+type inspectEntryFunc func(directory repositoryHandle, name string, entry os.DirEntry) (repositoryEntryMetadata, error)
 
 type repositoryEntryMetadata struct {
 	mode     os.FileMode
@@ -46,7 +47,8 @@ func (info repositoryEntryMetadata) Size() int64       { return info.size }
 
 // Scanner reads supported source files without following directory symlinks.
 type Scanner struct {
-	openPath openPathFunc
+	openPath     openPathFunc
+	inspectEntry inspectEntryFunc
 }
 
 // OpenedRoot is an opaque, retained repository directory. It binds a scan to
@@ -222,7 +224,7 @@ func (s *Scanner) scanDirectory(ctx context.Context, directory repositoryHandle,
 			continue
 		}
 
-		entryInfo, err := inspectRepositoryEntry(directory, entry.Name(), entry)
+		entryInfo, err := s.inspectRepositoryPath(directory, entry.Name(), entry)
 		if err != nil {
 			return sanitizedPathError("inspect-entry", relativePath)
 		}
@@ -320,6 +322,13 @@ func (s *Scanner) openRepositoryPath(directory repositoryHandle, name string, wa
 		return s.openPath(directory, name, wantDirectory)
 	}
 	return openNoFollow(directory, name, wantDirectory)
+}
+
+func (s *Scanner) inspectRepositoryPath(directory repositoryHandle, name string, entry os.DirEntry) (repositoryEntryMetadata, error) {
+	if s.inspectEntry != nil {
+		return s.inspectEntry(directory, name, entry)
+	}
+	return inspectRepositoryEntry(directory, name, entry)
 }
 
 func containsGitMarker(entries []os.DirEntry) bool {

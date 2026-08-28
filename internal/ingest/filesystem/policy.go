@@ -18,7 +18,8 @@ var securityDirectories = []string{
 var dependencyBuildCacheDirectories = []string{
 	"node_modules", "vendor", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
 	".ruff_cache", ".cache", ".next", ".nuxt", ".svelte-kit", "dist", "build", "out", "target",
-	"coverage", "tmp", "temp",
+	"coverage", "tmp", "temp", "Pods", ".gradle", ".dart_tool", ".pub-cache", "DerivedData",
+	"Carthage", ".cxx", ".expo", ".turbo", ".nx", ".parcel-cache", ".vite", ".bundle",
 }
 
 var securityBasenames = []string{

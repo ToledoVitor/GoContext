@@ -57,6 +57,10 @@ Preencher matriz separadamente, após descoberta:
 
 `padrões/frameworks` usa taxonomia genérica, por exemplo componente UI, rota, handler, modelo, migração, teste, configuração permitida e código gerado. Para extensão/linguagem não suportada, valor é `unknown/not evaluated`: não inferir padrão sem abrir conteúdo e não criar segunda caminhada. Classificação manual futura pode ocorrer localmente sob novo gate e reportar somente agregado. Nenhum nome concreto entra no relatório.
 
+A primeira execução autorizada desta fase produziu somente agregados e mostrou duas limitações do sinal: taxonomia incompleta de extensões não suportadas e contagens compatíveis com provável ruído de dependências/build/cache. Essa leitura é uma hipótese sobre as categorias, não uma afirmação sobre conteúdo oculto; nenhum path, basename, exemplo ou byte de diretório negado foi usado. `scanner-v5` passa a negar antes de metadata/open os roots de alta confiança `Pods`, `.gradle`, `.dart_tool`, `.pub-cache`, `DerivedData`, `Carthage`, `.cxx`, `.expo`, `.turbo`, `.nx`, `.parcel-cache`, `.vite` e `.bundle`, sem negar o nome ambíguo `packages`, e amplia apenas buckets lowercase agregados para famílias não sensíveis.
+
+Esses buckets continuam report-only: não habilitam parser ou ingestão. JSON permanece `unknown/not evaluated` e unsupported; não será habilitado cegamente porque configuração JSON pode incluir credenciais ou outros dados sensíveis. Qualquer suporte futuro exige plano próprio, fixtures sintéticas e novo gate de segurança. Snapshots/corpora anteriores a `scanner-v5` exigem reindex completo e nunca são migrados no lugar.
+
 ## Fase B — benchmark de recuperação
 
 Executar primeiro baseline lexical. Vetorial/híbrido somente depois, com Ollama loopback e mesmo corpus permitido.

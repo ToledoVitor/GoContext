@@ -2,6 +2,7 @@ package filesystem_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -18,12 +19,15 @@ func TestScannerHardDenyTableIsCaseInsensitiveAndAudited(t *testing.T) {
 	builtInDirectories := []string{
 		"node_modules", "vendor", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
 		".ruff_cache", ".cache", ".next", ".nuxt", ".svelte-kit", "dist", "build", "out", "target",
-		"coverage", "tmp", "temp",
+		"coverage", "tmp", "temp", "Pods", ".gradle", ".dart_tool", ".pub-cache", "DerivedData",
+		"Carthage", ".cxx", ".expo", ".turbo", ".nx", ".parcel-cache", ".vite", ".bundle",
 	}
 	for _, directory := range append(append([]string(nil), securityDirectories...), builtInDirectories...) {
 		writeFile(t, root, filepath.Join(directory, "allowed.ts"), "export const visible = true\n")
 	}
 	writeFile(t, root, filepath.Join("nested", ".GiThUb", "allowed.py"), "VISIBLE = true\n")
+	writeFile(t, root, filepath.Join("nested", ".DaRt_ToOl", "allowed.py"), "VISIBLE = true\n")
+	writeFile(t, root, filepath.Join("packages", "allowed.ts"), "export const visible = true\n")
 
 	securityBasenames := []string{
 		".env", ".env.local", ".npmrc", ".pypirc", ".netrc", ".htpasswd",
@@ -59,13 +63,13 @@ func TestScannerHardDenyTableIsCaseInsensitiveAndAudited(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
-	if len(result.Files) != 0 {
-		t.Fatalf("Scan() returned %d files, want none", len(result.Files))
+	if len(result.Files) != 1 || result.Files[0].Reference.Path != "packages/allowed.ts" {
+		t.Fatalf("Scan() files = %#v, want only ambiguous packages directory content", result.Files)
 	}
 	if got, want := result.Report.Excluded[ingest.ExclusionSecurity], len(securityDirectories)+1+len(securityBasenames)+len(securitySuffixes); got != want {
 		t.Errorf("security exclusions = %d, want %d", got, want)
 	}
-	if got, want := result.Report.Excluded[ingest.ExclusionDependencyBuildCache], len(builtInDirectories); got != want {
+	if got, want := result.Report.Excluded[ingest.ExclusionDependencyBuildCache], len(builtInDirectories)+1; got != want {
 		t.Errorf("dependency/build/cache exclusions = %d, want %d", got, want)
 	}
 	if got, want := result.Report.Excluded[ingest.ExclusionGenerated], len(generatedSuffixes); got != want {
@@ -73,6 +77,37 @@ func TestScannerHardDenyTableIsCaseInsensitiveAndAudited(t *testing.T) {
 	}
 	if len(result.Report.UnsupportedByExtension) != 0 {
 		t.Errorf("UnsupportedByExtension = %#v, want empty because hard deny precedes allowlist", result.Report.UnsupportedByExtension)
+	}
+}
+
+func TestScannerExpandedUnsupportedTaxonomyRemainsReportOnly(t *testing.T) {
+	root := t.TempDir()
+	extensions := []string{
+		".dart", ".m", ".mm", ".gradle", ".properties", ".lock", ".podspec", ".xcconfig", ".pbxproj",
+		".plist", ".storyboard", ".xib", ".graphql", ".gql", ".proto", ".svelte", ".astro", ".pyi",
+		".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico", ".tif", ".tiff",
+		".ttf", ".otf", ".woff", ".woff2", ".eot",
+		".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".aar", ".apk", ".ipa",
+		".so", ".dylib", ".dll", ".a", ".lib", ".o", ".obj", ".exe", ".bin", ".wasm",
+	}
+	for index, extension := range extensions {
+		writeFile(t, root, fmt.Sprintf("artifact-%02d%s", index, extension), "aggregate-only\n")
+	}
+
+	result, err := filesystem.NewScanner().Scan(context.Background(), root)
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(result.Files) != 0 {
+		t.Fatalf("Scan() returned %d files, want no newly ingestible extensions", len(result.Files))
+	}
+	if got := result.Report.Excluded[ingest.ExclusionUnsupportedExtension]; got != len(extensions) {
+		t.Fatalf("unsupported exclusions = %d, want %d", got, len(extensions))
+	}
+	for _, extension := range extensions {
+		if got := result.Report.UnsupportedByExtension[extension]; got != 1 {
+			t.Errorf("unsupported %s count = %d, want 1", extension, got)
+		}
 	}
 }
 

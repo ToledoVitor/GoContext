@@ -205,7 +205,7 @@ type ScanResult struct {
 	Report        ScanReport
 }
 
-const ScanPolicyVersion = "scanner-v2"
+const ScanPolicyVersion = "scanner-v5"
 
 // internal/source/corpus.go
 type Corpus struct {
@@ -236,7 +236,8 @@ directories:
   .gocontext .idea .vscode .devcontainer .terraform .serverless
   node_modules vendor .venv venv __pycache__ .pytest_cache .mypy_cache
   .ruff_cache .cache .next .nuxt .svelte-kit dist build out target
-  coverage tmp temp
+  coverage tmp temp Pods .gradle .dart_tool .pub-cache DerivedData Carthage
+  .cxx .expo .turbo .nx .parcel-cache .vite .bundle
 
 files/basenames:
   .env .env.* .npmrc .pypirc .netrc .htpasswd
@@ -290,6 +291,8 @@ Report contém somente contagens, bytes elegíveis/incluídos, linguagens, size 
 `cmd/gocontext/index.go` consome `ScanResult.Files`; estatísticas podem usar contagens agregadas. Falha de policy, auditoria ou leitura permitida aborta indexação antes de parser/chunker/store.
 
 Bump do snapshot JSON para schema/policy segura invalida snapshot legado. Depois do chunking, composition root cria `source.Corpus` com policy do `ScanResult`; revisão é SHA-256 de versão do corpus + policy + IDs ordenados. `localstore.Replace` recebe corpus completo e nunca marca versão implicitamente; `Load` retorna erro tipado pedindo reindex. Testes cobrem payload v1 contendo canário e confirmam ausência em search/output. Bump é obrigatório quando deny/precedência/classificadores de segredo, binário, UTF-8, gerado, symlink ou nested repo mudarem. Tasks SQLite recebem mesmo corpus.
+
+Refinamento Task 14C: `scanner-v5` acrescenta os roots de dependências/build/cache acima com decisão em `classifyPath` antes de `inspectRepositoryEntry`/open e mantém nomes ambíguos como `packages` permitidos. A taxonomia central de buckets agrega extensões source/build não sensíveis e assets/binários comuns, sempre lowercase e sem paths, nomes ou amostras; `<none>` e `<other>` continuam cobrindo extension-less e valores arbitrários. Isso melhora somente o sinal de inventário e não torna extensão nova ingestível. Corpora/snapshots `scanner-v4` são rejeitados e exigem reindex completo, sem migração.
 
 - [ ] **Step 8: Verificar regressão e commit**
 
@@ -1119,6 +1122,8 @@ Preencher matriz com métricas agregadas; não copiar código, paths ou consulta
 
 Ordenar linguagens/formatos/padrões pela fórmula do plano de validação. Cada capacidade nova vira plano pequeno, com fixture sintética/minimizada e critérios próprios; não adicionar parser durante inventário.
 
+A primeira execução aggregate-only mostrou taxonomia incompleta e sinal compatível com provável ruído de dependências/build/cache; não houve observação de conteúdo dentro dos novos hard denies. Task 14C refina buckets sanitizados e policy pré-open antes de escolher qualquer parser. JSON continua `unknown/not evaluated` e não será habilitado cegamente: configuração JSON pode conter segredos ou dados sensíveis e requer plano/testes próprios.
+
 - [ ] **Step 7: Verificar e commit**
 
 Run: `go test -race ./internal/eval ./cmd/gocontext && go test ./... && go vet ./... && git diff --check`
@@ -1157,7 +1162,7 @@ git commit -m "feat: add privacy-safe local retrieval evaluation"
 3. Reindexar fixtures e repositórios de teste; comparar lexical antes/depois.
 4. Habilitar `preferred` somente em ambiente de teste com endpoint controlado.
 5. Medir latência, requests, tokens, degradação e qualidade conceitual.
-6. Manter snapshot JSON de policy atual durante M2; v1 exige reindex seguro.
+6. Manter snapshot JSON de policy `scanner-v5` durante M2; `scanner-v4` ou anterior exige reindex seguro, sem migração in-place.
 7. Em regressão, garantir snapshot atual e selecionar `--index-backend snapshot`; não apagar banco.
 8. Tornar SQLite default somente em ADR futuro com evidência de uso e migração.
 
