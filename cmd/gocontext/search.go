@@ -30,6 +30,8 @@ var (
 	errSnapshotRollbackReindex error = snapshotRollbackReindexError{}
 )
 
+type searchHitObserver func([]searchdomain.Hit)
+
 type snapshotRollbackReindexError struct{}
 
 func (snapshotRollbackReindexError) Error() string {
@@ -41,6 +43,15 @@ func (snapshotRollbackReindexError) Unwrap() error {
 }
 
 func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runSearchWithObserver(ctx, args, stdout, stderr, nil)
+}
+
+func runSearchWithObserver(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+	observer searchHitObserver,
+) int {
 	flags := flag.NewFlagSet("search", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
@@ -105,6 +116,9 @@ func runSearch(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if err != nil {
 		fmt.Fprintf(stderr, "consultar repositório: %v\n", err)
 		return 1
+	}
+	if observer != nil {
+		observer(append([]searchdomain.Hit(nil), hits...))
 	}
 	if len(hits) == 0 {
 		fmt.Fprintln(stdout, "nenhum resultado")

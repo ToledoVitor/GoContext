@@ -14,6 +14,10 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithSearchObserver(args, stdout, stderr, nil)
+}
+
+func runWithSearchObserver(args []string, stdout, stderr io.Writer, observer searchHitObserver) int {
 	if len(args) == 1 && args[0] == "--version" {
 		fmt.Fprintf(stdout, "gocontext %s\n", version)
 		return 0
@@ -27,7 +31,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "index":
 		return runIndex(context.Background(), args[1:], stdout, stderr)
 	case "search":
-		return runSearch(context.Background(), args[1:], stdout, stderr)
+		return runSearchWithObserver(context.Background(), args[1:], stdout, stderr, observer)
 	case "help", "--help", "-h":
 		printUsage(stdout)
 		return 0

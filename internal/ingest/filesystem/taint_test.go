@@ -3,7 +3,6 @@ package filesystem_test
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/ingest/lineparser"
 	"github.com/ToledoVitor/GoContext/internal/ingest/symbolchunker"
 	"github.com/ToledoVitor/GoContext/internal/source"
+	"github.com/ToledoVitor/GoContext/internal/testsupport/taintcheck"
 )
 
 const (
@@ -305,16 +305,7 @@ func assertNoTaintReflect(t *testing.T, label string, value reflect.Value, forbi
 
 func checkTaintBytes(t *testing.T, label string, payload []byte, forbidden []string) {
 	t.Helper()
-	for _, canary := range forbidden {
-		forms := [][]byte{
-			[]byte(canary),
-			[]byte(base64.StdEncoding.EncodeToString([]byte(canary))),
-			[]byte(fmt.Sprintf("%#v", []byte(canary))),
-		}
-		for _, form := range forms {
-			if len(form) != 0 && bytes.Contains(payload, form) {
-				t.Fatalf("%s contains forbidden taint %q", label, canary)
-			}
-		}
+	if match, found := taintcheck.Find(payload, forbidden); found {
+		t.Fatalf("%s contains forbidden taint %q encoded as %s", label, match.Canary, match.Encoding)
 	}
 }
