@@ -2,6 +2,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -26,20 +27,36 @@ import (
 
 const databaseName = "index-v2.sqlite3"
 
+var (
+	errBoundReaderClosed = errors.New("bound sqlite reader is closed")
+	errPublicationFailed = errors.New("sqlite index publication failed")
+)
+
 // Store keeps complete repository generations in one local SQLite database.
 type Store struct {
 	db         *sql.DB
 	writeToken chan struct{}
+
+	lifecycleMu sync.Mutex
+	readers     map[*BoundReader]struct{}
+	closed      bool
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 // BoundReader holds one immutable repository generation in a read transaction.
 type BoundReader struct {
-	tx                *sql.Tx
-	repositoryID      string
-	generationID      string
-	corpusRevision    string
-	contentDigest     string
-	scanPolicyVersion string
+	tx                 *sql.Tx
+	repositoryID       string
+	generationID       string
+	corpusRevision     string
+	contentDigest      string
+	scanPolicyVersion  string
+	profileFingerprint string
+	profileModel       string
+	dimensions         int
+	metric             index.VectorMetric
+	store              *Store
 
 	mu     sync.Mutex
 	closed bool
@@ -120,7 +137,11 @@ func NewStore(directory string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create sqlite index store: open database: %w", err)
 	}
-	store := &Store{db: db, writeToken: make(chan struct{}, 1)}
+	store := &Store{
+		db:         db,
+		writeToken: make(chan struct{}, 1),
+		readers:    make(map[*BoundReader]struct{}),
+	}
 	store.writeToken <- struct{}{}
 	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
@@ -486,7 +507,24 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	s.closeOnce.Do(func() {
+		s.lifecycleMu.Lock()
+		s.closed = true
+		readers := make([]*BoundReader, 0, len(s.readers))
+		for reader := range s.readers {
+			readers = append(readers, reader)
+		}
+		s.lifecycleMu.Unlock()
+		for _, reader := range readers {
+			if err := reader.Close(); err != nil && s.closeErr == nil {
+				s.closeErr = err
+			}
+		}
+		if err := s.db.Close(); err != nil && s.closeErr == nil {
+			s.closeErr = err
+		}
+	})
+	return s.closeErr
 }
 
 // Replace publishes a complete generation atomically.
@@ -503,10 +541,8 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	if generation.ScanPolicyVersion != ingest.ScanPolicyVersion {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrReindexRequired)
 	}
-	if len(generation.Vectors) != 0 {
-		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
-	}
-	if !validGenerationVectorMetadata(generation) {
+	preparedVectors, err := prepareGenerationVectors(generation)
+	if err != nil {
 		return fmt.Errorf("replace sqlite index: %w", index.ErrInvalidGeneration)
 	}
 	corpus, err := source.NewCorpus(generation.ScanPolicyVersion, generation.Chunks)
@@ -520,13 +556,17 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	}
 	defer func() { s.writeToken <- struct{}{} }()
 
-	published, err := s.publish(ctx, generation)
+	published, err := s.publish(ctx, generation, preparedVectors)
 	if err != nil {
 		if published {
 			var committed *index.CommittedCleanupError
 			if !errors.As(err, &committed) {
 				err = index.NewCommittedCleanupError(index.CleanupStagePublicationFinalization)
 			}
+		} else if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		} else if !errors.Is(err, index.ErrConcurrentIndex) && !errors.Is(err, index.ErrInvalidGeneration) {
+			err = errPublicationFailed
 		}
 		return fmt.Errorf("replace sqlite index: %w", err)
 	}
@@ -541,10 +581,10 @@ func (s *Store) Replace(ctx context.Context, generation index.Generation) error 
 	return nil
 }
 
-func (s *Store) publish(ctx context.Context, generation index.Generation) (bool, error) {
+func (s *Store) publish(ctx context.Context, generation index.Generation, vectors []preparedVector) (bool, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		published, err := s.publishAttempt(ctx, generation)
+		published, err := s.publishAttempt(ctx, generation, vectors)
 		if err == nil || published {
 			return published, err
 		}
@@ -572,21 +612,22 @@ func (s *Store) publish(ctx context.Context, generation index.Generation) (bool,
 	}
 }
 
-func (s *Store) publishAttempt(ctx context.Context, generation index.Generation) (published bool, returnedErr error) {
+func (s *Store) publishAttempt(ctx context.Context, generation index.Generation, vectors []preparedVector) (published bool, returnedErr error) {
 	connection, err := s.db.Conn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("acquire write connection: %w", err)
 	}
-	return publishOnConnection(ctx, connection, generation)
+	return publishOnConnection(ctx, connection, generation, vectors)
 }
 
 type writeConnection interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	Close() error
 }
 
-func publishOnConnection(ctx context.Context, connection writeConnection, generation index.Generation) (published bool, returnedErr error) {
+func publishOnConnection(ctx context.Context, connection writeConnection, generation index.Generation, vectors []preparedVector) (published bool, returnedErr error) {
 	committed := false
 	defer func() {
 		stage, finalizationErr := finalizeWriteConnection(connection)
@@ -624,9 +665,12 @@ func publishOnConnection(ctx context.Context, connection writeConnection, genera
 		return false, fmt.Errorf("read repository manifest: %w", err)
 	}
 	if activeGeneration == generation.ID {
-		matches, err := generationMetadataMatches(ctx, connection, generation)
+		matches, err := generationMetadataMatches(ctx, connection, generation, vectors)
 		if err != nil {
-			return false, fmt.Errorf("verify active generation: %w", err)
+			if contextErr := ctx.Err(); contextErr != nil {
+				return false, contextErr
+			}
+			return false, index.ErrInvalidGeneration
 		}
 		if !matches {
 			return false, index.ErrInvalidGeneration
@@ -665,6 +709,23 @@ func publishOnConnection(ctx context.Context, connection writeConnection, genera
 			chunk.Reference.StartLine, chunk.Reference.EndLine,
 		); err != nil {
 			return false, fmt.Errorf("insert chunk: %w", err)
+		}
+	}
+	for _, vector := range vectors {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if _, err := connection.ExecContext(ctx, `
+			INSERT INTO vectors(
+				repository_id, generation_id, chunk_id, encoding_version, dimensions, values_blob
+			) VALUES (?, ?, ?, ?, ?, ?)`,
+			generation.RepositoryID, generation.ID, vector.chunkID, vectorEncodingVersion,
+			vector.dimensions, vector.valuesBlob,
+		); err != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return false, contextErr
+			}
+			return false, fmt.Errorf("insert vector")
 		}
 	}
 	result, err := connection.ExecContext(ctx, `
@@ -724,6 +785,14 @@ func (s *Store) purgeInactive(ctx context.Context) error {
 }
 
 func (s *Store) checkpoint(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closed {
+		return fmt.Errorf("sqlite store is closed")
+	}
+	if len(s.readers) != 0 {
+		return fmt.Errorf("bound readers remain open")
+	}
 	var busy, logFrames, checkpointedFrames int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
 		&busy, &logFrames, &checkpointedFrames,
@@ -740,31 +809,73 @@ type queryRower interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func generationMetadataMatches(ctx context.Context, database queryRower, generation index.Generation) (bool, error) {
+type generationMetadataQuerier interface {
+	queryRower
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func generationMetadataMatches(ctx context.Context, database generationMetadataQuerier, generation index.Generation, vectors []preparedVector) (bool, error) {
 	var revision, contentDigest, policy, fingerprint, model, metric string
-	var dimensions, chunks int
+	var dimensions, chunks, vectorCount int
 	err := database.QueryRowContext(ctx, `
 		SELECT g.corpus_revision, g.content_digest, g.scan_policy_version,
 		       COALESCE(g.profile_fingerprint, ''), COALESCE(g.profile_model, ''),
-		       g.dimensions, g.metric, count(c.chunk_id)
+		       g.dimensions, g.metric, count(c.chunk_id),
+		       (SELECT count(*) FROM vectors AS v
+		        WHERE v.repository_id = g.repository_id AND v.generation_id = g.generation_id)
 		FROM generations AS g
 		LEFT JOIN chunks AS c
 		  ON c.repository_id = g.repository_id AND c.generation_id = g.generation_id
 		WHERE g.repository_id = ? AND g.generation_id = ?
 		GROUP BY g.repository_id, g.generation_id`, generation.RepositoryID, generation.ID,
-	).Scan(&revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric, &chunks)
+	).Scan(&revision, &contentDigest, &policy, &fingerprint, &model, &dimensions, &metric, &chunks, &vectorCount)
 	if err != nil {
 		return false, err
 	}
 	expectedFingerprint, expectedModel := profileMetadata(generation)
-	return revision == generation.CorpusRevision &&
+	metadataMatches := revision == generation.CorpusRevision &&
 		contentDigest == canonicalContentDigest(generation.Chunks) &&
 		policy == generation.ScanPolicyVersion &&
 		fingerprint == expectedFingerprint &&
 		model == expectedModel &&
 		dimensions == generation.Dimensions &&
 		metric == string(generation.Metric) &&
-		chunks == len(generation.Chunks), nil
+		chunks == len(generation.Chunks) &&
+		vectorCount == len(vectors)
+	if !metadataMatches {
+		return false, nil
+	}
+	rows, err := database.QueryContext(ctx, `
+		SELECT chunk_id, encoding_version, dimensions, values_blob
+		FROM vectors
+		WHERE repository_id = ? AND generation_id = ?
+		ORDER BY chunk_id`, generation.RepositoryID, generation.ID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	expected := make(map[string]preparedVector, len(vectors))
+	for _, vector := range vectors {
+		expected[vector.chunkID] = vector
+	}
+	seen := 0
+	for rows.Next() {
+		var chunkID string
+		var version, storedDimensions int
+		var blob []byte
+		if err := rows.Scan(&chunkID, &version, &storedDimensions, &blob); err != nil {
+			return false, err
+		}
+		vector, present := expected[chunkID]
+		if !present || version != vectorEncodingVersion || storedDimensions != vector.dimensions || !bytes.Equal(blob, vector.valuesBlob) {
+			return false, nil
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return seen == len(vectors), nil
 }
 
 func canonicalContentDigest(chunks []source.Chunk) string {
@@ -810,18 +921,6 @@ func profileMetadata(generation index.Generation) (string, string) {
 	return generation.Profile.Fingerprint, generation.Profile.Model
 }
 
-func validGenerationVectorMetadata(generation index.Generation) bool {
-	if generation.Metric != index.VectorMetricCosine {
-		return false
-	}
-	if generation.Profile == nil {
-		return generation.Dimensions == 0
-	}
-	return strings.TrimSpace(generation.Profile.Fingerprint) != "" &&
-		strings.TrimSpace(generation.Profile.Model) != "" &&
-		generation.Dimensions > 0
-}
-
 // ActiveGeneration returns the active generation ID for one repository.
 func (s *Store) ActiveGeneration(ctx context.Context, repositoryID string) (string, error) {
 	if err := ctx.Err(); err != nil {
@@ -852,6 +951,11 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 	if strings.TrimSpace(repositoryID) == "" {
 		return nil, fmt.Errorf("bind active sqlite index: %w", index.ErrInvalidGeneration)
 	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closed {
+		return nil, fmt.Errorf("bind active sqlite index: store is closed")
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("bind active sqlite index: begin transaction: %w", err)
@@ -874,7 +978,10 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 	}
 	if err != nil {
 		_ = tx.Rollback()
-		return nil, fmt.Errorf("bind active sqlite index: read manifest: %w", err)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, fmt.Errorf("bind active sqlite index: %w", contextErr)
+		}
+		return nil, index.ErrReindexRequired
 	}
 	if policy != ingest.ScanPolicyVersion {
 		_ = tx.Rollback()
@@ -884,14 +991,21 @@ func (s *Store) BindActive(ctx context.Context, repositoryID string) (*BoundRead
 		_ = tx.Rollback()
 		return nil, index.ErrReindexRequired
 	}
-	return &BoundReader{
-		tx:                tx,
-		repositoryID:      repositoryID,
-		generationID:      generationID,
-		corpusRevision:    revision,
-		contentDigest:     contentDigest,
-		scanPolicyVersion: policy,
-	}, nil
+	reader := &BoundReader{
+		tx:                 tx,
+		repositoryID:       repositoryID,
+		generationID:       generationID,
+		corpusRevision:     revision,
+		contentDigest:      contentDigest,
+		scanPolicyVersion:  policy,
+		profileFingerprint: fingerprint,
+		profileModel:       model,
+		dimensions:         dimensions,
+		metric:             index.VectorMetric(metric),
+		store:              s,
+	}
+	s.readers[reader] = struct{}{}
+	return reader, nil
 }
 
 func validStoredVectorMetadata(fingerprint, model string, dimensions int) bool {
@@ -920,7 +1034,7 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return nil, fmt.Errorf("load bound sqlite index: reader is closed")
+		return nil, fmt.Errorf("load bound sqlite index: %w", errBoundReaderClosed)
 	}
 	rows, err := r.tx.QueryContext(ctx, `
 		SELECT c.chunk_id, c.text, c.language, c.symbol_name, c.path, c.start_line, c.end_line
@@ -928,9 +1042,8 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 		WHERE c.repository_id = ? AND c.generation_id = ?
 		ORDER BY c.ordinal`, r.repositoryID, r.generationID)
 	if err != nil {
-		return nil, fmt.Errorf("load bound sqlite index: query chunks: %w", err)
+		return nil, boundLoadError(ctx)
 	}
-	defer rows.Close()
 
 	chunks := make([]source.Chunk, 0)
 	for rows.Next() {
@@ -940,13 +1053,16 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 			&chunk.ID, &chunk.Text, &language, &chunk.SymbolName,
 			&chunk.Reference.Path, &chunk.Reference.StartLine, &chunk.Reference.EndLine,
 		); err != nil {
-			return nil, fmt.Errorf("load bound sqlite index: scan chunk: %w", err)
+			_ = rows.Close()
+			return nil, boundLoadError(ctx)
 		}
 		chunk.Language = source.Language(language)
 		chunks = append(chunks, chunk)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("load bound sqlite index: read chunks: %w", err)
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil {
+		return nil, boundLoadError(ctx)
 	}
 	corpus, err := source.NewCorpus(r.scanPolicyVersion, chunks)
 	if err != nil || corpus.Revision != r.corpusRevision || canonicalContentDigest(chunks) != r.contentDigest {
@@ -955,22 +1071,39 @@ func (r *BoundReader) Load(ctx context.Context, repositoryID string) ([]source.C
 	return chunks, nil
 }
 
+func boundLoadError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("load bound sqlite index: %w", err)
+	}
+	return index.ErrReindexRequired
+}
+
 // Close releases the bound read transaction. It is safe to call repeatedly.
 func (r *BoundReader) Close() error {
 	if r == nil {
 		return nil
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return nil
 	}
 	r.closed = true
 	err := r.tx.Rollback()
+	r.mu.Unlock()
+	if r.store != nil {
+		r.store.unregisterReader(r)
+	}
 	if errors.Is(err, sql.ErrTxDone) {
 		return nil
 	}
 	return err
+}
+
+func (s *Store) unregisterReader(reader *BoundReader) {
+	s.lifecycleMu.Lock()
+	delete(s.readers, reader)
+	s.lifecycleMu.Unlock()
 }
 
 // Load returns canonical chunks from the active repository generation.

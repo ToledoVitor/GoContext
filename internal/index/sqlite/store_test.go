@@ -66,6 +66,7 @@ func TestStorePersistsAndValidatesVectorMetric(t *testing.T) {
 	})
 	generation.Profile = &embedding.Profile{Fingerprint: "profile-fingerprint", Model: "model"}
 	generation.Dimensions = 3
+	generation.Vectors = []index.VectorRecord{{ChunkID: "chunk", Values: embedding.Vector{1, 0, 0}}}
 	if err := store.Replace(context.Background(), generation); err != nil {
 		t.Fatalf("Replace() error = %v", err)
 	}

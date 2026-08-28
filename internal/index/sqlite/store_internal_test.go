@@ -131,7 +131,11 @@ func TestPublishOnConnectionReportsCommittedFinalizationFailureAndAllowsRetry(t 
 				closeErr:   tt.closeErr,
 			}
 
-			published, err := publishOnConnection(context.Background(), wrapped, generation)
+			vectors, prepareErr := prepareGenerationVectors(generation)
+			if prepareErr != nil {
+				t.Fatalf("prepareGenerationVectors() error = %v", prepareErr)
+			}
+			published, err := publishOnConnection(context.Background(), wrapped, generation, vectors)
 			if !published {
 				t.Fatalf("publishOnConnection() published = false, want true after commit")
 			}
