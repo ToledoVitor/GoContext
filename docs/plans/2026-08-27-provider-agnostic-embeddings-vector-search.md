@@ -1126,6 +1126,17 @@ Ordenar linguagens/formatos/padrões pela fórmula do plano de validação. Cada
 
 A primeira execução aggregate-only mostrou taxonomia incompleta e sinal compatível com provável ruído de dependências/build/cache; não houve observação de conteúdo dentro dos novos hard denies. Task 14C refina buckets sanitizados e policy pré-open antes de escolher qualquer parser. JSON continua `unknown/not evaluated` e não será habilitado cegamente: configuração JSON pode conter segredos ou dados sensíveis e requer plano/testes próprios.
 
+Checkpoint `scanner-v6`: depois do tracer bullet JavaScript/JSX sintético, revisão
+independente, taint renovado e três checklists privados novos, os três runs
+lexicais seriais terminaram `go`, sem provider/rede. O agregado incluiu 378
+JavaScript, barrou outros seis candidatos por segredo/tamanho e acrescentou só
+seis símbolos `function`; 372 arquivos novos ficaram sem símbolo. Exact-symbol
+geral permaneceu estável na precisão publicada, mas a amostra não informa
+linguagem por query. Fronteira de citação JavaScript é evidência dos testes
+sintéticos, não do run profissional. Gold set humano privado e adapter
+estrutural JavaScript continuam próximos gates antes de alegar qualidade ou
+executar semântica profissional.
+
 - [ ] **Step 7: Verificar e commit**
 
 Run: `go test -race ./internal/eval ./cmd/gocontext && go test ./... && go vet ./... && git diff --check`

@@ -1,7 +1,7 @@
 # Baseline local sanitizado dos repositórios profissionais
 
 **Data:** 2026-08-28  
-**Policy:** `scanner-v5`  
+**Policies:** baseline histórico `scanner-v5`; comparação `scanner-v6`
 **Escopo:** três raízes profissionais autorizadas, identificadas apenas como
 `repo-2f`, `repo-7c` e `repo-b4`. IDs e ordem das linhas foram atribuídos
 independentemente de qualquer lista nominal.
@@ -125,12 +125,80 @@ revalidar taint, hard-deny, secret scan, no-egress e checklist individual;
 somente então repetir baseline local protegido. Depois, criar gold set P1 sem
 versionar queries ou hits.
 
-## Estado após o tracer bullet sintético
+## Comparação protegida `scanner-v6`
 
-Task 14D implementa o P0 em `scanner-v6` somente com fixtures sintéticas e
-renova os gates de taint para a nova fronteira `.js`/`.jsx`. Os números e as
-métricas deste documento continuam sendo o baseline histórico `scanner-v5`:
-nenhum repositório profissional foi reaberto e nenhuma melhora de cobertura,
-recall, ranking ou qualidade é alegada aqui. Uma comparação antes/depois exige
-nova autorização operacional, reindex explícito e repetição completa do
-checklist go/no-go, mantendo output apenas agregado.
+Depois do tracer bullet sintético, os gates de taint/no-egress/hard-deny foram
+reexecutados, três checklists privados novos foram preenchidos e as três raízes
+foram avaliadas novamente. Os runs ocorreram serialmente, com `semantic off`,
+sem provider/rede, raiz read-only e outputs aggregate-only `0600` fora dos
+repositórios. Todos terminaram `go`. Os IDs públicos continuam remapeados e não
+posicionais; nenhuma ligação com nomes ou roots foi persistida.
+
+| Repositório | Elegíveis (arquivos / bytes) | Incluídos (arquivos / bytes) | Cobertura incluída | Chunks / bytes indexados | Sem símbolo |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `repo-2f` | 3.828 / 22.273.812 | 3.679 / 19.056.968 | 96,1% / 85,6% | 10.865 / 17.525.898 | 461 |
+| `repo-7c` | 3.606 / 10.860.453 | 3.563 / 10.669.841 | 98,8% / 98,2% | 5.926 / 9.368.554 | 1.104 |
+| `repo-b4` | 1.367 / 21.568.035 | 1.304 / 14.792.881 | 95,4% / 68,6% | 6.650 / 13.515.659 | 446 |
+
+| Repositório | Linguagens/extensões incluídas | Delta JavaScript sobre v5 | Símbolos agregados |
+| --- | --- | ---: | --- |
+| `repo-2f` | Python 3.679 (`.py` 3.679) | 0 arquivo / 0 byte | class 5.449; function 5.249 |
+| `repo-7c` | JavaScript 8 (`.js` 8); TypeScript 3.555 (`.ts` 1.267, `.tsx` 2.288) | +8 arquivos / +2.938 bytes | class 9; enum 69; function 1.854; interface 841; type 2.050 |
+| `repo-b4` | JavaScript 370 (`.js` 370); Python 372 (`.py` 372); TypeScript 562 (`.ts` 243, `.tsx` 319) | +370 arquivos / +5.676.896 bytes | class 387; function 5.101; interface 583; type 141 |
+
+Em `repo-b4`, os 376 candidatos `.js` do baseline viraram 370 arquivos
+incluídos; quatro foram barrados pelo detector de segredo e dois pelo limite de
+tamanho. Isso é comportamento esperado: suporte de extensão não contorna gates
+de conteúdo. A contagem unsupported caiu de 2.173 para 1.797. Em `repo-7c`,
+oito `.js` foram incluídos e a contagem unsupported caiu de 168 para 160.
+`repo-2f` permaneceu byte a byte igual nas contagens de corpus.
+
+O sinal estrutural é deliberadamente conservador. Entre os 378 JavaScript
+incluídos, a variação agregada é de seis símbolos `function` e 372 arquivos sem
+símbolo adicional. Isso confirma contagens de inclusão/chunking, não cobertura
+de AST nem citação específica de JavaScript. A fronteira JS de citação foi
+provada por fixtures sintéticas; a amostra profissional exact-symbol é limitada
+a 1.000 casos e não informa linguagem por query. Próximo adapter de linguagem
+deve atacar declarações/módulos JavaScript medidos com fixtures sintéticas e
+manter falso negativo preferível a símbolo inventado.
+
+| Repositório | Queries | Recall@5 | Recall@10 | MRR@10 | nDCG@10 | Citação válida | Ordem determinística |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `repo-2f` | 1.000 | 0,929 | 0,954 | 0,878 | 0,897 | 1,000 | 1,000 |
+| `repo-7c` | 1.000 | 0,945 | 0,971 | 0,820 | 0,859 | 1,000 | 1,000 |
+| `repo-b4` | 1.000 | 0,936 | 0,967 | 0,876 | 0,899 | 1,000 | 1,000 |
+
+As métricas exact-symbol ficaram iguais ao baseline na precisão publicada.
+Isso não demonstra ganho de busca: o conjunto automático continua derivado de
+símbolos já reconhecidos, e o parser JavaScript encontrou pouco sinal novo.
+Citação e ordem permaneceram 100% dentro desse escopo estreito.
+
+| Repositório | Scan | Index | Query p50 / p95 | Pico heap aproximado |
+| --- | ---: | ---: | ---: | ---: |
+| `repo-2f` | 2.325 ms | 80 ms | 282.740 / 292.982 µs | 80.723.352 B |
+| `repo-7c` | 1.350 ms | 68 ms | 165.820 / 167.754 µs | 42.622.808 B |
+| `repo-b4` | 1.894 ms | 76 ms | 258.852 / 262.165 µs | 56.251.072 B |
+
+Runs v5 foram concorrentes; runs v6 foram seriais. Números acima são
+diagnóstico process-local, não comparação controlada nem SLA. A carga maior de
+`repo-b4` é compatível com corpus indexado 72,4% maior, mas não prova causalidade
+de qualquer diferença de latência.
+
+## Decisão após `scanner-v6`
+
+1. **P0 — gold set humano privado:** continua bloqueio para alegar qualidade
+   conceitual, cross-layer, framework, erro ou evidência negativa. Queries,
+   julgamentos e hits não serão versionados.
+2. **P1 — adapter estrutural JavaScript:** medir padrões via gold set e ampliar
+   parser/chunker com fixtures sintéticas. Não relaxar fail-closed nem trocar por
+   fallback cru. Mudança de parser exige versão de chunk/reindex explícitos.
+3. **P2 — Markdown:** permanece candidato por volume agregado; exige chunker de
+   headings/blocos, limites e fixtures de prompt injection.
+4. **P3 — JSON seletivo:** continua unsupported. Volume alto não prova segurança
+   ou utilidade; exigir allowlist de basename/schema, redaction e novo gate.
+5. **P4 — assets/binários:** permanecem não indexáveis.
+
+Sem gold set humano, não há base para habilitar semântica profissional, escolher
+ANN, promover híbrido ou afirmar superioridade sobre lexical. Próximo run real
+deve usar harness de gold set privado; até lá, baseline lexical e fallback
+continuam referência segura.

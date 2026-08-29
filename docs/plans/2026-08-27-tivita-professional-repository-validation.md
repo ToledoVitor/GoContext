@@ -63,6 +63,16 @@ Esses buckets continuam report-only: não habilitam parser ou ingestão. JSON pe
 
 Task 14D implementa depois desse baseline um tracer bullet `scanner-v6` para `.js`/`.jsx` usando somente fixtures sintéticas. A ampliação não autoriza automaticamente nova leitura profissional e não transforma o baseline `scanner-v5` em evidência de qualidade JavaScript. Antes de repetir qualquer raiz, o operador deve reindexar explicitamente, repetir taint/no-egress/hard-deny/secret scan e preencher novamente o checklist go/no-go individual. JSON permanece `unknown/not evaluated` e unsupported. Relatórios continuam aggregate-only, sem registros por query.
 
+Checkpoint 2026-08-28: depois da revisão independente do tracer bullet, esses
+gates e os três checklists foram renovados. Três runs seriais `semantic off`
+terminaram `go`, sem provider/rede. Em agregado, 378 arquivos JavaScript foram
+incluídos; seis candidatos adicionais foram excluídos por segredo/tamanho. A
+variação estrutural foi de seis símbolos `function` e 372 arquivos sem símbolo,
+evidência de inclusão/chunking agregado, mas insuficiente para alegar cobertura
+de linguagem ou citação específica de JavaScript. Essa fronteira foi validada
+separadamente por fixtures sintéticas. Nenhum nome, root, path, query ou hit foi
+versionado.
+
 ## Fase B — benchmark de recuperação
 
 Executar primeiro baseline lexical. Vetorial/híbrido somente depois, com Ollama loopback e mesmo corpus permitido.
@@ -95,6 +105,13 @@ Mínimo inicial: 5 queries por categoria aplicável e repositório. Avaliador ma
 - segurança: zero bytes excluídos em qualquer sink instrumentado.
 
 Não definir ganho semântico universal antes do primeiro baseline. Critério de promoção vem dos dados; regressão lexical em símbolo/erro é bloqueante.
+
+O baseline `scanner-v6` preservou, na precisão publicada, Recall@5/10, MRR@10,
+nDCG@10, citações e determinismo do baseline `scanner-v5`. Só a categoria
+exact-symbol automática foi avaliada; conceito, fluxo cross-layer, framework,
+mensagem de erro, configuração/path e evidência negativa permanecem
+`not-evaluated`. Gold set humano privado é gate obrigatório antes de qualquer
+afirmação de qualidade ou execução semântica profissional.
 
 ## Fase C — priorização de suporte
 
