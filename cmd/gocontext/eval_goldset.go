@@ -15,7 +15,7 @@ func readEvalGoldSet(ctx context.Context, path, repositoryID string, root *files
 	if !cleanAbsoluteEvalPath(path) {
 		return nil, errEvalGoldSet
 	}
-	payload, err := readPrivateEvalFileOutsideRoot(path, evaluation.MaxGoldSetBytes, root)
+	payload, err := readPrivateEvalGoldFileOutsideRoot(path, evaluation.MaxGoldSetBytes, root)
 	if err != nil {
 		return nil, errEvalGoldSet
 	}

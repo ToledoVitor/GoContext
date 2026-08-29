@@ -143,25 +143,68 @@ Cada adição exige plano/commit próprio e estes critérios:
 
 ## Saída sanitizada
 
-Formato versionado sugerido, sem registros por query:
+Formato versionado atual, ilustrado somente com agregados vazios e sem registros
+por query. Todas as sete categorias têm o mesmo conjunto completo de campos; em
+`negative_evidence`, os quatro campos de qualidade positiva permanecem zero:
 
 ```json
 {
   "schema": 2,
-  "repository": "opaque-id",
+  "repository": "repo-ab",
   "decision": "go",
+  "blockers": {},
   "inventory": {
     "eligible_files": 0,
+    "eligible_bytes": 0,
     "included_files": 0,
+    "included_bytes": 0,
     "excluded_by_category": {},
     "supported_languages": {},
-    "unsupported_extensions": {}
+    "supported_extensions": {},
+    "unsupported_extensions": {},
+    "size_bands": {},
+    "symbol_kinds": {},
+    "files_without_symbols": 0,
+    "pattern_buckets": {},
+    "chunks": 0,
+    "indexed_bytes": 0
   },
   "retrieval": {
-    "query_counts_by_category": {},
-    "recall_at_5": 0,
-    "mrr_at_10": 0,
-    "citation_validity": 1
+    "status": "not-evaluated",
+    "categories": {
+      "exact_symbol": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0},
+      "concept": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0},
+      "cross_layer": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0},
+      "framework": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0},
+      "error_message": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0},
+      "configuration_path": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0},
+      "negative_evidence": {"status":"not-evaluated","query_count":0,"recall_at_5":0,"recall_at_10":0,"mrr_at_10":0,"ndcg_at_10":0,"no_evidence_accuracy":0}
+    },
+    "citation_validity": 0,
+    "deterministic_order_rate": 0,
+    "fallback_count": 0,
+    "fallback_reason": "zero"
+  },
+  "performance": {
+    "scan_milliseconds": 0,
+    "index_milliseconds": 0,
+    "query_p50_microseconds": 0,
+    "query_p95_microseconds": 0,
+    "peak_heap_bytes_approximate": 0
+  },
+  "capability_gaps": {
+    "concept": "not-evaluated",
+    "cross_layer": "not-evaluated",
+    "framework": "not-evaluated",
+    "error_message": "not-evaluated",
+    "configuration_path": "not-evaluated",
+    "negative_evidence": "not-evaluated"
+  },
+  "limitations": {
+    "heap_peak_approximate": 1,
+    "process_local_latency": 1,
+    "automatic_exact_symbol_only": 1,
+    "frameworks_not_inferred": 1
   }
 }
 ```

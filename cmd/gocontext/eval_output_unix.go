@@ -46,12 +46,20 @@ type evalFileOperations struct {
 	beforeOpenFile  func() error
 	afterOpenFile   func() error
 	afterRead       func() error
+	policy          evalPrivateFilePolicy
 	root            *filesystem.OpenedRoot
 }
 
 type evalPrivateFileIdentity struct {
 	stat unix.Stat_t
 }
+
+type evalPrivateFilePolicy struct {
+	exactMode         os.FileMode
+	requireSingleLink bool
+}
+
+var evalGoldFilePolicy = evalPrivateFilePolicy{exactMode: 0o600, requireSingleLink: true}
 
 type evalDirectory struct {
 	file     *os.File
@@ -289,6 +297,10 @@ func readPrivateEvalFileOutsideRoot(targetPath string, maxBytes int64, root *fil
 	return readPrivateEvalFileWithOperations(targetPath, maxBytes, evalFileOperations{root: root})
 }
 
+func readPrivateEvalGoldFileOutsideRoot(targetPath string, maxBytes int64, root *filesystem.OpenedRoot) ([]byte, error) {
+	return readPrivateEvalFileWithOperations(targetPath, maxBytes, evalFileOperations{policy: evalGoldFilePolicy, root: root})
+}
+
 func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operations evalFileOperations) (payload []byte, resultErr error) {
 	if maxBytes <= 0 {
 		return nil, errEvalChecklist
@@ -317,7 +329,7 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 		return nil, errEvalChecklistLocation
 	}
 	name := filepath.Base(targetPath)
-	identity, err := capturePrivateEvalFilename(parent.file, name, maxBytes)
+	identity, err := capturePrivateEvalFilename(parent.file, name, maxBytes, operations.policy)
 	if err != nil {
 		return nil, errEvalChecklist
 	}
@@ -337,8 +349,8 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 			resultErr = errEvalChecklist
 		}
 	}()
-	if validatePrivateEvalDescriptor(file, identity, maxBytes) != nil ||
-		validatePrivateEvalFilename(parent.file, name, identity, maxBytes) != nil {
+	if validatePrivateEvalDescriptor(file, identity, maxBytes, operations.policy) != nil ||
+		validatePrivateEvalFilename(parent.file, name, identity, maxBytes, operations.policy) != nil {
 		return nil, errEvalChecklist
 	}
 	if operations.afterOpenFile != nil {
@@ -346,8 +358,8 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 			return nil, errEvalChecklist
 		}
 	}
-	if validatePrivateEvalDescriptor(file, identity, maxBytes) != nil ||
-		validatePrivateEvalFilename(parent.file, name, identity, maxBytes) != nil {
+	if validatePrivateEvalDescriptor(file, identity, maxBytes, operations.policy) != nil ||
+		validatePrivateEvalFilename(parent.file, name, identity, maxBytes, operations.policy) != nil {
 		return nil, errEvalChecklist
 	}
 	payload, err = io.ReadAll(io.LimitReader(file, maxBytes+1))
@@ -359,8 +371,8 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 			return nil, errEvalChecklist
 		}
 	}
-	if validatePrivateEvalDescriptor(file, identity, maxBytes) != nil ||
-		validatePrivateEvalFilename(parent.file, name, identity, maxBytes) != nil {
+	if validatePrivateEvalDescriptor(file, identity, maxBytes, operations.policy) != nil ||
+		validatePrivateEvalFilename(parent.file, name, identity, maxBytes, operations.policy) != nil {
 		return nil, errEvalChecklist
 	}
 	inside, err = parent.revalidate(operations.root)
@@ -373,49 +385,58 @@ func readPrivateEvalFileWithOperations(targetPath string, maxBytes int64, operat
 	return payload, nil
 }
 
-func capturePrivateEvalFilename(parent *os.File, name string, maxBytes int64) (*evalPrivateFileIdentity, error) {
+func capturePrivateEvalFilename(parent *os.File, name string, maxBytes int64, policy evalPrivateFilePolicy) (*evalPrivateFileIdentity, error) {
 	if parent == nil || name == "" {
 		return nil, errEvalChecklist
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
-		!validPrivateEvalStat(&stat, maxBytes) {
+		!validPrivateEvalStat(&stat, maxBytes, policy) {
 		return nil, errEvalChecklist
 	}
 	return &evalPrivateFileIdentity{stat: stat}, nil
 }
 
-func validatePrivateEvalFilename(parent *os.File, name string, expected *evalPrivateFileIdentity, maxBytes int64) error {
+func validatePrivateEvalFilename(parent *os.File, name string, expected *evalPrivateFileIdentity, maxBytes int64, policy evalPrivateFilePolicy) error {
 	if expected == nil {
 		return errEvalChecklist
 	}
-	current, err := capturePrivateEvalFilename(parent, name, maxBytes)
+	current, err := capturePrivateEvalFilename(parent, name, maxBytes, policy)
 	if err != nil || !samePrivateEvalStat(&expected.stat, &current.stat) {
 		return errEvalChecklist
 	}
 	return nil
 }
 
-func validatePrivateEvalDescriptor(file *os.File, expected *evalPrivateFileIdentity, maxBytes int64) error {
+func validatePrivateEvalDescriptor(file *os.File, expected *evalPrivateFileIdentity, maxBytes int64, policy evalPrivateFilePolicy) error {
 	if file == nil || expected == nil {
 		return errEvalChecklist
 	}
 	var stat unix.Stat_t
-	if err := unix.Fstat(int(file.Fd()), &stat); err != nil || !validPrivateEvalStat(&stat, maxBytes) ||
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil || !validPrivateEvalStat(&stat, maxBytes, policy) ||
 		!samePrivateEvalStat(&expected.stat, &stat) {
 		return errEvalChecklist
 	}
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() != stat.Size {
+	if err != nil || !info.Mode().IsRegular() || !policy.validMode(info.Mode()) || info.Size() != stat.Size {
 		return errEvalChecklist
 	}
 	return nil
 }
 
-func validPrivateEvalStat(stat *unix.Stat_t, maxBytes int64) bool {
+func validPrivateEvalStat(stat *unix.Stat_t, maxBytes int64, policy evalPrivateFilePolicy) bool {
 	return stat != nil && maxBytes > 0 && uint32(stat.Mode)&unix.S_IFMT == unix.S_IFREG &&
-		uint32(stat.Mode)&0o7777 == 0o600 && stat.Uid == uint32(os.Geteuid()) && uint64(stat.Nlink) == 1 &&
+		policy.validMode(os.FileMode(uint32(stat.Mode)&0o7777)) && stat.Uid == uint32(os.Geteuid()) &&
+		uint64(stat.Nlink) >= 1 && (!policy.requireSingleLink || uint64(stat.Nlink) == 1) &&
 		stat.Size >= 0 && stat.Size <= maxBytes
+}
+
+func (policy evalPrivateFilePolicy) validMode(mode os.FileMode) bool {
+	permissions := mode.Perm()
+	if policy.exactMode != 0 {
+		return permissions == policy.exactMode
+	}
+	return permissions&0o077 == 0 && permissions&0o400 != 0
 }
 
 func samePrivateEvalStat(left, right *unix.Stat_t) bool {

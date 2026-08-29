@@ -28,6 +28,7 @@ func TestParseGoldSetRejectsInvalidInputsWithSanitizedSentinel(t *testing.T) {
 	}{
 		{name: "empty cases", payload: replaceGold(validGoldSetPayload(), []byte(`"cases":[{`), []byte(`"cases":[],"removed":[{`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "query too long", payload: replaceGold(validGoldSetPayload(), []byte(`"private query"`), []byte(`"`+strings.Repeat("q", 4097)+`"`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
+		{name: "whitespace query", payload: replaceGold(validGoldSetPayload(), []byte(`"private query"`), []byte(`" \t "`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "missing judgment", payload: replaceGold(validGoldSetPayload(), []byte(`"judgments":[{"reference":{"path":"permitted/relative.go","start_line":1,"end_line":10},"relevance":3}]`), []byte(`"judgments":[]`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "bad relevance", payload: replaceGold(validGoldSetPayload(), []byte(`"relevance":3`), []byte(`"relevance":4`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "unknown category", payload: replaceGold(validGoldSetPayload(), []byte(`"concept"`), []byte(`"private-category"`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
@@ -37,6 +38,7 @@ func TestParseGoldSetRejectsInvalidInputsWithSanitizedSentinel(t *testing.T) {
 		{name: "missing key", payload: replaceGold(validGoldSetPayload(), []byte(`"id":"case-ab",`), nil), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "duplicate key", payload: replaceGold(validGoldSetPayload(), []byte(`"id":"case-ab"`), []byte(`"id":"case-ab","id":"`+canary+`"`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "trailing json", payload: append(validGoldSetPayload(), []byte(` {}`)...), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
+		{name: "malformed json", payload: []byte(`{"schema":`), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "control byte", payload: replaceGold(validGoldSetPayload(), []byte(`private query`), []byte(`private\u0000query`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "invalid utf8", payload: append(validGoldSetPayload(), 0xff), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "oversize", payload: bytes.Repeat([]byte("x"), int(evaluation.MaxGoldSetBytes)+1), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
@@ -48,6 +50,13 @@ func TestParseGoldSetRejectsInvalidInputsWithSanitizedSentinel(t *testing.T) {
 				t.Fatalf("ParseGoldSet() = %#v, %v", goldSet, err)
 			}
 		})
+	}
+}
+
+func TestParseGoldSetRejectsExcessiveJSONDepth(t *testing.T) {
+	payload := []byte(strings.Repeat("[", 34) + "0" + strings.Repeat("]", 34))
+	if _, err := evaluation.ParseGoldSet(context.Background(), payload, "repo-ab", ingest.ScanPolicyVersion); !errors.Is(err, evaluation.ErrGoldSet) {
+		t.Fatalf("ParseGoldSet() error = %v", err)
 	}
 }
 

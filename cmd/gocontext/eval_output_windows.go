@@ -26,3 +26,6 @@ func (*evalOutput) Close() error              { return nil }
 func readPrivateEvalFileOutsideRoot(string, int64, *filesystem.OpenedRoot) ([]byte, error) {
 	return nil, errEvalChecklist
 }
+func readPrivateEvalGoldFileOutsideRoot(string, int64, *filesystem.OpenedRoot) ([]byte, error) {
+	return nil, errEvalChecklist
+}

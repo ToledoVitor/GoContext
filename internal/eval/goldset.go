@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -15,6 +16,11 @@ import (
 )
 
 const MaxGoldSetBytes int64 = 1 << 20
+
+const (
+	maxGoldJSONDepth               = 32
+	goldJSONCancellationTokenBatch = 64
+)
 
 var (
 	// ErrGoldSet is the sanitized failure returned for every invalid private
@@ -83,17 +89,37 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 		return nil, err
 	}
 	if len(payload) == 0 || int64(len(payload)) > MaxGoldSetBytes || !utf8.Valid(payload) ||
-		!opaqueRepositoryPattern.MatchString(repositoryID) || scanPolicy != ingest.ScanPolicyVersion ||
-		!exactUniqueJSONKeys(payload) {
-		return nil, ErrGoldSet
+		!opaqueRepositoryPattern.MatchString(repositoryID) || scanPolicy != ingest.ScanPolicyVersion {
+		return nil, invalidGoldSet(ctx)
+	}
+	unique, err := exactUniqueJSONKeys(ctx, payload)
+	if err != nil {
+		return nil, err
+	}
+	if !unique {
+		return nil, invalidGoldSet(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var decoded goldSetJSON
-	if err := decoder.Decode(&decoded); err != nil || !decoderAtEOF(decoder) || decoded.Schema != 1 ||
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	decodeErr := decoder.Decode(&decoded)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	atEOF := decoderAtEOF(decoder)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if decodeErr != nil || !atEOF || decoded.Schema != 1 ||
 		decoded.Repository != repositoryID || decoded.ScanPolicyVersion != scanPolicy ||
 		len(decoded.Cases) < 1 || len(decoded.Cases) > 1000 {
-		return nil, ErrGoldSet
+		return nil, invalidGoldSet(ctx)
 	}
 
 	result := &GoldSet{repository: repositoryID, scanPolicy: scanPolicy, cases: make([]goldCase, 0, len(decoded.Cases))}
@@ -111,8 +137,8 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 		_, duplicateID := seenIDs[candidate.ID]
 		_, duplicateQuery := seenQueries[queryKey]
 		if candidate.Judgments == nil || !opaqueCaseIDPattern.MatchString(candidate.ID) || duplicateID || duplicateQuery ||
-			!validQueryCategory(candidate.Category) || !privateText(candidate.Query, 1, 4096) {
-			return nil, ErrGoldSet
+			!validQueryCategory(candidate.Category) || !privateText(candidate.Query, 1, 4096) || strings.TrimSpace(candidate.Query) == "" {
+			return nil, invalidGoldSet(ctx)
 		}
 		seenIDs[candidate.ID] = struct{}{}
 		seenQueries[queryKey] = struct{}{}
@@ -121,14 +147,14 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 		switch candidate.Expectation {
 		case goldRelevant:
 			if candidate.Category == CategoryNegativeEvidence || len(candidate.Judgments) < 1 || len(candidate.Judgments) > 100 {
-				return nil, ErrGoldSet
+				return nil, invalidGoldSet(ctx)
 			}
 		case goldNoEvidence:
 			if candidate.Category != CategoryNegativeEvidence || len(candidate.Judgments) != 0 {
-				return nil, ErrGoldSet
+				return nil, invalidGoldSet(ctx)
 			}
 		default:
-			return nil, ErrGoldSet
+			return nil, invalidGoldSet(ctx)
 		}
 
 		seenReferences := make(map[source.Reference]struct{}, len(candidate.Judgments))
@@ -141,7 +167,7 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 			}
 			_, duplicate := seenReferences[reference]
 			if !reference.Valid() || !privateText(reference.Path, 1, 4096) || judgment.Relevance < 1 || judgment.Relevance > 3 || duplicate {
-				return nil, ErrGoldSet
+				return nil, invalidGoldSet(ctx)
 			}
 			seenReferences[reference] = struct{}{}
 			parsed.judgments = append(parsed.judgments, goldJudgment{reference: reference, relevance: judgment.Relevance})
@@ -149,6 +175,13 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 		result.cases = append(result.cases, parsed)
 	}
 	return result, nil
+}
+
+func invalidGoldSet(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ErrGoldSet
 }
 
 func privateText(value string, minimum, maximum int) bool {
@@ -163,53 +196,91 @@ func privateText(value string, minimum, maximum int) bool {
 	return true
 }
 
-func exactUniqueJSONKeys(payload []byte) bool {
+func exactUniqueJSONKeys(ctx context.Context, payload []byte) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
-	if !walkUniqueJSONValue(decoder) {
-		return false
+	walker := goldJSONWalker{ctx: ctx}
+	valid, err := walker.walkUniqueJSONValue(decoder, 0)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return false, contextErr
+		}
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !valid {
+		return false, nil
 	}
 	var trailing any
-	return errors.Is(decoder.Decode(&trailing), io.EOF)
+	atEOF := errors.Is(decoder.Decode(&trailing), io.EOF)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return atEOF, nil
 }
 
-func walkUniqueJSONValue(decoder *json.Decoder) bool {
-	token, err := decoder.Token()
+type goldJSONWalker struct {
+	ctx    context.Context
+	tokens int
+}
+
+func (walker *goldJSONWalker) nextToken(decoder *json.Decoder) (json.Token, error) {
+	walker.tokens++
+	if walker.tokens%goldJSONCancellationTokenBatch == 0 {
+		if err := walker.ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return decoder.Token()
+}
+
+func (walker *goldJSONWalker) walkUniqueJSONValue(decoder *json.Decoder, depth int) (bool, error) {
+	if depth > maxGoldJSONDepth {
+		return false, nil
+	}
+	token, err := walker.nextToken(decoder)
 	if err != nil {
-		return false
+		return false, err
 	}
 	delimiter, compound := token.(json.Delim)
 	if !compound {
-		return true
+		return true, nil
 	}
 	switch delimiter {
 	case '{':
 		seen := make(map[string]struct{})
 		for decoder.More() {
-			keyToken, err := decoder.Token()
+			keyToken, err := walker.nextToken(decoder)
 			key, ok := keyToken.(string)
 			if err != nil || !ok {
-				return false
+				return false, err
 			}
 			if _, duplicate := seen[key]; duplicate {
-				return false
+				return false, nil
 			}
 			seen[key] = struct{}{}
-			if !walkUniqueJSONValue(decoder) {
-				return false
+			valid, err := walker.walkUniqueJSONValue(decoder, depth+1)
+			if err != nil || !valid {
+				return false, err
 			}
 		}
-		closing, err := decoder.Token()
-		return err == nil && closing == json.Delim('}')
+		closing, err := walker.nextToken(decoder)
+		return err == nil && closing == json.Delim('}'), err
 	case '[':
 		for decoder.More() {
-			if !walkUniqueJSONValue(decoder) {
-				return false
+			valid, err := walker.walkUniqueJSONValue(decoder, depth+1)
+			if err != nil || !valid {
+				return false, err
 			}
 		}
-		closing, err := decoder.Token()
-		return err == nil && closing == json.Delim(']')
+		closing, err := walker.nextToken(decoder)
+		return err == nil && closing == json.Delim(']'), err
 	default:
-		return false
+		return false, nil
 	}
 }

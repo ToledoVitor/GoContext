@@ -73,6 +73,18 @@ func TestRunEvalInventoryWritesSyntheticAggregateOnlyReport(t *testing.T) {
 	}
 }
 
+func TestRunEvalInventoryWithoutGoldSetPreservesOwnerReadOnlyChecklist(t *testing.T) {
+	fixture := newEvalCLIFixture(t)
+	if err := os.Chmod(fixture.checklist, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := run(evalCLIArgs(fixture), &stdout, &stderr)
+	if exitCode != 0 || stdout.String() != "evaluation: go\n" || stderr.Len() != 0 {
+		t.Fatalf("exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+	}
+}
+
 func TestRunEvalInventoryAcceptsPrivateGoldSetWithoutPublishingPrivateFacts(t *testing.T) {
 	fixture := newEvalCLIFixture(t)
 	writeEvalCLIFile(t, fixture.root, "safe.py", "def Match():\n")
@@ -145,6 +157,19 @@ func TestRunEvalInventoryRejectsUntrustedGoldSetBeforePipeline(t *testing.T) {
 			if err := os.Chmod(path, 0o640); err != nil {
 				t.Fatal(err)
 			}
+			return path
+		}},
+		{name: "owner read-only", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
+			writeEvalGoldSet(t, path, "private-query-CANARY")
+			if err := os.Chmod(path, 0o400); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+		{name: "whitespace query", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
+			writeEvalGoldSet(t, path, " \t ")
 			return path
 		}},
 		{name: "malformed schema", configure: func(t *testing.T, fixture evalCLIFixture) string {
