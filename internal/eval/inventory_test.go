@@ -433,7 +433,11 @@ func TestEvaluateResolvesHumanGoldReferenceIntoCanonicalChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	searcher := &sequenceSearcher{results: [][]search.Hit{{{Chunk: chunk}}, {{Chunk: chunk}}}}
+	searchResults := make([][]search.Hit, 10)
+	for index := range searchResults {
+		searchResults[index] = []search.Hit{{Chunk: chunk}}
+	}
+	searcher := &sequenceSearcher{results: searchResults}
 	report, err := evaluation.Evaluate(context.Background(), "repo-a1", "ignored", evaluation.Dependencies{
 		Scanner: &fixedScanner{result: validFixedScanResult([]source.File{file})},
 		Parser:  parserFunc(func(context.Context, source.File) ([]source.Symbol, error) { return nil, nil }),
@@ -446,7 +450,7 @@ func TestEvaluateResolvesHumanGoldReferenceIntoCanonicalChunk(t *testing.T) {
 		t.Fatalf("Evaluate() report/error = %#v/%v", report, err)
 	}
 	metrics := report.Retrieval.Categories[evaluation.CategoryConcept]
-	if metrics.Status != evaluation.StatusEvaluated || metrics.QueryCount != 1 || metrics.RecallAt5 != 1 ||
+	if metrics.Status != evaluation.StatusEvaluated || metrics.QueryCount != 5 || metrics.RecallAt5 != 1 ||
 		report.CapabilityGaps[evaluation.CategoryConcept] != evaluation.StatusEvaluated ||
 		report.Retrieval.Categories[evaluation.CategoryExactSymbol].Status != evaluation.StatusNotEvaluated ||
 		report.Limitations[evaluation.LimitationAutomaticSymbols] != 0 {
@@ -499,9 +503,12 @@ func TestEvaluateRejectsMissingOrAmbiguousGoldReferenceBeforeSearchFactory(t *te
 func TestEvaluateRejectsGoldCasesOverChecklistQueryBudgetBeforeSearch(t *testing.T) {
 	file := source.File{Reference: source.Reference{Path: "safe.py", StartLine: 1, EndLine: 1}, Language: source.LanguagePython, Content: []byte("content")}
 	chunk := source.Chunk{ID: "opaque", Text: "content", Language: source.LanguagePython, Reference: file.Reference}
-	payload := []byte(`{"schema":1,"repository":"repo-a1","scan_policy_version":"scanner-v6","cases":[` +
-		`{"id":"case-a1","category":"concept","query":"first","expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":1}]},` +
-		`{"id":"case-a2","category":"framework","query":"second","expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":1}]}]}`)
+	payload := goldSetPayload(
+		goldCategoryFixture{category: evaluation.CategoryConcept, count: 5},
+		goldCategoryFixture{category: evaluation.CategoryFramework, count: 5},
+	)
+	payload = bytes.ReplaceAll(payload, []byte("repo-ab"), []byte("repo-a1"))
+	payload = bytes.ReplaceAll(payload, []byte("permitted/relative.go"), []byte("safe.py"))
 	goldSet, err := evaluation.ParseGoldSet(context.Background(), payload, "repo-a1", ingest.ScanPolicyVersion)
 	if err != nil {
 		t.Fatal(err)

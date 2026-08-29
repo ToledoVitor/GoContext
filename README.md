@@ -2,7 +2,7 @@
 
 GoContext é um copiloto local de inteligência para repositórios. A proposta é transformar código-fonte em contexto pesquisável, responder perguntas com evidências verificáveis e expor esse contexto por uma interface MCP somente leitura.
 
-O núcleo de recuperação do **M2** está implementado: snapshot JSON e busca lexical continuam sendo o caminho padrão offline; SQLite, embeddings OpenAI-compatible, busca vetorial exata e fusão híbrida são capacidades opt-in. A prova taint ponta a ponta, o primeiro baseline profissional agregado e um tracer bullet sintético de JavaScript/JSX estão concluídos. Parsing estrutural, nova medição profissional após esse suporte, LLM, MCP, frontend, ANN, reranker e reuso incremental permanecem futuros.
+O núcleo de recuperação do **M2** está implementado: snapshot JSON e busca lexical continuam sendo o caminho padrão offline; SQLite, embeddings OpenAI-compatible, busca vetorial exata e fusão híbrida são capacidades opt-in. A prova taint ponta a ponta, os baselines profissionais agregados `scanner-v5`/`scanner-v6`, o tracer bullet sintético de JavaScript/JSX e o seam privado para gold set humano estão concluídos. Gold set humano profissional, comparação híbrida profissional, parsing estrutural, LLM, MCP, frontend, ANN, reranker e reuso incremental permanecem futuros.
 
 ## Objetivo do MVP
 
@@ -85,7 +85,11 @@ go run ./cmd/gocontext index --store /caminho/do/cache /caminho/do/repositório
 
 A policy `scanner-v6` mantém todos os hard denies e classificadores de `scanner-v5` e adiciona somente `.js` e `.jsx`, com comparação case-insensitive, à allowlist de fontes. Todos os gates de filename, diretório, nested repo, symlink, arquivo regular, tamanho, binário, UTF-8, gerado e segredo continuam anteriores à criação de `source.File`. JSON, Markdown, assets, binários e extensões arbitrárias permanecem não suportados; em particular, JSON não é habilitado cegamente porque pode misturar configuração útil com credenciais ou outros dados sensíveis.
 
-Snapshots e corpora `scanner-v5` ou anteriores são incompatíveis e falham com pedido sanitizado de reindexação; não existe migração in-place. Reexecute `index` no backend desejado para produzir um corpus `scanner-v6`. O suporte JavaScript foi provado somente com fixtures sintéticas e não altera os resultados profissionais já registrados sob `scanner-v5`; nenhuma melhoria de qualidade profissional é alegada antes de uma nova execução local que repita os gates de taint, no-egress e go/no-go.
+Snapshots e corpora `scanner-v5` ou anteriores são incompatíveis e falham com pedido sanitizado de reindexação; não existe migração in-place. Reexecute `index` no backend desejado para produzir um corpus `scanner-v6`.
+
+Depois da revisão do tracer bullet sintético, os gates de taint, no-egress e go/no-go foram repetidos e três inventários profissionais agregados `scanner-v6` terminaram `go` com `semantic off`. Em agregado, 378 arquivos JavaScript foram incluídos, seis candidatos foram excluídos pelos gates de segredo/tamanho e o parser acrescentou seis símbolos `function`, enquanto outros 372 arquivos ficaram sem símbolo. As métricas exact-symbol gerais permaneceram iguais ao baseline na precisão publicada. Esses dados não identificam linguagem por query e não sustentam alegação de citação específica de JavaScript, cobertura estrutural ou ganho de qualidade.
+
+O comando profissional aggregate-only atual continua lexical/offline. `gocontext eval inventory --gold-set ABS_PATH` entrega o seam privado para casos humanos e exige ao menos cinco casos distintos em cada categoria fornecida, mas nenhum gold set humano profissional foi criado ou executado. Esse harness não compõe a busca híbrida nem Ollama; a comparação híbrida profissional não foi entregue nem executada e permanece bloqueada até existir gold set humano e um gate verificado de Ollama em loopback sem telemetry, request logging ou retenção de payload. O caminho Ollama opt-in do produto descrito abaixo existe, mas não equivale a um harness profissional agregado.
 
 ### Opt-in SQLite sem embeddings
 

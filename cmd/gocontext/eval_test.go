@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	evaluation "github.com/ToledoVitor/GoContext/internal/eval"
@@ -107,7 +108,7 @@ func TestRunEvalInventoryAcceptsPrivateGoldSetWithoutPublishingPrivateFacts(t *t
 		t.Fatal(err)
 	}
 	concept := report.Retrieval.Categories[evaluation.CategoryConcept]
-	if report.Schema != 2 || concept.Status != evaluation.StatusEvaluated || concept.QueryCount != 1 ||
+	if report.Schema != 2 || concept.Status != evaluation.StatusEvaluated || concept.QueryCount != 5 ||
 		report.Retrieval.Categories[evaluation.CategoryExactSymbol].Status != evaluation.StatusNotEvaluated ||
 		report.CapabilityGaps[evaluation.CategoryConcept] != evaluation.StatusEvaluated ||
 		report.Limitations[evaluation.LimitationAutomaticSymbols] != 0 {
@@ -170,6 +171,11 @@ func TestRunEvalInventoryRejectsUntrustedGoldSetBeforePipeline(t *testing.T) {
 		{name: "whitespace query", configure: func(t *testing.T, fixture evalCLIFixture) string {
 			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
 			writeEvalGoldSet(t, path, "   ")
+			return path
+		}},
+		{name: "underfilled category", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
+			writeEvalGoldSetCases(t, path, "private-query-CANARY", 4)
 			return path
 		}},
 		{name: "malformed schema", configure: func(t *testing.T, fixture evalCLIFixture) string {
@@ -684,7 +690,23 @@ func writeEvalChecklist(t *testing.T, target string, checklist evaluation.Checkl
 
 func writeEvalGoldSet(t *testing.T, target, query string) {
 	t.Helper()
-	payload := []byte(fmt.Sprintf(`{"schema":1,"repository":"repo-a1","scan_policy_version":%q,"cases":[{"id":"case-a1","category":"concept","query":%q,"expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":3}]}]}`, ingest.ScanPolicyVersion, query))
+	writeEvalGoldSetCases(t, target, query, 5)
+}
+
+func writeEvalGoldSetCases(t *testing.T, target, query string, count int) {
+	t.Helper()
+	var cases strings.Builder
+	for index := 1; index <= count; index++ {
+		if index > 1 {
+			cases.WriteByte(',')
+		}
+		caseQuery := query
+		if index > 1 {
+			caseQuery = fmt.Sprintf("%s %d", query, index)
+		}
+		fmt.Fprintf(&cases, `{"id":"case-a%d","category":"concept","query":%q,"expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":3}]}`, index, caseQuery)
+	}
+	payload := []byte(fmt.Sprintf(`{"schema":1,"repository":"repo-a1","scan_policy_version":%q,"cases":[%s]}`, ingest.ScanPolicyVersion, cases.String()))
 	if err := os.WriteFile(target, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}

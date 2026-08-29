@@ -1142,9 +1142,13 @@ Checkpoint Task 14E: o mesmo `internal/eval.Evaluate` aceita opcionalmente um
 `--gold-set ABS_PATH` somente depois dos gates de output/root/checklist, exige
 arquivo local `0600` de link único em diretório/ancestralidade confiáveis e
 falha fechado com categoria fixa. Referências são resolvidas somente contra o
-corpus canônico já permitido antes de construir busca. O output aggregate-only
-agora é schema 2; schema 1 permanece histórico e não recebe migração. Nenhum
-gold set humano profissional foi criado ou executado neste checkpoint.
+corpus canônico já permitido antes de construir busca; cada categoria fornecida
+precisa ter pelo menos cinco casos distintos. O output aggregate-only agora é
+schema 2; schema 1 permanece histórico e não recebe migração. Nenhum gold set
+humano profissional foi criado ou executado neste checkpoint. O CLI de
+avaliação entregue continua lexical/offline e não compõe híbrido/Ollama; a
+comparação profissional permanece bloqueada por gold set humano, gate de
+loopback sem telemetry/logging/retenção e uma composição aggregate-only futura.
 
 - [ ] **Step 7: Verificar e commit**
 

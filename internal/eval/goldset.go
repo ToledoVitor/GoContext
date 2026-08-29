@@ -20,6 +20,7 @@ const MaxGoldSetBytes int64 = 1 << 20
 const (
 	maxGoldJSONDepth               = 32
 	goldJSONCancellationTokenBatch = 64
+	minimumGoldCasesPerCategory    = 5
 )
 
 var (
@@ -129,6 +130,7 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 		query    string
 	}
 	seenQueries := make(map[categoryQuery]struct{}, len(decoded.Cases))
+	categoryCounts := make(map[QueryCategory]int)
 	for _, candidate := range decoded.Cases {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -172,7 +174,13 @@ func ParseGoldSet(ctx context.Context, payload []byte, repositoryID, scanPolicy 
 			seenReferences[reference] = struct{}{}
 			parsed.judgments = append(parsed.judgments, goldJudgment{reference: reference, relevance: judgment.Relevance})
 		}
+		categoryCounts[candidate.Category]++
 		result.cases = append(result.cases, parsed)
+	}
+	for _, count := range categoryCounts {
+		if count < minimumGoldCasesPerCategory {
+			return nil, invalidGoldSet(ctx)
+		}
 	}
 	return result, nil
 }

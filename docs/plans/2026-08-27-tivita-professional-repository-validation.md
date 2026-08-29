@@ -8,7 +8,8 @@
 
 - Descobrir linguagens, extensões, tamanhos e padrões; não presumir stack de nenhum repositório.
 - Código profissional fica local. Para estes três repositórios, embeddings externos são proibidos mesmo que produto genérico ofereça opt-in.
-- Modos permitidos: lexical/offline e OpenAI-compatible apontando somente para Ollama em loopback.
+- O harness profissional aggregate-only entregue (`gocontext eval inventory`) executa somente lexical/offline com `semantic off`; não compõe SQLite vetorial, busca híbrida ou Ollama.
+- O caminho semântico opt-in do produto aceita OpenAI-compatible apontando para Ollama em loopback, mas não constitui um harness profissional agregado. Uma comparação profissional futura só poderá usar esse modo depois dos gates humanos e de privacidade abaixo.
 - `.env`, `.env.*`, `.git/**`, `.github/**` e demais hard denies nunca são abertos. Exclusão integral de `.github/**` perde contexto útil de workflows/configuração, mas atende requisito explícito.
 - Relatórios persistem somente contagens, percentuais, histogramas, IDs opacos de query e achados categóricos. Nunca persistem conteúdo, símbolo, query, path, basename, URL interna, nome de pessoa ou amostra de código.
 - Gold sets, queries e ranks por item ficam em workspace local não sincronizado: diretório `0700`, arquivos `0600`, fora do Git, com retenção até revisão e remoção depois da agregação. Documentação recebe somente categoria e métricas agregadas.
@@ -75,7 +76,7 @@ versionado.
 
 ## Fase B — benchmark de recuperação
 
-Executar primeiro baseline lexical. Vetorial/híbrido somente depois, com Ollama loopback e mesmo corpus permitido.
+Executar primeiro baseline lexical. A comparação vetorial/híbrida profissional não foi entregue nem executada: permanece bloqueada até existir gold set humano válido e um gate verificado de Ollama em IP loopback, sem DNS/proxy/redirect, telemetry, request logging ou retenção de payload. Depois desses gates, ainda será necessário entregar e revisar uma composição aggregate-only que use exatamente o mesmo corpus permitido; o caminho Ollama genérico do produto, sozinho, não satisfaz esse requisito.
 
 ### Matriz de consultas
 
@@ -91,7 +92,7 @@ Cada repositório recebe IDs opacos e quantidade comparável por categoria:
 | padrão de framework | achar construção idiomática | parser/chunker não fragmenta evidência |
 | evidência negativa | consulta sem suporte no corpus | nenhuma citação inventada |
 
-Mínimo inicial: 5 queries por categoria aplicável e repositório. Avaliador marca relevância localmente. Dados por query — ID, texto, ranks, booleanos e hits — permanecem somente no workspace privado; resultado versionado agrega por categoria e repositório.
+Mínimo inicial: 5 queries distintas por categoria aplicável e repositório. `ParseGoldSet` rejeita qualquer categoria fornecida com menos de cinco casos antes de criar o pipeline. O avaliador marca relevância localmente. Dados por query — ID, texto, ranks, booleanos e hits — permanecem somente no workspace privado; resultado versionado agrega por categoria e repositório.
 
 ### Métricas
 
@@ -223,7 +224,7 @@ autorizado, criado ou executado durante a implementação desse seam.
 
 - três checklists registrados localmente; `no-go` permanece resultado válido;
 - inventário reproduzível sem assumir linguagem ou framework;
-- baseline lexical e, quando disponível, híbrido local comparados pela mesma matriz;
+- baseline lexical registrado; comparação híbrida local permanece pendente até os gates e a composição aggregate-only descritos na Fase B;
 - nenhum acesso a hard deny nem egress externo;
 - gaps ordenados por impacto e convertidos em planos pequenos com fixtures não proprietárias;
 - relatório Git contém somente agregados sanitizados e limitações explícitas.

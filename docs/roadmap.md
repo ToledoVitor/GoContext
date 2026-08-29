@@ -8,7 +8,7 @@ Cada marco deve terminar compilável, testado e utilizável sem depender do segu
 - modelo de proveniência e citações;
 - arquitetura, decisão de stack e limites do MVP.
 
-**Pronto quando:** `go test ./...`, `go vet ./...` e build da CLI passam sem dependências externas.
+**Pronto quando:** `go test ./...`, `go vet ./...` e build da CLI passam sem serviços externos.
 
 ## M1 — Ingestão observável (parcial)
 
@@ -38,7 +38,7 @@ Scanner `scanner-v6`, relatório, snapshots seguros, tracer bullet JavaScript/JS
 
 **Pronto quando:** consultas exatas e conceituais encontram fixtures sem serviço de índice externo; modo default não abre rede; falha temporária semântica preserva busca lexical e referências canônicas.
 
-Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. Task 13 concluiu prova taint e Task 14 concluiu primeiro inventário/baseline lexical profissional aggregate-only. O harness aceita agora um gold set humano local opcional, estrito e owner-only, resolve julgamentos apenas contra chunks canônicos permitidos e emite somente agregados schema 2. O conteúdo humano ainda não foi criado nem executado; portanto a promoção ampla continua bloqueada e as categorias conceituais, framework, erro, configuração, cross-layer e evidência negativa dos baselines publicados permanecem `not-evaluated`.
+Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. Task 13 concluiu a prova taint; Task 14 concluiu o baseline lexical profissional aggregate-only e sua repetição protegida sob `scanner-v6`. O harness aceita agora um gold set humano local opcional, estrito e owner-only, exige pelo menos cinco casos distintos por categoria fornecida, resolve julgamentos apenas contra chunks canônicos permitidos e emite somente agregados schema 2. O conteúdo humano ainda não foi criado nem executado; portanto a promoção ampla continua bloqueada e as categorias conceituais, framework, erro, configuração, cross-layer e evidência negativa dos baselines publicados permanecem `not-evaluated`.
 
 ## M3 — Perguntas fundamentadas
 
@@ -62,4 +62,6 @@ Esses comportamentos do núcleo estão entregues com `source.Reference` canônic
 
 React/TypeScript para navegação e histórico, atualização incremental, ANN, reranker, banco vetorial externo, mais linguagens, métricas de recuperação e adapters adicionais. Só entram após uso real indicar prioridade.
 
-Primeiro ciclo de uso real em três repositórios profissionais autorizados passou os gates da Task 14 e concluiu inventário/baseline lexical aggregate-only sob `scanner-v5`, sem rede. O tracer bullet JavaScript/JSX posterior usa somente fixtures sintéticas: não atualiza aquele baseline nem sustenta delta de qualidade profissional. Nova medição exige reindex `scanner-v6` e repetição dos gates de taint, no-egress e go/no-go. Categorias não exact-symbol continuam `not-evaluated`; híbrido via Ollama loopback permanece futuro e condicionado ao gate local. Código, paths e queries profissionais não entram em relatórios nem providers externos.
+O primeiro ciclo em três repositórios profissionais autorizados passou os gates da Task 14 e concluiu inventário/baseline lexical aggregate-only sob `scanner-v5`, sem rede. Depois do tracer bullet JavaScript/JSX sintético, reindexação e gates renovados, a repetição `scanner-v6` incluiu 378 arquivos JavaScript, excluiu seis candidatos por segredo/tamanho, acrescentou seis símbolos `function` e deixou outros 372 arquivos sem símbolo. Exact-symbol permaneceu igual na precisão publicada; o agregado não identifica linguagem por query e não sustenta citação JavaScript ou ganho de qualidade. Categorias não exact-symbol continuam `not-evaluated`.
+
+O seam privado de gold set humano foi entregue, mas nenhum conjunto profissional foi criado ou executado. O CLI profissional aggregate-only atual permanece lexical/offline e não compõe a busca híbrida nem Ollama. A comparação híbrida profissional não foi entregue nem executada; depende de gold set humano e de um gate verificado de Ollama em loopback sem telemetry, request logging ou retenção de payload. O caminho Ollama opt-in do produto existe separadamente. Código, paths e queries profissionais não entram em relatórios nem providers externos.
