@@ -427,6 +427,40 @@ func TestPrivateEvalFileDoesNotBlockOnFIFOReplacementBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestPrivateEvalFilePolicyValidatesRawOrdinaryAndSpecialModeBits(t *testing.T) {
+	tests := []struct {
+		name   string
+		mode   uint32
+		policy evalPrivateFilePolicy
+		valid  bool
+	}{
+		{name: "checklist owner read-only", mode: 0o400, valid: true},
+		{name: "checklist owner read-write", mode: 0o600, valid: true},
+		{name: "checklist group-readable", mode: 0o640, valid: false},
+		{name: "gold owner read-write", mode: 0o600, policy: evalGoldFilePolicy, valid: true},
+		{name: "gold owner read-only", mode: 0o400, policy: evalGoldFilePolicy, valid: false},
+		{name: "gold sticky", mode: 0o1600, policy: evalGoldFilePolicy, valid: false},
+		{name: "gold setgid", mode: 0o2600, policy: evalGoldFilePolicy, valid: false},
+		{name: "gold setuid", mode: 0o4600, policy: evalGoldFilePolicy, valid: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := secureEvalOutputDirectory(t)
+			target := filepath.Join(directory, "private.json")
+			if err := os.WriteFile(target, []byte(`{"schema":1}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Chmod(target, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			_, err := readPrivateEvalFileWithOperations(target, 1024, evalFileOperations{policy: test.policy})
+			if got := err == nil; got != test.valid {
+				t.Fatalf("read private file with raw mode %#o error = %v; valid = %v, want %v", test.mode, err, got, test.valid)
+			}
+		})
+	}
+}
+
 func TestEvalOutputRejectsWritableAncestorBeforeCreatingTarget(t *testing.T) {
 	base := secureEvalOutputDirectory(t)
 	unsafeAncestor := filepath.Join(base, "unsafe")

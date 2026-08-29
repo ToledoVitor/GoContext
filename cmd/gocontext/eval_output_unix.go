@@ -426,9 +426,16 @@ func validatePrivateEvalDescriptor(file *os.File, expected *evalPrivateFileIdent
 
 func validPrivateEvalStat(stat *unix.Stat_t, maxBytes int64, policy evalPrivateFilePolicy) bool {
 	return stat != nil && maxBytes > 0 && uint32(stat.Mode)&unix.S_IFMT == unix.S_IFREG &&
-		policy.validMode(os.FileMode(uint32(stat.Mode)&0o7777)) && stat.Uid == uint32(os.Geteuid()) &&
+		policy.validRawMode(uint32(stat.Mode)&0o7777) && stat.Uid == uint32(os.Geteuid()) &&
 		uint64(stat.Nlink) >= 1 && (!policy.requireSingleLink || uint64(stat.Nlink) == 1) &&
 		stat.Size >= 0 && stat.Size <= maxBytes
+}
+
+func (policy evalPrivateFilePolicy) validRawMode(mode uint32) bool {
+	if policy.exactMode != 0 {
+		return mode == uint32(policy.exactMode)&0o7777
+	}
+	return policy.validMode(os.FileMode(mode))
 }
 
 func (policy evalPrivateFilePolicy) validMode(mode os.FileMode) bool {
