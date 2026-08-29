@@ -1,6 +1,6 @@
 # Baseline local sanitizado dos repositórios profissionais
 
-**Data:** 2026-08-28  
+**Data:** 2026-08-28
 **Policies:** baseline histórico `scanner-v5`; comparação `scanner-v6`
 **Escopo:** três raízes profissionais autorizadas, identificadas apenas como
 `repo-2f`, `repo-7c` e `repo-b4`. IDs e ordem das linhas foram atribuídos
