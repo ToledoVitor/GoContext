@@ -93,7 +93,8 @@ no mesmo host quando performance virar gate.
 
 Estas categorias continuam `not-evaluated` em todos os repositórios: conceito,
 configuração/path, fluxo cross-layer, mensagem de erro, framework e evidência
-negativa. Não existe gold set humano privado ainda. Logo:
+negativa. O harness já aceita gold set humano privado local, mas esse conteúdo
+ainda não existe e nenhum run humano ocorreu. Logo:
 
 - não há conclusão sobre ganho semântico ou qualidade híbrida;
 - não há inferência de framework baseada em nome/path ou conteúdo excluído;
@@ -198,7 +199,9 @@ de qualquer diferença de latência.
    ou utilidade; exigir allowlist de basename/schema, redaction e novo gate.
 5. **P4 — assets/binários:** permanecem não indexáveis.
 
-Sem gold set humano, não há base para habilitar semântica profissional, escolher
-ANN, promover híbrido ou afirmar superioridade sobre lexical. Próximo run real
-deve usar harness de gold set privado; até lá, baseline lexical e fallback
-continuam referência segura.
+Sem resultados de gold set humano, não há base para habilitar semântica
+profissional, escolher ANN, promover híbrido ou afirmar superioridade sobre
+lexical. O seam local owner-only está disponível e novos relatórios usam schema
+2; os resultados schema 1 acima permanecem históricos, sem migração ou
+conversão de dados privados. Próximo run real deve usar o harness de gold set
+privado; até lá, baseline lexical e fallback continuam referência segura.

@@ -147,7 +147,7 @@ Formato versionado sugerido, sem registros por query:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "repository": "opaque-id",
   "decision": "go",
   "inventory": {
@@ -167,6 +167,14 @@ Formato versionado sugerido, sem registros por query:
 ```
 
 Antes de versionar qualquer resultado, executar scanner de segredos no arquivo e revisão manual para confirmar ausência de paths, conteúdo e identificadores internos.
+
+O comando atual emite schema 2. Resultados schema 1 anteriores são históricos e
+não são migrados no lugar. Um input humano opcional usa schema privado 1, fica
+somente em workspace local owner-only e entra por `--gold-set ABS_PATH` depois
+dos gates de output/root/checklist. O harness resolve cada julgamento para um
+único chunk canônico já permitido; o relatório continua sem query, caso, path,
+referência, julgamento, hit, rank ou chunk ID. Nenhum conjunto humano foi
+autorizado, criado ou executado durante a implementação desse seam.
 
 ## Critérios de conclusão
 

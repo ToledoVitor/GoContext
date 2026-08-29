@@ -8,7 +8,7 @@ import (
 	"github.com/ToledoVitor/GoContext/internal/source"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type Decision string
 
@@ -21,6 +21,7 @@ type Blocker string
 
 const (
 	BlockerChecklist Blocker = "checklist"
+	BlockerGoldSet   Blocker = "gold_set"
 	BlockerRoot      Blocker = "root"
 	BlockerLocation  Blocker = "location"
 	BlockerBudget    Blocker = "budget"
@@ -92,7 +93,7 @@ type Limitation string
 const (
 	LimitationHeapApproximate  Limitation = "heap_peak_approximate"
 	LimitationProcessLatency   Limitation = "process_local_latency"
-	LimitationSyntheticSymbols Limitation = "synthetic_exact_symbol_only"
+	LimitationAutomaticSymbols Limitation = "automatic_exact_symbol_only"
 	LimitationFrameworkUnknown Limitation = "frameworks_not_inferred"
 )
 
@@ -119,12 +120,13 @@ type InventoryReport struct {
 }
 
 type CategoryMetrics struct {
-	Status     EvaluationStatus `json:"status"`
-	QueryCount int              `json:"query_count"`
-	RecallAt5  float64          `json:"recall_at_5"`
-	RecallAt10 float64          `json:"recall_at_10"`
-	MRRAt10    float64          `json:"mrr_at_10"`
-	NDCGAt10   float64          `json:"ndcg_at_10"`
+	Status             EvaluationStatus `json:"status"`
+	QueryCount         int              `json:"query_count"`
+	RecallAt5          float64          `json:"recall_at_5"`
+	RecallAt10         float64          `json:"recall_at_10"`
+	MRRAt10            float64          `json:"mrr_at_10"`
+	NDCGAt10           float64          `json:"ndcg_at_10"`
+	NoEvidenceAccuracy float64          `json:"no_evidence_accuracy"`
 }
 
 type RetrievalReport struct {
@@ -196,7 +198,7 @@ func EmptyReport(repository string, decision Decision) Report {
 		Limitations: map[Limitation]int{
 			LimitationHeapApproximate:  1,
 			LimitationProcessLatency:   1,
-			LimitationSyntheticSymbols: 1,
+			LimitationAutomaticSymbols: 1,
 			LimitationFrameworkUnknown: 1,
 		},
 	}

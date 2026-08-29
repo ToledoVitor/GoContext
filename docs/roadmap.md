@@ -38,7 +38,7 @@ Scanner `scanner-v6`, relatório, snapshots seguros, tracer bullet JavaScript/JS
 
 **Pronto quando:** consultas exatas e conceituais encontram fixtures sem serviço de índice externo; modo default não abre rede; falha temporária semântica preserva busca lexical e referências canônicas.
 
-Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. Task 13 concluiu prova taint e Task 14 concluiu primeiro inventário/baseline lexical profissional aggregate-only. Promoção ampla ainda aguarda gold set humano local para categorias conceituais, framework, erro, configuração, cross-layer e evidência negativa; elas permanecem `not-evaluated`.
+Esses comportamentos do núcleo estão entregues com `source.Reference` canônico e composition root no CLI. Task 13 concluiu prova taint e Task 14 concluiu primeiro inventário/baseline lexical profissional aggregate-only. O harness aceita agora um gold set humano local opcional, estrito e owner-only, resolve julgamentos apenas contra chunks canônicos permitidos e emite somente agregados schema 2. O conteúdo humano ainda não foi criado nem executado; portanto a promoção ampla continua bloqueada e as categorias conceituais, framework, erro, configuração, cross-layer e evidência negativa dos baselines publicados permanecem `not-evaluated`.
 
 ## M3 — Perguntas fundamentadas
 

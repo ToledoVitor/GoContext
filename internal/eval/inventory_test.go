@@ -1,6 +1,7 @@
 package eval_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -58,7 +59,7 @@ func TestEvaluateBuildsExactAggregateInventoryAndUsesOneTraversal(t *testing.T) 
 	scanner := &countingScanner{inner: filesystem.NewScanner()}
 	report, err := evaluation.Evaluate(context.Background(), "repo-a1", root, evaluation.Dependencies{
 		Scanner: scanner, Parser: lineparser.NewParser(), Chunker: symbolchunker.NewChunker(), SearchFactory: lexicalFactory,
-	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 1 << 20, MaxAutoQueries: 10})
+	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 1 << 20, MaxAutoQueries: 10}, nil)
 	if err != nil {
 		t.Fatalf("Evaluate() error = %v", err)
 	}
@@ -137,7 +138,7 @@ func TestEvaluateEnforcesEligibleBudgetBeforeParseOrSearch(t *testing.T) {
 	report, err := evaluation.Evaluate(context.Background(), "repo-a1", "ignored", evaluation.Dependencies{
 		Scanner: scanner, Parser: parser, Chunker: chunker,
 		SearchFactory: func(string, []source.Chunk) (search.Searcher, error) { factoryCalls++; return nil, nil },
-	}, evaluation.Budgets{MaxEligibleFiles: 1, MaxEligibleBytes: 10, MaxAutoQueries: 1})
+	}, evaluation.Budgets{MaxEligibleFiles: 1, MaxEligibleBytes: 10, MaxAutoQueries: 1}, nil)
 	if err == nil || report.Decision != evaluation.DecisionNoGo || report.Blockers[evaluation.BlockerBudget] != 1 {
 		t.Fatalf("report = %#v; error = %v", report, err)
 	}
@@ -203,7 +204,7 @@ func TestEvaluateHardDeniedCanariesReachNoParserChunkerSearchOrReport(t *testing
 			inner, factoryErr := lexicalFactory(repository, chunks)
 			return taintAuditingSearcher{t: t, forbidden: forbidden, inner: inner}, factoryErr
 		},
-	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 1 << 20, MaxAutoQueries: 10})
+	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 1 << 20, MaxAutoQueries: 10}, nil)
 	if err != nil {
 		t.Fatalf("Evaluate() error = %v", err)
 	}
@@ -284,7 +285,7 @@ func TestEvaluateMapsPipelineFailuresToFixedCategoryWithoutPartialInventory(t *t
 		t.Run(test.name, func(t *testing.T) {
 			report, err := evaluation.Evaluate(context.Background(), "repo-a1", "ignored", evaluation.Dependencies{
 				Scanner: &fixedScanner{result: scanResult}, Parser: test.parser, Chunker: test.chunker, SearchFactory: test.factory,
-			}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 10, MaxAutoQueries: 10})
+			}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 10, MaxAutoQueries: 10}, nil)
 			if err == nil || strings.Contains(err.Error(), "CANARY") || report.Decision != evaluation.DecisionNoGo ||
 				report.Blockers[evaluation.BlockerIntegrity] != 1 || report.Inventory.IncludedFiles != 0 || report.Inventory.Chunks != 0 {
 				t.Fatalf("report/error = %#v/%v", report, err)
@@ -301,7 +302,7 @@ func TestEvaluateDeadlineCancelsScannerWithFixedNoGoCategory(t *testing.T) {
 		Parser:        parserFunc(func(context.Context, source.File) ([]source.Symbol, error) { return nil, nil }),
 		Chunker:       chunkerFunc(func(context.Context, source.File, []source.Symbol) ([]source.Chunk, error) { return nil, nil }),
 		SearchFactory: lexicalFactory,
-	}, evaluation.Budgets{MaxEligibleFiles: 1, MaxEligibleBytes: 1, MaxAutoQueries: 1})
+	}, evaluation.Budgets{MaxEligibleFiles: 1, MaxEligibleBytes: 1, MaxAutoQueries: 1}, nil)
 	if err == nil || report.Blockers[evaluation.BlockerCanceled] != 1 {
 		t.Fatalf("report/error = %#v/%v", report, err)
 	}
@@ -355,7 +356,7 @@ func TestEvaluateStopsAfterSuccessfulDependencyCancelsContext(t *testing.T) {
 						return []search.Hit{{Chunk: chunks[0]}}, nil
 					}), nil
 				},
-			}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10})
+			}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10}, nil)
 			if err != context.Canceled || report.Blockers[evaluation.BlockerCanceled] != 1 {
 				t.Fatalf("report/error = %#v/%v", report, err)
 			}
@@ -394,7 +395,7 @@ func TestEvaluateRejectsChunkerThatOmitsParsedSymbol(t *testing.T) {
 			}}, nil
 		}),
 		SearchFactory: lexicalFactory,
-	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10})
+	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10}, nil)
 	if err == nil || report.Blockers[evaluation.BlockerIntegrity] != 1 {
 		t.Fatalf("report/error = %#v/%v", report, err)
 	}
@@ -413,13 +414,109 @@ func TestEvaluateCapsPrivateExactSymbolCasesAtChecklistBudget(t *testing.T) {
 				return inner.Search(ctx, query)
 			}), factoryErr
 		},
-	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 1 << 20, MaxAutoQueries: 1})
+	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 1 << 20, MaxAutoQueries: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	metrics := report.Retrieval.Categories[evaluation.CategoryExactSymbol]
 	if metrics.QueryCount != 1 || searchCalls != 2 {
 		t.Fatalf("query count/search calls = %d/%d", metrics.QueryCount, searchCalls)
+	}
+}
+
+func TestEvaluateResolvesHumanGoldReferenceIntoCanonicalChunk(t *testing.T) {
+	file := source.File{Reference: source.Reference{Path: "permitted/relative.py", StartLine: 1, EndLine: 10}, Language: source.LanguagePython, Content: []byte("content")}
+	chunk := source.Chunk{ID: "opaque-chunk", Text: "content", Language: source.LanguagePython, Reference: file.Reference}
+	payload := bytes.ReplaceAll(validGoldSetPayload(), []byte("repo-ab"), []byte("repo-a1"))
+	payload = bytes.ReplaceAll(payload, []byte("permitted/relative.go"), []byte("permitted/relative.py"))
+	goldSet, err := evaluation.ParseGoldSet(context.Background(), payload, "repo-a1", ingest.ScanPolicyVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	searcher := &sequenceSearcher{results: [][]search.Hit{{{Chunk: chunk}}, {{Chunk: chunk}}}}
+	report, err := evaluation.Evaluate(context.Background(), "repo-a1", "ignored", evaluation.Dependencies{
+		Scanner: &fixedScanner{result: validFixedScanResult([]source.File{file})},
+		Parser:  parserFunc(func(context.Context, source.File) ([]source.Symbol, error) { return nil, nil }),
+		Chunker: chunkerFunc(func(context.Context, source.File, []source.Symbol) ([]source.Chunk, error) {
+			return []source.Chunk{chunk}, nil
+		}),
+		SearchFactory: func(string, []source.Chunk) (search.Searcher, error) { return searcher, nil },
+	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10}, goldSet)
+	if err != nil {
+		t.Fatalf("Evaluate() report/error = %#v/%v", report, err)
+	}
+	metrics := report.Retrieval.Categories[evaluation.CategoryConcept]
+	if metrics.Status != evaluation.StatusEvaluated || metrics.QueryCount != 1 || metrics.RecallAt5 != 1 ||
+		report.CapabilityGaps[evaluation.CategoryConcept] != evaluation.StatusEvaluated ||
+		report.Retrieval.Categories[evaluation.CategoryExactSymbol].Status != evaluation.StatusNotEvaluated ||
+		report.Limitations[evaluation.LimitationAutomaticSymbols] != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestEvaluateRejectsMissingOrAmbiguousGoldReferenceBeforeSearchFactory(t *testing.T) {
+	file := source.File{Reference: source.Reference{Path: "permitted/relative.py", StartLine: 1, EndLine: 10}, Language: source.LanguagePython, Content: []byte("content")}
+	goldPayload := bytes.ReplaceAll(validGoldSetPayload(), []byte("repo-ab"), []byte("repo-a1"))
+	goldPayload = bytes.ReplaceAll(goldPayload, []byte("permitted/relative.go"), []byte("permitted/relative.py"))
+	goldSet, err := evaluation.ParseGoldSet(context.Background(), goldPayload, "repo-a1", ingest.ScanPolicyVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		chunks []source.Chunk
+	}{
+		{name: "missing", chunks: []source.Chunk{{ID: "missing", Text: "content", Language: source.LanguagePython, Reference: source.Reference{Path: file.Reference.Path, StartLine: 1, EndLine: 5}}}},
+		{name: "ambiguous", chunks: []source.Chunk{
+			{ID: "one", SymbolName: "One", Text: "one", Language: source.LanguagePython, Reference: file.Reference},
+			{ID: "two", SymbolName: "Two", Text: "two", Language: source.LanguagePython, Reference: file.Reference},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			factoryCalls := 0
+			parser := parserFunc(func(context.Context, source.File) ([]source.Symbol, error) { return nil, nil })
+			if test.name == "ambiguous" {
+				parser = parserFunc(func(context.Context, source.File) ([]source.Symbol, error) {
+					return []source.Symbol{
+						{Name: "One", Kind: "function", Reference: source.Reference{Path: file.Reference.Path, StartLine: 1, EndLine: 1}},
+						{Name: "Two", Kind: "function", Reference: source.Reference{Path: file.Reference.Path, StartLine: 2, EndLine: 2}},
+					}, nil
+				})
+			}
+			report, evalErr := evaluation.Evaluate(context.Background(), "repo-a1", "ignored", evaluation.Dependencies{
+				Scanner: &fixedScanner{result: validFixedScanResult([]source.File{file})}, Parser: parser,
+				Chunker:       chunkerFunc(func(context.Context, source.File, []source.Symbol) ([]source.Chunk, error) { return test.chunks, nil }),
+				SearchFactory: func(string, []source.Chunk) (search.Searcher, error) { factoryCalls++; return nil, nil },
+			}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 10}, goldSet)
+			if evalErr == nil || report.Blockers[evaluation.BlockerIntegrity] != 1 || factoryCalls != 0 {
+				t.Fatalf("report/error/factory = %#v/%v/%d", report, evalErr, factoryCalls)
+			}
+		})
+	}
+}
+
+func TestEvaluateRejectsGoldCasesOverChecklistQueryBudgetBeforeSearch(t *testing.T) {
+	file := source.File{Reference: source.Reference{Path: "safe.py", StartLine: 1, EndLine: 1}, Language: source.LanguagePython, Content: []byte("content")}
+	chunk := source.Chunk{ID: "opaque", Text: "content", Language: source.LanguagePython, Reference: file.Reference}
+	payload := []byte(`{"schema":1,"repository":"repo-a1","scan_policy_version":"scanner-v6","cases":[` +
+		`{"id":"case-a1","category":"concept","query":"first","expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":1}]},` +
+		`{"id":"case-a2","category":"framework","query":"second","expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":1}]}]}`)
+	goldSet, err := evaluation.ParseGoldSet(context.Background(), payload, "repo-a1", ingest.ScanPolicyVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	factoryCalls := 0
+	report, evalErr := evaluation.Evaluate(context.Background(), "repo-a1", "ignored", evaluation.Dependencies{
+		Scanner: &fixedScanner{result: validFixedScanResult([]source.File{file})},
+		Parser:  parserFunc(func(context.Context, source.File) ([]source.Symbol, error) { return nil, nil }),
+		Chunker: chunkerFunc(func(context.Context, source.File, []source.Symbol) ([]source.Chunk, error) {
+			return []source.Chunk{chunk}, nil
+		}),
+		SearchFactory: func(string, []source.Chunk) (search.Searcher, error) { factoryCalls++; return nil, nil },
+	}, evaluation.Budgets{MaxEligibleFiles: 10, MaxEligibleBytes: 100, MaxAutoQueries: 1}, goldSet)
+	if evalErr == nil || report.Blockers[evaluation.BlockerBudget] != 1 || factoryCalls != 0 {
+		t.Fatalf("report/error/factory = %#v/%v/%d", report, evalErr, factoryCalls)
 	}
 }
 

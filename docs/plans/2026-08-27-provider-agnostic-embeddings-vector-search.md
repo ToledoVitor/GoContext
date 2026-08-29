@@ -1137,6 +1137,15 @@ sintéticos, não do run profissional. Gold set humano privado e adapter
 estrutural JavaScript continuam próximos gates antes de alegar qualidade ou
 executar semântica profissional.
 
+Checkpoint Task 14E: o mesmo `internal/eval.Evaluate` aceita opcionalmente um
+`GoldSet` opaco, parseado de schema privado 1 estrito. O CLI abre
+`--gold-set ABS_PATH` somente depois dos gates de output/root/checklist, exige
+arquivo local `0600` de link único em diretório/ancestralidade confiáveis e
+falha fechado com categoria fixa. Referências são resolvidas somente contra o
+corpus canônico já permitido antes de construir busca. O output aggregate-only
+agora é schema 2; schema 1 permanece histórico e não recebe migração. Nenhum
+gold set humano profissional foi criado ou executado neste checkpoint.
+
 - [ ] **Step 7: Verificar e commit**
 
 Run: `go test -race ./internal/eval ./cmd/gocontext && go test ./... && go vet ./... && git diff --check`

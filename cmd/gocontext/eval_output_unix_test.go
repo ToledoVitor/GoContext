@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ToledoVitor/GoContext/internal/ingest/filesystem"
+	"golang.org/x/sys/unix"
 )
 
 func TestEvalOutputFailureBeforePublicationLeavesNoTargetOrPartialFile(t *testing.T) {
@@ -336,6 +338,92 @@ func TestPrivateEvalFileRejectsParentPathRetargetAfterDirectoryOpen(t *testing.T
 	})
 	if !errors.Is(err, errEvalChecklist) {
 		t.Fatalf("read error = %v", err)
+	}
+}
+
+func TestPrivateEvalFileRejectsMutationAroundDescriptorRead(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(string) error
+		stage  string
+	}{
+		{name: "deletion", stage: "open", mutate: func(target string) error { return os.Remove(target) }},
+		{name: "retarget", stage: "open", mutate: func(target string) error {
+			if err := os.Rename(target, target+"-retained"); err != nil {
+				return err
+			}
+			return os.WriteFile(target, []byte(`{"replacement":true}`), 0o600)
+		}},
+		{name: "mode", stage: "open", mutate: func(target string) error { return os.Chmod(target, 0o640) }},
+		{name: "size", stage: "read", mutate: func(target string) error {
+			file, err := os.OpenFile(target, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				return err
+			}
+			_, writeErr := file.WriteString("x")
+			closeErr := file.Close()
+			if writeErr != nil {
+				return writeErr
+			}
+			return closeErr
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := secureEvalOutputDirectory(t)
+			target := filepath.Join(directory, "gold.json")
+			if err := os.WriteFile(target, []byte(`{"schema":1}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			operations := evalFileOperations{}
+			if test.stage == "open" {
+				operations.afterOpenFile = func() error { return test.mutate(target) }
+			} else {
+				operations.afterRead = func() error { return test.mutate(target) }
+			}
+			if _, err := readPrivateEvalFileWithOperations(target, 1024, operations); !errors.Is(err, errEvalChecklist) {
+				t.Fatalf("read error = %v", err)
+			}
+		})
+	}
+}
+
+func TestPrivateEvalFileDoesNotBlockOnFIFOReplacementBeforeOpen(t *testing.T) {
+	directory := secureEvalOutputDirectory(t)
+	target := filepath.Join(directory, "gold.json")
+	if err := os.WriteFile(target, []byte(`{"schema":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replaced := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := readPrivateEvalFileWithOperations(target, 1024, evalFileOperations{
+			beforeOpenFile: func() error {
+				if err := os.Remove(target); err != nil {
+					return err
+				}
+				if err := unix.Mkfifo(target, 0o600); err != nil {
+					return err
+				}
+				close(replaced)
+				return nil
+			},
+		})
+		result <- err
+	}()
+	<-replaced
+	select {
+	case err := <-result:
+		if !errors.Is(err, errEvalChecklist) {
+			t.Fatalf("read error = %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		descriptor, openErr := unix.Open(target, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if openErr == nil {
+			_ = unix.Close(descriptor)
+		}
+		err := <-result
+		t.Fatalf("private file open blocked on FIFO replacement; rescue/error = %v/%v", openErr, err)
 	}
 }
 

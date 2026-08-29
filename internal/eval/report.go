@@ -46,7 +46,7 @@ func validReport(report Report) bool {
 		report.Performance.ScanMilliseconds < 0 || report.Performance.IndexMilliseconds < 0 ||
 		report.Performance.QueryP50Micros < 0 || report.Performance.QueryP95Micros < 0 ||
 		report.Performance.QueryP50Micros > report.Performance.QueryP95Micros ||
-		!validCapabilityGaps(report.CapabilityGaps) || !validLimitations(report.Limitations) {
+		!validCapabilityGaps(report.CapabilityGaps, report.Retrieval.Categories) || !validLimitations(report.Limitations) {
 		return false
 	}
 	blockerCount := 0
@@ -58,7 +58,7 @@ func validReport(report Report) bool {
 
 func validBlockers(values map[Blocker]int) bool {
 	allowed := map[Blocker]struct{}{
-		BlockerChecklist: {}, BlockerRoot: {}, BlockerLocation: {}, BlockerBudget: {},
+		BlockerChecklist: {}, BlockerGoldSet: {}, BlockerRoot: {}, BlockerLocation: {}, BlockerBudget: {},
 		BlockerScan: {}, BlockerIntegrity: {}, BlockerRetrieval: {}, BlockerCanceled: {},
 	}
 	return validCountMap(values, allowed)
@@ -125,7 +125,7 @@ func validRetrieval(value RetrievalReport) bool {
 	}
 	evaluatedCategories := 0
 	for category, metrics := range value.Categories {
-		if _, ok := allowed[category]; !ok || !validCategoryMetrics(metrics) {
+		if _, ok := allowed[category]; !ok || !validCategoryMetrics(category, metrics) {
 			return false
 		}
 		if metrics.Status == StatusEvaluated {
@@ -142,18 +142,26 @@ func validRetrieval(value RetrievalReport) bool {
 	return evaluatedCategories > 0 && value.FallbackReason == FallbackLexicalBaseline
 }
 
-func validCategoryMetrics(value CategoryMetrics) bool {
+func validCategoryMetrics(category QueryCategory, value CategoryMetrics) bool {
 	if (value.Status != StatusEvaluated && value.Status != StatusNotEvaluated) || value.QueryCount < 0 ||
-		!validRatio(value.RecallAt5) || !validRatio(value.RecallAt10) || !validRatio(value.MRRAt10) || !validRatio(value.NDCGAt10) {
+		!validRatio(value.RecallAt5) || !validRatio(value.RecallAt10) || !validRatio(value.MRRAt10) ||
+		!validRatio(value.NDCGAt10) || !validRatio(value.NoEvidenceAccuracy) {
 		return false
 	}
 	if value.Status == StatusNotEvaluated {
-		return value.QueryCount == 0 && value.RecallAt5 == 0 && value.RecallAt10 == 0 && value.MRRAt10 == 0 && value.NDCGAt10 == 0
+		return value.QueryCount == 0 && value.RecallAt5 == 0 && value.RecallAt10 == 0 && value.MRRAt10 == 0 &&
+			value.NDCGAt10 == 0 && value.NoEvidenceAccuracy == 0
 	}
-	return value.QueryCount > 0
+	if value.QueryCount == 0 {
+		return false
+	}
+	if category == CategoryNegativeEvidence {
+		return value.RecallAt5 == 0 && value.RecallAt10 == 0 && value.MRRAt10 == 0 && value.NDCGAt10 == 0
+	}
+	return value.NoEvidenceAccuracy == 0
 }
 
-func validCapabilityGaps(values map[QueryCategory]EvaluationStatus) bool {
+func validCapabilityGaps(values map[QueryCategory]EvaluationStatus, metrics map[QueryCategory]CategoryMetrics) bool {
 	allowed := map[QueryCategory]struct{}{
 		CategoryConcept: {}, CategoryCrossLayer: {}, CategoryFramework: {}, CategoryErrorMessage: {},
 		CategoryConfigurationPath: {}, CategoryNegativeEvidence: {},
@@ -162,7 +170,8 @@ func validCapabilityGaps(values map[QueryCategory]EvaluationStatus) bool {
 		return false
 	}
 	for category, status := range values {
-		if _, ok := allowed[category]; !ok || status != StatusNotEvaluated {
+		if _, ok := allowed[category]; !ok || status != StatusNotEvaluated && status != StatusEvaluated ||
+			metrics[category].Status != status {
 			return false
 		}
 	}
@@ -171,7 +180,7 @@ func validCapabilityGaps(values map[QueryCategory]EvaluationStatus) bool {
 
 func validLimitations(values map[Limitation]int) bool {
 	allowed := map[Limitation]struct{}{
-		LimitationHeapApproximate: {}, LimitationProcessLatency: {}, LimitationSyntheticSymbols: {}, LimitationFrameworkUnknown: {},
+		LimitationHeapApproximate: {}, LimitationProcessLatency: {}, LimitationAutomaticSymbols: {}, LimitationFrameworkUnknown: {},
 	}
 	return validCountMap(values, allowed)
 }

@@ -103,6 +103,30 @@ func TestMarshalValidatedRejectsNonOpaqueRepositoryAndUnknownMapCategories(t *te
 			metrics.NDCGAt10 = 1.01
 			report.Retrieval.Categories[evaluation.CategoryExactSymbol] = metrics
 		}},
+		{name: "historical schema one", mutate: func(report *evaluation.Report) { report.Schema = 1 }},
+		{name: "positive category with negative metric", mutate: func(report *evaluation.Report) {
+			metrics := report.Retrieval.Categories[evaluation.CategoryConcept]
+			metrics.Status = evaluation.StatusEvaluated
+			metrics.QueryCount = 1
+			metrics.NoEvidenceAccuracy = 1
+			report.Retrieval.Categories[evaluation.CategoryConcept] = metrics
+			report.Retrieval.Status = evaluation.StatusEvaluated
+			report.Retrieval.FallbackReason = evaluation.FallbackLexicalBaseline
+			report.CapabilityGaps[evaluation.CategoryConcept] = evaluation.StatusEvaluated
+		}},
+		{name: "negative category with positive metric", mutate: func(report *evaluation.Report) {
+			metrics := report.Retrieval.Categories[evaluation.CategoryNegativeEvidence]
+			metrics.Status = evaluation.StatusEvaluated
+			metrics.QueryCount = 1
+			metrics.RecallAt5 = 1
+			report.Retrieval.Categories[evaluation.CategoryNegativeEvidence] = metrics
+			report.Retrieval.Status = evaluation.StatusEvaluated
+			report.Retrieval.FallbackReason = evaluation.FallbackLexicalBaseline
+			report.CapabilityGaps[evaluation.CategoryNegativeEvidence] = evaluation.StatusEvaluated
+		}},
+		{name: "capability gap differs from metrics", mutate: func(report *evaluation.Report) {
+			report.CapabilityGaps[evaluation.CategoryConcept] = evaluation.StatusEvaluated
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -112,5 +136,36 @@ func TestMarshalValidatedRejectsNonOpaqueRepositoryAndUnknownMapCategories(t *te
 				t.Fatal("MarshalValidated() error = nil, want sanitized validation failure")
 			}
 		})
+	}
+}
+
+func TestMarshalValidatedAcceptsSchemaTwoHumanAggregateAndCasesSerializeNoPrivateFacts(t *testing.T) {
+	report := evaluation.EmptyReport("repo-a1", evaluation.DecisionGo)
+	metrics := report.Retrieval.Categories[evaluation.CategoryNegativeEvidence]
+	metrics.Status = evaluation.StatusEvaluated
+	metrics.QueryCount = 2
+	metrics.NoEvidenceAccuracy = 0.5
+	report.Retrieval.Categories[evaluation.CategoryNegativeEvidence] = metrics
+	report.Retrieval.Status = evaluation.StatusEvaluated
+	report.Retrieval.CitationValidity = 1
+	report.Retrieval.DeterministicOrderRate = 1
+	report.Retrieval.FallbackReason = evaluation.FallbackLexicalBaseline
+	report.CapabilityGaps[evaluation.CategoryNegativeEvidence] = evaluation.StatusEvaluated
+	delete(report.Limitations, evaluation.LimitationAutomaticSymbols)
+
+	payload, err := evaluation.MarshalValidated(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(payload, []byte(`"schema":2`)) || !bytes.Contains(payload, []byte(`"no_evidence_accuracy":0.5`)) {
+		t.Fatalf("payload = %s", payload)
+	}
+	privateCase := evaluation.Case{
+		Category: evaluation.CategoryConcept, Query: "private-query-CANARY",
+		RelevanceByChunkID: map[string]int{"private-chunk-CANARY": 3},
+	}
+	casePayload, err := json.Marshal(privateCase)
+	if err != nil || string(casePayload) != `{}` {
+		t.Fatalf("case JSON/error = %s/%v", casePayload, err)
 	}
 }

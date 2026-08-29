@@ -217,6 +217,40 @@ func TestEvaluateMetricsUsesCompleteDeterministicRankOrderForScoreTies(t *testin
 	}
 }
 
+func TestEvaluateMetricsComputesGradedNDCGFromPrivateRelevance(t *testing.T) {
+	canonical := []source.Chunk{metricChunk("high", "high.py", 1), metricChunk("low", "low.py", 1)}
+	hits := []search.Hit{{Chunk: canonical[1]}, {Chunk: canonical[0]}}
+	result, err := evaluation.EvaluateMetrics(context.Background(), &sequenceSearcher{results: [][]search.Hit{hits, hits}}, "repo-a1", canonical, []evaluation.Case{{
+		Category: evaluation.CategoryConcept, Query: "opaque", RelevanceByChunkID: map[string]int{"high": 3, "low": 1},
+	}}, evaluation.MetricOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := result.Report.Categories[evaluation.CategoryConcept]
+	wantNDCG := (1 + 7/math.Log2(3)) / (7 + 1/math.Log2(3))
+	if metrics.QueryCount != 1 || metrics.RecallAt5 != 1 || metrics.RecallAt10 != 1 || metrics.MRRAt10 != 1 ||
+		math.Abs(metrics.NDCGAt10-wantNDCG) > 1e-12 || metrics.NoEvidenceAccuracy != 0 {
+		t.Fatalf("metrics = %#v, want nDCG %.15f", metrics, wantNDCG)
+	}
+}
+
+func TestEvaluateMetricsPublishesOnlyNegativeNoEvidenceAccuracy(t *testing.T) {
+	canonical := []source.Chunk{metricChunk("a", "one.py", 1)}
+	searcher := &sequenceSearcher{results: [][]search.Hit{nil, nil, {{Chunk: canonical[0]}}, nil}}
+	result, err := evaluation.EvaluateMetrics(context.Background(), searcher, "repo-a1", canonical, []evaluation.Case{
+		{Category: evaluation.CategoryNegativeEvidence, Query: "absent", NoEvidence: true},
+		{Category: evaluation.CategoryNegativeEvidence, Query: "present", NoEvidence: true},
+	}, evaluation.MetricOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := result.Report.Categories[evaluation.CategoryNegativeEvidence]
+	if metrics.Status != evaluation.StatusEvaluated || metrics.QueryCount != 2 || metrics.NoEvidenceAccuracy != 0.5 ||
+		metrics.RecallAt5 != 0 || metrics.RecallAt10 != 0 || metrics.MRRAt10 != 0 || metrics.NDCGAt10 != 0 {
+		t.Fatalf("negative metrics = %#v", metrics)
+	}
+}
+
 func metricChunk(id, path string, line int) source.Chunk {
 	return source.Chunk{ID: id, Text: "content", Language: source.LanguagePython, SymbolName: "symbol", Reference: source.Reference{Path: path, StartLine: line, EndLine: line}}
 }

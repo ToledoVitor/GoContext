@@ -35,14 +35,16 @@ type Budgets struct {
 
 // Evaluate is the module's small external interface. It owns the single scan,
 // parsing, chunking, corpus integrity validation, deterministic case generation,
-// and aggregate metrics. Concrete adapters are supplied by the CLI composition
-// root.
+// and aggregate metrics. A nil gold set preserves automatic exact-symbol cases;
+// a non-nil gold set replaces them with resolved human cases. Concrete adapters
+// are supplied by the CLI composition root.
 func Evaluate(
 	ctx context.Context,
 	repositoryID string,
 	root string,
 	dependencies Dependencies,
 	budgets Budgets,
+	goldSet *GoldSet,
 ) (Report, error) {
 	if err := ctx.Err(); err != nil {
 		return failedReport(repositoryID, BlockerCanceled), err
@@ -145,6 +147,22 @@ func Evaluate(
 	sampleHeap()
 
 	cases := exactSymbolCases(corpus.Chunks, budgets.MaxAutoQueries)
+	if goldSet != nil {
+		if goldSet.repository != repositoryID || goldSet.scanPolicy != corpus.PolicyVersion || len(goldSet.cases) == 0 {
+			return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
+		}
+		if len(goldSet.cases) > budgets.MaxAutoQueries {
+			return failedReport(repositoryID, BlockerBudget), ErrEvaluation
+		}
+		cases, err = resolveGoldCases(ctx, goldSet, corpus.Chunks)
+		if err != nil {
+			if ctx.Err() != nil {
+				return failedReport(repositoryID, BlockerCanceled), ctx.Err()
+			}
+			return failedReport(repositoryID, BlockerIntegrity), ErrEvaluation
+		}
+		delete(report.Limitations, LimitationAutomaticSymbols)
+	}
 	if len(cases) > 0 {
 		searcher, factoryErr := dependencies.SearchFactory(repositoryID, append([]source.Chunk(nil), corpus.Chunks...))
 		if err := ctx.Err(); err != nil {
@@ -163,6 +181,9 @@ func Evaluate(
 		report.Retrieval = metrics.Report
 		report.Performance.QueryP50Micros = metrics.QueryP50Micros
 		report.Performance.QueryP95Micros = metrics.QueryP95Micros
+		for category := range report.CapabilityGaps {
+			report.CapabilityGaps[category] = report.Retrieval.Categories[category].Status
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return failedReport(repositoryID, BlockerCanceled), err
@@ -176,6 +197,38 @@ func Evaluate(
 		return failedReport(repositoryID, BlockerCanceled), err
 	}
 	return report, nil
+}
+
+func resolveGoldCases(ctx context.Context, goldSet *GoldSet, chunks []source.Chunk) ([]Case, error) {
+	chunksByReference := make(map[source.Reference][]source.Chunk, len(chunks))
+	for _, chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		chunksByReference[chunk.Reference] = append(chunksByReference[chunk.Reference], chunk)
+	}
+	cases := make([]Case, 0, len(goldSet.cases))
+	for _, privateCase := range goldSet.cases {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resolved := Case{Category: privateCase.category, Query: privateCase.query, NoEvidence: privateCase.expectation == goldNoEvidence}
+		if !resolved.NoEvidence {
+			resolved.RelevanceByChunkID = make(map[string]int, len(privateCase.judgments))
+		}
+		for _, judgment := range privateCase.judgments {
+			matches := chunksByReference[judgment.reference]
+			if len(matches) != 1 {
+				return nil, ErrEvaluation
+			}
+			if _, duplicate := resolved.RelevanceByChunkID[matches[0].ID]; duplicate {
+				return nil, ErrEvaluation
+			}
+			resolved.RelevanceByChunkID[matches[0].ID] = judgment.relevance
+		}
+		cases = append(cases, resolved)
+	}
+	return cases, nil
 }
 
 func failedReport(repositoryID string, blocker Blocker) Report {

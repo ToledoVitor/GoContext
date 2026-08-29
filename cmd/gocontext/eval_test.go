@@ -73,6 +73,121 @@ func TestRunEvalInventoryWritesSyntheticAggregateOnlyReport(t *testing.T) {
 	}
 }
 
+func TestRunEvalInventoryAcceptsPrivateGoldSetWithoutPublishingPrivateFacts(t *testing.T) {
+	fixture := newEvalCLIFixture(t)
+	writeEvalCLIFile(t, fixture.root, "safe.py", "def Match():\n")
+	goldPath := filepath.Join(filepath.Dir(fixture.checklist), "gold-path-CANARY.json")
+	writeEvalGoldSet(t, goldPath, `gold-query-CANARY`)
+	t.Setenv("OPENAI_API_KEY", "hostile-gold-environment-CANARY")
+	t.Setenv("GOCONTEXT_EMBEDDING_BASE_URL", "https://gold-network-CANARY.invalid")
+
+	var stdout, stderr bytes.Buffer
+	exitCode := run(append(evalCLIArgs(fixture), "--gold-set", goldPath), &stdout, &stderr)
+	if exitCode != 0 || stdout.String() != "evaluation: go\n" || stderr.Len() != 0 {
+		t.Fatalf("exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+	}
+	payload, err := os.ReadFile(fixture.output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report evaluation.Report
+	if err := json.Unmarshal(payload, &report); err != nil {
+		t.Fatal(err)
+	}
+	concept := report.Retrieval.Categories[evaluation.CategoryConcept]
+	if report.Schema != 2 || concept.Status != evaluation.StatusEvaluated || concept.QueryCount != 1 ||
+		report.Retrieval.Categories[evaluation.CategoryExactSymbol].Status != evaluation.StatusNotEvaluated ||
+		report.CapabilityGaps[evaluation.CategoryConcept] != evaluation.StatusEvaluated ||
+		report.Limitations[evaluation.LimitationAutomaticSymbols] != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	forbidden := []string{goldPath, "gold-path-CANARY", "gold-query-CANARY", "safe.py", "Match", "hostile-gold-environment-CANARY", "gold-network-CANARY"}
+	for _, sink := range [][]byte{payload, stdout.Bytes(), stderr.Bytes(), []byte(fmt.Sprintf("%#v", report))} {
+		result := taintcheck.Scan(sink, forbidden)
+		if !result.Complete || result.Found {
+			t.Fatalf("taint result = %#v for %q", result, sink)
+		}
+	}
+}
+
+func TestRunEvalInventoryRejectsUntrustedGoldSetBeforePipeline(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*testing.T, evalCLIFixture) string
+	}{
+		{name: "relative", configure: func(*testing.T, evalCLIFixture) string { return "gold.json" }},
+		{name: "inside root", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			path := filepath.Join(fixture.root, "gold.json")
+			writeEvalGoldSet(t, path, "private-query-CANARY")
+			return path
+		}},
+		{name: "symlink", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			target := filepath.Join(filepath.Dir(fixture.checklist), "gold-target.json")
+			writeEvalGoldSet(t, target, "private-query-CANARY")
+			alias := filepath.Join(filepath.Dir(fixture.checklist), "gold-alias.json")
+			if err := os.Symlink(target, alias); err != nil {
+				t.Fatal(err)
+			}
+			return alias
+		}},
+		{name: "hardlink", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			target := filepath.Join(filepath.Dir(fixture.checklist), "gold-target.json")
+			writeEvalGoldSet(t, target, "private-query-CANARY")
+			alias := filepath.Join(filepath.Dir(fixture.checklist), "gold-hardlink.json")
+			if err := os.Link(target, alias); err != nil {
+				t.Fatal(err)
+			}
+			return alias
+		}},
+		{name: "permissive", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
+			writeEvalGoldSet(t, path, "private-query-CANARY")
+			if err := os.Chmod(path, 0o640); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+		{name: "malformed schema", configure: func(t *testing.T, fixture evalCLIFixture) string {
+			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
+			if err := os.WriteFile(path, []byte(`{"private":"private-query-CANARY"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newEvalCLIFixture(t)
+			goldPath := test.configure(t, fixture)
+			constructed, searched := 0, 0
+			composition := evalCLIComposition{
+				newScanner:    func() ingest.Scanner { constructed++; return nil },
+				newParser:     func() ingest.Parser { constructed++; return nil },
+				newChunker:    func() ingest.Chunker { constructed++; return nil },
+				searchFactory: func(string, []source.Chunk) (search.Searcher, error) { searched++; return nil, nil },
+			}
+			var stdout, stderr bytes.Buffer
+			args := append(evalCLIArgs(fixture)[1:], "--gold-set", goldPath)
+			exitCode := runEvalWithComposition(context.Background(), args, &stdout, &stderr, composition)
+			if exitCode != 1 || stdout.String() != "evaluation: no-go\n" || stderr.String() != "evaluation error: gold_set\n" || constructed != 0 || searched != 0 {
+				t.Fatalf("exit/stdout/stderr/constructed/searched = %d/%q/%q/%d/%d", exitCode, stdout.String(), stderr.String(), constructed, searched)
+			}
+			payload, err := os.ReadFile(fixture.output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report evaluation.Report
+			if err := json.Unmarshal(payload, &report); err != nil || report.Blockers[evaluation.BlockerGoldSet] != 1 {
+				t.Fatalf("report/error = %#v/%v", report, err)
+			}
+			result := taintcheck.Scan(payload, []string{goldPath, "private-query-CANARY"})
+			if !result.Complete || result.Found {
+				t.Fatalf("taint = %#v", result)
+			}
+		})
+	}
+}
+
 func TestRunEvalInventoryWritesNoGoWithoutScanningForInvalidChecklist(t *testing.T) {
 	fixture := newEvalCLIFixture(t)
 	checklist := validEvalChecklist()
@@ -370,6 +485,21 @@ func TestRunEvalInventoryRejectsDuplicateExplicitFlagsWithoutWriting(t *testing.
 	}
 }
 
+func TestRunEvalInventoryRejectsDuplicateGoldSetFlagWithoutWriting(t *testing.T) {
+	fixture := newEvalCLIFixture(t)
+	goldPath := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
+	writeEvalGoldSet(t, goldPath, "private query")
+	args := append(evalCLIArgs(fixture), "--gold-set", goldPath, "--gold-set", goldPath)
+	var stdout, stderr bytes.Buffer
+	exitCode := run(args, &stdout, &stderr)
+	if exitCode != 2 || stdout.Len() != 0 || stderr.String() != "evaluation error: input\n" {
+		t.Fatalf("exit/stdout/stderr = %d/%q/%q", exitCode, stdout.String(), stderr.String())
+	}
+	if _, err := os.Lstat(fixture.output); !os.IsNotExist(err) {
+		t.Fatalf("output exists/error = %v", err)
+	}
+}
+
 func TestRunEvalInventoryScansRetainedApprovedRootAfterPathReplacement(t *testing.T) {
 	fixture := newEvalCLIFixture(t)
 	writeEvalCLIFile(t, fixture.root, "approved.py", "def Approved():\n    return 1\n")
@@ -519,6 +649,17 @@ func writeEvalChecklist(t *testing.T, target string, checklist evaluation.Checkl
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(target, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeEvalGoldSet(t *testing.T, target, query string) {
+	t.Helper()
+	payload := []byte(fmt.Sprintf(`{"schema":1,"repository":"repo-a1","scan_policy_version":%q,"cases":[{"id":"case-a1","category":"concept","query":%q,"expectation":"relevant","judgments":[{"reference":{"path":"safe.py","start_line":1,"end_line":1},"relevance":3}]}]}`, ingest.ScanPolicyVersion, query))
 	if err := os.WriteFile(target, payload, 0o600); err != nil {
 		t.Fatal(err)
 	}

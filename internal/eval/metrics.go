@@ -18,9 +18,11 @@ var ErrMetrics = errors.New("evaluation metrics failed")
 // deliberately excluded from JSON so accidental embedding cannot make them
 // query-level output.
 type Case struct {
-	Category         QueryCategory `json:"-"`
-	Query            string        `json:"-"`
-	RelevantChunkIDs []string      `json:"-"`
+	Category           QueryCategory  `json:"-"`
+	Query              string         `json:"-"`
+	RelevantChunkIDs   []string       `json:"-"`
+	RelevanceByChunkID map[string]int `json:"-"`
+	NoEvidence         bool           `json:"-"`
 }
 
 type MetricOptions struct {
@@ -34,11 +36,12 @@ type MetricAggregate struct {
 }
 
 type metricAccumulator struct {
-	queries  int
-	recall5  float64
-	recall10 float64
-	mrr10    float64
-	ndcg10   float64
+	queries    int
+	recall5    float64
+	recall10   float64
+	mrr10      float64
+	ndcg10     float64
+	noEvidence float64
 }
 
 // EvaluateMetrics runs every suitable private case twice and returns aggregate
@@ -78,11 +81,17 @@ func EvaluateMetrics(
 		if !validQueryCategory(evaluationCase.Category) || strings.TrimSpace(evaluationCase.Query) == "" {
 			return MetricAggregate{}, ErrMetrics
 		}
-		relevant, err := relevantSet(evaluationCase.RelevantChunkIDs, canonical)
+		relevant, err := relevantGrades(evaluationCase, canonical)
 		if err != nil {
 			return MetricAggregate{}, ErrMetrics
 		}
-		if len(relevant) == 0 {
+		if evaluationCase.NoEvidence {
+			if evaluationCase.Category != CategoryNegativeEvidence || len(relevant) != 0 {
+				return MetricAggregate{}, ErrMetrics
+			}
+		} else if evaluationCase.Category == CategoryNegativeEvidence {
+			return MetricAggregate{}, ErrMetrics
+		} else if len(relevant) == 0 {
 			continue
 		}
 
@@ -129,7 +138,14 @@ func EvaluateMetrics(
 			accumulator = &metricAccumulator{}
 			accumulators[evaluationCase.Category] = accumulator
 		}
-		accumulateQuality(accumulator, runs[0], relevant)
+		if evaluationCase.NoEvidence {
+			accumulator.queries++
+			if len(runs[0]) == 0 && len(runs[1]) == 0 {
+				accumulator.noEvidence++
+			}
+		} else {
+			accumulateQuality(accumulator, runs[0], relevant)
+		}
 		if sameCompleteOrder(runs[0], runs[1]) {
 			deterministic++
 		}
@@ -144,11 +160,16 @@ func EvaluateMetrics(
 	}
 	for category, accumulator := range accumulators {
 		count := float64(accumulator.queries)
-		report.Categories[category] = CategoryMetrics{
-			Status: StatusEvaluated, QueryCount: accumulator.queries,
-			RecallAt5: accumulator.recall5 / count, RecallAt10: accumulator.recall10 / count,
-			MRRAt10: accumulator.mrr10 / count, NDCGAt10: accumulator.ndcg10 / count,
+		metrics := CategoryMetrics{Status: StatusEvaluated, QueryCount: accumulator.queries}
+		if category == CategoryNegativeEvidence {
+			metrics.NoEvidenceAccuracy = accumulator.noEvidence / count
+		} else {
+			metrics.RecallAt5 = accumulator.recall5 / count
+			metrics.RecallAt10 = accumulator.recall10 / count
+			metrics.MRRAt10 = accumulator.mrr10 / count
+			metrics.NDCGAt10 = accumulator.ndcg10 / count
 		}
+		report.Categories[category] = metrics
 	}
 	report.Status = StatusEvaluated
 	if citations == 0 {
@@ -184,27 +205,36 @@ func canonicalChunkMap(chunks []source.Chunk) (map[string]source.Chunk, error) {
 	return canonical, nil
 }
 
-func relevantSet(ids []string, corpus map[string]source.Chunk) (map[string]struct{}, error) {
-	relevant := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
+func relevantGrades(evaluationCase Case, corpus map[string]source.Chunk) (map[string]int, error) {
+	if len(evaluationCase.RelevantChunkIDs) > 0 && len(evaluationCase.RelevanceByChunkID) > 0 {
+		return nil, ErrMetrics
+	}
+	relevant := make(map[string]int, len(evaluationCase.RelevantChunkIDs)+len(evaluationCase.RelevanceByChunkID))
+	for _, id := range evaluationCase.RelevantChunkIDs {
 		if _, present := corpus[id]; !present {
 			return nil, ErrMetrics
 		}
 		if _, duplicate := relevant[id]; duplicate {
 			return nil, ErrMetrics
 		}
-		relevant[id] = struct{}{}
+		relevant[id] = 1
+	}
+	for id, relevance := range evaluationCase.RelevanceByChunkID {
+		if _, present := corpus[id]; !present || relevance < 1 || relevance > 3 {
+			return nil, ErrMetrics
+		}
+		relevant[id] = relevance
 	}
 	return relevant, nil
 }
 
-func accumulateQuality(accumulator *metricAccumulator, hits []search.Hit, relevant map[string]struct{}) {
+func accumulateQuality(accumulator *metricAccumulator, hits []search.Hit, relevant map[string]int) {
 	accumulator.queries++
 	matched5, matched10 := 0, 0
 	dcg := 0.0
 	firstRelevant := 0
 	for index, hit := range hits {
-		_, matched := relevant[hit.Chunk.ID]
+		relevance, matched := relevant[hit.Chunk.ID]
 		if !matched {
 			continue
 		}
@@ -214,7 +244,7 @@ func accumulateQuality(accumulator *metricAccumulator, hits []search.Hit, releva
 		}
 		if rank <= 10 {
 			matched10++
-			dcg += 1 / math.Log2(float64(rank+1))
+			dcg += (math.Pow(2, float64(relevance)) - 1) / math.Log2(float64(rank+1))
 			if firstRelevant == 0 {
 				firstRelevant = rank
 			}
@@ -225,13 +255,18 @@ func accumulateQuality(accumulator *metricAccumulator, hits []search.Hit, releva
 	if firstRelevant > 0 {
 		accumulator.mrr10 += 1 / float64(firstRelevant)
 	}
-	idealCount := len(relevant)
+	gains := make([]float64, 0, len(relevant))
+	for _, relevance := range relevant {
+		gains = append(gains, math.Pow(2, float64(relevance))-1)
+	}
+	sort.Slice(gains, func(left, right int) bool { return gains[left] > gains[right] })
+	idealCount := len(gains)
 	if idealCount > 10 {
 		idealCount = 10
 	}
 	idcg := 0.0
 	for index := 0; index < idealCount; index++ {
-		idcg += 1 / math.Log2(float64(index+2))
+		idcg += gains[index] / math.Log2(float64(index+2))
 	}
 	if idcg > 0 {
 		accumulator.ndcg10 += dcg / idcg

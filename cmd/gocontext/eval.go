@@ -92,14 +92,16 @@ func runEvalWithComposition(ctx context.Context, args []string, stdout, stderr i
 	}
 	flags := flag.NewFlagSet("eval inventory", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var root, checklistPath, outputPath, repositoryID requiredEvalFlag
+	var root, checklistPath, outputPath, repositoryID, goldSetPath requiredEvalFlag
 	flags.Var(&root, "root", "")
 	flags.Var(&checklistPath, "checklist", "")
 	flags.Var(&outputPath, "output", "")
 	flags.Var(&repositoryID, "repository", "")
+	flags.Var(&goldSetPath, "gold-set", "")
 	if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 0 || root.count != 1 || checklistPath.count != 1 ||
 		outputPath.count != 1 || repositoryID.count != 1 || root.value == "" || checklistPath.value == "" ||
-		outputPath.value == "" || !evalRepositoryPattern.MatchString(repositoryID.value) {
+		outputPath.value == "" || !evalRepositoryPattern.MatchString(repositoryID.value) || goldSetPath.count > 1 ||
+		goldSetPath.count == 1 && goldSetPath.value == "" {
 		return evalInputFailure(stderr)
 	}
 
@@ -136,6 +138,13 @@ func runEvalWithComposition(ctx context.Context, args []string, stdout, stderr i
 
 	evaluationContext, cancel := context.WithTimeout(ctx, checklist.Duration())
 	defer cancel()
+	var goldSet *evaluation.GoldSet
+	if goldSetPath.count == 1 {
+		goldSet, err = readEvalGoldSet(evaluationContext, goldSetPath.value, repositoryID.value, openedRoot)
+		if err != nil {
+			return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerGoldSet, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "gold_set")
+		}
+	}
 	if composition.newScanner == nil || composition.newParser == nil || composition.newChunker == nil || composition.searchFactory == nil {
 		return finishEvalReport(output, openedRoot, evalNoGo(repositoryID.value, evaluation.BlockerIntegrity, 1), checklist.Budget.MaxOutputBytes, stdout, stderr, "integrity")
 	}
@@ -158,7 +167,7 @@ func runEvalWithComposition(ctx context.Context, args []string, stdout, stderr i
 	report, evaluationErr := evaluation.Evaluate(evaluationContext, repositoryID.value, "retained-root", evaluation.Dependencies{
 		Scanner: retainedEvalScanner{root: openedRoot, scanner: openedScanner}, Parser: configuredParser, Chunker: configuredChunker,
 		SearchFactory: composition.searchFactory,
-	}, checklist.EvaluationBudgets())
+	}, checklist.EvaluationBudgets(), goldSet)
 	if evaluationErr != nil {
 		return finishEvalReport(output, openedRoot, report, checklist.Budget.MaxOutputBytes, stdout, stderr, evalReportErrorCategory(report))
 	}
@@ -224,6 +233,7 @@ func evalReportErrorCategory(report evaluation.Report) string {
 		category string
 	}{
 		{evaluation.BlockerBudget, "budget"},
+		{evaluation.BlockerGoldSet, "gold_set"},
 		{evaluation.BlockerScan, "scan"},
 		{evaluation.BlockerIntegrity, "integrity"},
 		{evaluation.BlockerRetrieval, "retrieval"},
