@@ -28,7 +28,7 @@ func TestParseGoldSetRejectsInvalidInputsWithSanitizedSentinel(t *testing.T) {
 	}{
 		{name: "empty cases", payload: replaceGold(validGoldSetPayload(), []byte(`"cases":[{`), []byte(`"cases":[],"removed":[{`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "query too long", payload: replaceGold(validGoldSetPayload(), []byte(`"private query"`), []byte(`"`+strings.Repeat("q", 4097)+`"`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
-		{name: "whitespace query", payload: replaceGold(validGoldSetPayload(), []byte(`"private query"`), []byte(`" \t "`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
+		{name: "whitespace query", payload: replaceGold(validGoldSetPayload(), []byte(`"private query"`), []byte(`"   "`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "missing judgment", payload: replaceGold(validGoldSetPayload(), []byte(`"judgments":[{"reference":{"path":"permitted/relative.go","start_line":1,"end_line":10},"relevance":3}]`), []byte(`"judgments":[]`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "bad relevance", payload: replaceGold(validGoldSetPayload(), []byte(`"relevance":3`), []byte(`"relevance":4`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},
 		{name: "unknown category", payload: replaceGold(validGoldSetPayload(), []byte(`"concept"`), []byte(`"private-category"`)), repo: "repo-ab", policy: ingest.ScanPolicyVersion},

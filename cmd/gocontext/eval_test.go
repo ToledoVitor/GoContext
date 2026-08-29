@@ -169,7 +169,7 @@ func TestRunEvalInventoryRejectsUntrustedGoldSetBeforePipeline(t *testing.T) {
 		}},
 		{name: "whitespace query", configure: func(t *testing.T, fixture evalCLIFixture) string {
 			path := filepath.Join(filepath.Dir(fixture.checklist), "gold.json")
-			writeEvalGoldSet(t, path, " \t ")
+			writeEvalGoldSet(t, path, "   ")
 			return path
 		}},
 		{name: "malformed schema", configure: func(t *testing.T, fixture evalCLIFixture) string {
